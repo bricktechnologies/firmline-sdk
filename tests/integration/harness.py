@@ -18,7 +18,7 @@ folder per test; nothing is committed.
   may read and write every t/# topic): collects messages, publishes offers.
 - Agent: writes the configuration, runs `firmline-agent`, keeps its stderr as `log` (a running
   `run` in `running_log`, see wait_for_log); a sanitizer report in that stderr fails the test.
-  kill() stops it as a power loss would.
+  `env` is added to its environment; kill() stops it as a power loss would.
 - assert_no_secrets(log, secrets): none of the secrets, and no PEM block at all, is in the log.
 - wait_until(condition, timeout), count_connections(port, seconds): polling and a TCP listener
   that only counts the connections made to it (a broker that is down, seen from the agent).
@@ -1196,11 +1196,13 @@ class Agent:
         pki: Optional[Pki] = None,
         broker: Optional[Broker] = None,
         components: Optional[dict] = None,
+        env: Optional[dict] = None,
         **settings,
     ):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = self.dir / "data"
+        self.env = dict(env or {})  # added to its environment (its scripts inherit it)
         self.config_path = self.dir / "agent.conf"
         pki = pki or (platform.pki if platform else None)
         self.settings = {
@@ -1239,6 +1241,7 @@ class Agent:
         env = dict(os.environ)
         env.setdefault("ASAN_OPTIONS", "detect_leaks=1")
         env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1")
+        env.update(self.env)
         return env
 
     def _take_log(self, stderr: str) -> None:

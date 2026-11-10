@@ -151,6 +151,25 @@ class OtaTest(OtaBase):
         )
         self.finish(agent)
 
+    def test_script_inherits_only_stdin_stdout_stderr(self):
+        app, folder = self.component("app")
+        agent, device = self.start_agent({"app": app})
+
+        self.offer(device, "app", "1.1.0", payload(1000))
+        self.assertEqual("installed", self.platform.wait_results(device)[0]["result"])
+
+        fds = {}  # "info script: lr-x------ 1 root root 64 <date> 0 -> /dev/null" (ls -l /proc/$$/fd)
+        for line in agent.running_log.splitlines():
+            if line.startswith("info script: ") and " -> " in line:
+                left, target = line.split(" -> ", 1)
+                fds[int(left.split()[-1])] = target
+        self.assertEqual("/dev/null", fds[0])
+        self.assertTrue(fds[1].startswith("pipe:") and fds[1] == fds[2], fds)
+        script = str(folder / "install-ok.sh")
+        others = {n: t for n, t in fds.items() if n > 2 and t != script}
+        self.assertEqual({}, others, "nothing of the agent (sockets, files) reaches the script")
+        self.finish(agent)
+
     def test_download_resumes_after_interruptions_and_429(self):
         app, folder = self.component("app")
         agent, device = self.start_agent({"app": app})
@@ -180,9 +199,17 @@ class OtaTest(OtaBase):
         wait_until(lambda: (folder / "rebooted").exists(), 30, "the reboot command")
 
         self.assertEqual("now please\n", (folder / "rebooted").read_text())
+        state = agent.read_json("install.json")
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         self.assertEqual(
-            {"release": offer.release, "component": "app", "version": "1.1.0"},
-            agent.read_json("install.json"),
+            {
+                "release": offer.release,
+                "component": "app",
+                "version": "1.1.0",
+                "state": "reboot",
+                "bootId": boot_id,
+            },
+            state,
         )
         time.sleep(2)
         self.assertEqual([], self.platform.results(device), "no result before the next start")
@@ -199,13 +226,25 @@ class OtaTest(OtaBase):
 
     def test_script_exit_10_without_new_version_is_boot_failed(self):
         app, folder = self.component("app", script="install-later-broken.sh")
-        agent, device = self.start_agent({"app": app})
+        boot = self.tmp / "boot_id"  # played reboots: FIRMLINE_BOOT_ID_FILE (tests only)
+        boot.write_text("boot-a\n")
+        agent, device = self.start_agent({"app": app}, env={"FIRMLINE_BOOT_ID_FILE": str(boot)})
 
         offer = self.offer(device, "app", "1.1.0", payload(2000))
         wait_until(lambda: agent.path("install.json").exists(), 30, "install.json")
+        self.assertEqual("reboot", agent.read_json("install.json")["state"])
         self.assertEqual(0, agent.stop())
         self.assertEqual([], self.platform.results(device))
 
+        # Only the agent restarted, in the same boot: it keeps waiting for the reboot.
+        self.run_agent(agent)
+        agent.wait_for_log(f"release {offer.release}: installed at the next start")
+        time.sleep(2)
+        self.assertEqual([], self.platform.results(device), "no result before the reboot")
+        self.assertTrue(agent.path("install.json").exists())
+        self.assertEqual(0, agent.stop())
+
+        boot.write_text("boot-b\n")  # the device rebooted, the old version came back
         self.run_agent(agent)
         result = self.platform.wait_results(device)[0]
         self.assertEqual(
@@ -213,6 +252,93 @@ class OtaTest(OtaBase):
             result,
         )
         self.assertEqual(1, len((folder / "runs").read_text().splitlines()))
+        self.assertEqual(1, len(self.platform.download_requests(offer.url)))
+        self.assert_clean(agent)
+        self.finish(agent)
+
+    def stop_during_script(self, exit_code, sleep, expected, detail=None, fw=None):
+        """Stops the agent (SIGTERM) while the script sleeps; after the restart exactly one
+        result follows, and the script never runs again."""
+        app, folder = self.component("app", script="install-sleep.sh")
+        (folder / "exit").write_text(f"{exit_code}\n")
+        (folder / "sleep").write_text(f"{sleep}\n")
+        agent, device = self.start_agent({"app": app})
+
+        offer = self.offer(device, "app", "1.1.0", payload(2000))
+        agent.wait_for_log("script: sleeping before the installation")
+        self.assertEqual(0, agent.stop())
+
+        self.run_agent(agent)
+        self.platform.wait_results(device)
+        time.sleep(2)
+        expected_result = {"release": offer.release, "result": expected}
+        if fw is not None:
+            expected_result["fw"] = fw
+        if detail is not None:
+            expected_result["detail"] = detail
+        self.assertEqual([expected_result], self.platform.results(device))
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()), "never run again")
+        self.assertEqual(1, len(self.platform.download_requests(offer.url)))
+        self.assert_clean(agent)
+        self.finish(agent)
+
+    def test_stop_while_script_runs_keeps_its_exit_0(self):
+        self.stop_during_script(0, 2, "installed", fw="1.1.0")
+
+    def test_stop_while_script_runs_keeps_its_exit_10(self):
+        self.stop_during_script(10, 2, "installed", fw="1.1.0")
+
+    def test_stop_killing_a_long_script_sends_install_failed(self):
+        self.stop_during_script(0, 60, "failed", detail="install_failed", fw="1.0.0")
+
+    def test_waiting_older_release_is_refused_after_a_newer_install(self):
+        app, folder = self.component("app")
+        agent, device = self.start_agent({"app": app})
+
+        older = self.offer(
+            device,
+            "app",
+            "1.1.0",
+            payload(1000),
+            not_before=utc_now() + datetime.timedelta(seconds=8),
+        )
+        agent.wait_for_log(f"release {older.release}: offer queued")
+        newer = self.offer(device, "app", "1.2.0", payload(1000, seed=2))
+        results = self.platform.wait_results(device, count=2, timeout=60)
+
+        self.assertEqual(
+            [
+                {"release": newer.release, "result": "installed", "fw": "1.2.0"},
+                {"release": older.release, "result": "failed", "detail": "older_version"},
+            ],
+            results,
+        )
+        self.assertEqual([], self.ranges(older), "the older release is not downloaded")
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()), "one install")
+        self.assertEqual("1.2.0\n", (folder / "version").read_text())
+        self.assert_clean(agent)
+        self.finish(agent)
+
+    def test_queued_older_release_is_refused_after_a_newer_install(self):
+        app, folder = self.component("app")
+        agent, device = self.start_agent({"app": app})
+
+        newer = self.offer(device, "app", "1.2.0", payload(3000), slow=1500)
+        agent.wait_for_log(f"release {newer.release}: downloading")
+        older = self.offer(device, "app", "1.1.0", payload(1000, seed=2))
+        agent.wait_for_log(f"release {older.release}: offer queued")
+        results = self.platform.wait_results(device, count=2, timeout=60)
+
+        self.assertEqual(
+            [
+                {"release": newer.release, "result": "installed", "fw": "1.2.0"},
+                {"release": older.release, "result": "failed", "detail": "older_version"},
+            ],
+            results,
+        )
+        self.assertEqual([], self.ranges(older), "the older release is not downloaded")
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()), "one install")
+        self.assertEqual("1.2.0\n", (folder / "version").read_text())
         self.assert_clean(agent)
         self.finish(agent)
 
@@ -413,7 +539,11 @@ class OtaTest(OtaBase):
         try:
             disk = os.statvfs(SMALL_DISK)
         except FileNotFoundError:
-            self.skipTest(f"{SMALL_DISK} is missing: scripts/check.sh mounts it (1 MiB tmpfs)")
+            # Review Focus 5 must not vanish from CI: a skip only when asked for explicitly.
+            if os.environ.get("FIRMLINE_NO_SMALL_DISK") == "1":
+                self.skipTest(f"{SMALL_DISK} is missing and FIRMLINE_NO_SMALL_DISK=1")
+            self.fail(f"{SMALL_DISK} is missing: scripts/check.sh mounts it (1 MiB tmpfs); set "
+                      "FIRMLINE_NO_SMALL_DISK=1 to skip this test outside check.sh")
         self.assertLessEqual(disk.f_blocks * disk.f_frsize, 2 * 1024 * 1024, "a small disk")
         data_dir = SMALL_DISK / uuid.uuid4().hex
         self.addCleanup(shutil.rmtree, data_dir, ignore_errors=True)
