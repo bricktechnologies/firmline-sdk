@@ -39,7 +39,15 @@ static void usage(FILE *out) {
           out);
 }
 
+#ifndef FIRMLINE_AGENT_VERSION
+#define FIRMLINE_AGENT_VERSION "0.0.0-dev"
+#endif
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--version") == 0) {
+        printf("firmline-agent %s\n", FIRMLINE_AGENT_VERSION);
+        return 0;
+    }
     if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
         usage(stdout);
         return 0;
