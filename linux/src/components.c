@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE /* pipe2 */
 #include "components.h"
 
 #include <ctype.h>
@@ -78,32 +78,53 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Starts `path` in its own process group with stdin on /dev/null, stdout on `out_fd`, stderr on
+ * /dev/null, an empty signal mask and default dispositions for the signals the agent handles.
+ * 0, or -1 when any step fails. */
+static int spawn_command(const char *path, int out_fd, pid_t *pid) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    if (posix_spawn_file_actions_init(&actions) != 0)
+        return -1;
+    if (posix_spawnattr_init(&attr) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return -1;
+    }
+    sigset_t none, defaults;
+    sigemptyset(&none);
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGPIPE);
+    sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGINT);
+    sigaddset(&defaults, SIGHUP);
+    sigaddset(&defaults, SIGCHLD);
+
+    int rc = -1;
+    char *argv[] = {(char *)(size_t)path, NULL};
+    if (posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, out_fd, STDOUT_FILENO) == 0 &&
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 &&
+        posix_spawnattr_setsigmask(&attr, &none) == 0 &&
+        posix_spawnattr_setsigdefault(&attr, &defaults) == 0 &&
+        posix_spawnattr_setpgroup(&attr, 0) == 0 &&
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK |
+                                            POSIX_SPAWN_SETSIGDEF) == 0 &&
+        posix_spawn(pid, path, &actions, &attr, argv, environ) == 0)
+        rc = 0;
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    return rc;
+}
+
 /* Runs `path` with no arguments and no shell, stdin closed, stderr dropped. Reads the start of its
  * stdout and waits for it to exit with status 0, all within timeout_ms; past that the process
  * group is killed. */
 static int version_from_command(const char *path, int timeout_ms, char out[65]) {
     int pipefd[2];
-    if (pipe(pipefd) != 0)
+    if (pipe2(pipefd, O_CLOEXEC) != 0)
         return -1;
-
-    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC); /* the agent is single-threaded here: no race */
-    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
-
-    posix_spawn_file_actions_t actions;
-    posix_spawnattr_t attr;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawnattr_init(&attr);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-    posix_spawnattr_setpgroup(&attr, 0);
-
-    char *argv[] = {(char *)(size_t)path, NULL};
     pid_t pid;
-    int spawn_rc = posix_spawn(&pid, path, &actions, &attr, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    posix_spawnattr_destroy(&attr);
+    int spawn_rc = spawn_command(path, pipefd[1], &pid);
     close(pipefd[1]);
     if (spawn_rc != 0) {
         close(pipefd[0]);

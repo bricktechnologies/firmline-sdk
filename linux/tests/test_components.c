@@ -3,6 +3,8 @@
 #include "check.h"
 #include "components.h"
 
+#include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -126,6 +128,32 @@ static void version_from_failing_command_is_unreadable(void) {
     CHECK_EQ_INT(fa_component_version(&cfg, &c, out), -1);
 }
 
+static void version_command_starts_with_clean_signal_state(void) {
+    static fa_config cfg;
+    char path[256], out[65];
+    put("sigblk.sh", "#!/bin/sh\nawk '/^SigBlk/ {print $2}' /proc/self/status\n", 0755, path);
+    fa_component c = comp(FA_VERSION_COMMAND, path);
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGTERM);
+    sigaddset(&block, SIGHUP);
+    sigaddset(&block, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &block, &old);
+    struct sigaction ign, prev;
+    memset(&ign, 0, sizeof ign);
+    ign.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ign, &prev);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+    CHECK_EQ_STR(out, "0000000000000000");
+    put("sigign.sh", "#!/bin/sh\nawk '/^SigIgn/ {print $2}' /proc/self/status\n", 0755, path);
+    snprintf(c.source_arg, sizeof c.source_arg, "%s", path);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+    /* only SIGPIPE (bit 12) matters: the runtime may ignore internal signals of its own */
+    CHECK_EQ_INT(strtoull(out, NULL, 16) & (1ULL << (SIGPIPE - 1)), 0);
+    sigaction(SIGPIPE, &prev, NULL);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
 static void version_from_hanging_command_is_killed(void) {
     static fa_config cfg;
     char path[256], out[65];
@@ -147,6 +175,7 @@ int main(void) {
     RUN(version_from_file_trims_newline);
     RUN(version_from_command_first_line);
     RUN(version_from_failing_command_is_unreadable);
+    RUN(version_command_starts_with_clean_signal_state);
     RUN(version_from_hanging_command_is_killed);
     return CHECK_RESULT;
 }
