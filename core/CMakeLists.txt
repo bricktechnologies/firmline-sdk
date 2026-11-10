@@ -4,6 +4,8 @@ file(GLOB FIRMLINE_CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/s
 add_library(firmline_core STATIC ${FIRMLINE_CORE_SOURCES})
 target_include_directories(firmline_core PUBLIC include)
 target_link_libraries(firmline_core PUBLIC mbedcrypto)
+# jsmn (vendored, unchanged) as a system include: its code is not ours to warn about.
+target_include_directories(firmline_core SYSTEM PUBLIC third_party/jsmn)
 target_compile_options(firmline_core PRIVATE ${FIRMLINE_WARNINGS})
 
 if(FIRMLINE_BUILD_TESTS)

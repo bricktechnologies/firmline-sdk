@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 dirs=(core)
 [ -d linux ] && dirs+=(linux)
-find "${dirs[@]}" \( -name '*.c' -o -name '*.h' \) -print0 \
+find "${dirs[@]}" -path core/third_party -prune -o \( -name '*.c' -o -name '*.h' \) -print0 \
     | xargs -0 clang-format --dry-run --Werror
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFIRMLINE_SANITIZE=ON
