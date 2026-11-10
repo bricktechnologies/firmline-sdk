@@ -383,9 +383,31 @@ static void certificate_chains_only_to_the_root_in_use(void) {
         snprintf(scratch, sizeof scratch, bad_chains[i], mid_only, root, mid_only, mid_only, root);
         CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, NULL), 0);
     }
-    /* 4 certificates are still a chain (the intermediate repeated, the root last) */
+    /* 4 certificates are still a chain (the intermediate repeated, the root last); what is
+     * written is the verified path: intermediate, root. */
     snprintf(scratch, sizeof scratch, "%s%s%s%s", mid_only, mid_only, mid_only, root);
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, NULL), 1);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, &chain_out), 1);
+    static char path[8192];
+    snprintf(path, sizeof path, "%s%s", mid_only, root);
+    CHECK_EQ_STR(chain_out, path);
+    free(chain_out);
+
+    /* A certificate off the verified path (verification ignores it, found by name elsewhere):
+     * refused, never written in front of the intermediate. */
+    EVP_PKEY *unrelated_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    static char unrelated[4096];
+    unrelated[0] = '\0';
+    X509 *u =
+        add_certificate(unrelated_key, "Unrelated CA", NULL, NULL, 1, unrelated, sizeof unrelated);
+    CHECK(u != NULL);
+    snprintf(scratch, sizeof scratch, "%s%s", unrelated, chain);
+    chain_out = NULL;
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, &chain_out), 0);
+    CHECK(chain_out == NULL);
+    snprintf(scratch, sizeof scratch, "%s%s%s", mid_only, unrelated, root);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, NULL), 0);
+    X509_free(u);
+    EVP_PKEY_free(unrelated_key);
     /* the device certificate: exactly one block */
     snprintf(scratch, sizeof scratch, "%s%s", leaf, leaf);
     CHECK_EQ_INT(fa_certificate_chains_to(scratch, chain, root, NULL, NULL), 0);

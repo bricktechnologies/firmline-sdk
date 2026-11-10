@@ -1129,6 +1129,8 @@ class Broker:
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.port = port or free_port()
+        self._port_chosen = port is None
+        self._started = False
         self.config_path = self.dir / "mosquitto.conf"
         self.log_path = self.dir / "mosquitto.log"
         self.acl_path = self.dir / "acl"
@@ -1161,13 +1163,21 @@ class Broker:
         temp.write_text(self._acl())
         os.replace(temp, self.acl_path)
 
+    RUNNING = " running"  # the end of "mosquitto version 2.0.x running", logged when it is ready
+
     def reload_acl(self) -> None:
         """Rewrites the ACL file and has a running broker read it again (waits for it)."""
         self.write_acl()
         if self._process is not None and self._process.poll() is None:
             reloads = self.log.count("Reloading config")
             self._process.send_signal(signal.SIGHUP)
-            wait_until(lambda: self.log.count("Reloading config") > reloads, 10, "ACL reload")
+
+            def reloaded():
+                if self._process.poll() is not None:
+                    raise AssertionError(f"the broker exited ({self._process.returncode})")
+                return self.log.count("Reloading config") > reloads
+
+            wait_until(reloaded, 10, "ACL reload")
 
     def revoke(self, certificate_pem: str) -> None:
         """Revokes a certificate issued by the intermediate (a device's) from the next start."""
@@ -1226,20 +1236,39 @@ class Broker:
             ]
         )
 
+    START_TIMEOUT = 30  # seconds: the workstation may be busy with other test runs
+
     def start(self) -> "Broker":
-        self.write_acl()
-        self.config_path.write_text(self._config())
-        self._process = subprocess.Popen(
-            ["mosquitto", "-c", str(self.config_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            wait_for_port(self.port)
-        except TimeoutError:
+        """Starts mosquitto and waits until it logs that it runs: its port is open then, and its
+        signal handlers are in place (a SIGHUP from reload_acl before that would end it). A
+        broker whose port was chosen here and that exits at once (the port taken meanwhile by
+        another process) is started again on a new port, before its first start only: after
+        that, agents know the port."""
+        for attempt in range(3):
+            self.write_acl()
+            self.config_path.write_text(self._config())
+            running = self.log.count(self.RUNNING)  # the log file grows across restarts
+            self._process = subprocess.Popen(
+                ["mosquitto", "-c", str(self.config_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + self.START_TIMEOUT
+            while (
+                self.log.count(self.RUNNING) <= running
+                and self._process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            if self._process.poll() is None and self.log.count(self.RUNNING) > running:
+                self._started = True
+                return self
+            exited = self._process.poll() is not None
             self.stop()
-            raise
-        return self
+            if not (exited and self._port_chosen and not self._started):
+                break
+            self.port = free_port()
+        raise TimeoutError(f"the broker on port {self.port} did not start: see {self.log_path}")
 
     def stop(self) -> None:
         if self._process is not None:

@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -278,13 +279,28 @@ int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const 
         rc = 0;
         goto done;
     }
-    /* What is written: the checked objects, the chain ending with the root in use itself. */
-    for (int i = 0; i < n - 1; i++)
-        written[i] = sk_X509_value(chain, i);
-    written[n - 1] = root;
-    X509 *leaf = sk_X509_value(cert, 0);
+    /* What is written is the verified path (certificate, intermediate(s), root), not the answer's
+     * list: OpenSSL picks issuers by name and would ignore a certificate sent in front of the
+     * intermediate, which chain.pem (and so device-chain.pem) would then present first. Every
+     * certificate of the answer must be on that path, and the path must end with the anchor. */
+    STACK_OF(X509) *path = X509_STORE_CTX_get0_chain(ctx);
+    int len = path != NULL ? sk_X509_num(path) : 0;
+    rc = 0;
+    if (len < 2 || len - 1 > FA_CHAIN_MAX || X509_cmp(sk_X509_value(path, len - 1), root) != 0)
+        goto done;
+    for (int i = 0; i < n; i++) {
+        bool on_path = false;
+        for (int j = 1; j < len && !on_path; j++)
+            on_path = X509_cmp(sk_X509_value(chain, i), sk_X509_value(path, j)) == 0;
+        if (!on_path)
+            goto done; /* a certificate the verification did not use */
+    }
+    rc = -1;
+    for (int j = 1; j < len; j++)
+        written[j - 1] = sk_X509_value(path, j);
+    X509 *leaf = sk_X509_value(path, 0);
     new_cert = to_pem(&leaf, 1);
-    new_chain = to_pem(written, n);
+    new_chain = to_pem(written, len - 1);
     if (new_cert == NULL || new_chain == NULL)
         goto done;
     rc = 1;

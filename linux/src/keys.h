@@ -47,12 +47,14 @@ int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_befor
  *   - the last certificate of the chain is DER-equal to root_pem's certificate;
  *   - the certificate verifies through the chain against root_pem's certificate as the only
  *     trusted one (no system authority, no partial chain; the time is not checked: the clock of
- *     a device may be wrong).
+ *     a device may be wrong);
+ *   - every certificate of the chain is on the verified path (none that verification skipped),
+ *     and the path ends with root_pem's certificate.
  * 1 when all hold: then *cert_out (when not NULL) is the certificate and *chain_out (when not
- * NULL) the chain before the root followed by the root in use, both serialised again from the
- * checked certificates (PEM, LF line ends, malloc'ed, NUL-terminated: the caller frees them), so
- * that what is installed is what was checked. 0 when the answer is refused; -1 when root_pem
- * holds no certificate or memory runs out (outputs NULL in both cases). */
+ * NULL) the verified path after it (intermediate(s), then the root in use), both serialised
+ * again from the checked certificates (PEM, LF line ends, malloc'ed, NUL-terminated: the caller
+ * frees them), so that what is installed is what was checked. 0 when the answer is refused; -1
+ * when root_pem holds no certificate or memory runs out (outputs NULL in both cases). */
 int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem,
                              char **cert_out, char **chain_out);
 
