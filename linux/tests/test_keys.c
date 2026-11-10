@@ -320,7 +320,7 @@ static void certificate_chains_only_to_the_root_in_use(void) {
     EVP_PKEY *forged_root_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
     EVP_PKEY *forged_mid_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
     static char root[4096], chain[8192], mid_only[4096], leaf[4096];
-    static char forged_root[4096], forged_chain[8192], forged_leaf[4096], scratch[8192];
+    static char forged_root[4096], forged_chain[8192], forged_leaf[4096], scratch[16384];
     root[0] = chain[0] = mid_only[0] = leaf[0] = '\0';
     forged_root[0] = forged_chain[0] = forged_leaf[0] = scratch[0] = '\0';
 
@@ -339,19 +339,63 @@ static void certificate_chains_only_to_the_root_in_use(void) {
         add_certificate(leaf_key, "device", forged_mid_key, fm, 0, forged_leaf, sizeof forged_leaf);
     CHECK(r != NULL && m != NULL && l != NULL && fr != NULL && fm != NULL && fl != NULL);
 
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, root), 1);
+    /* Accepted: what is written is what was checked, serialised again. */
+    char *cert_out = NULL, *chain_out = NULL;
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, root, &cert_out, &chain_out), 1);
+    CHECK_EQ_STR(cert_out, leaf);
+    CHECK_EQ_STR(chain_out, chain); /* intermediate, then the root in use */
+    free(cert_out);
+    free(chain_out);
+    /* Accepted with CRLF line ends and blank lines between blocks; written with LF. */
+    static char crlf[16384];
+    size_t n = 0;
+    for (const char *p = chain; *p != '\0' && n + 4 < sizeof crlf; p++) {
+        if (*p == '\n')
+            crlf[n++] = '\r';
+        crlf[n++] = *p;
+    }
+    crlf[n] = '\0';
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, crlf, root, NULL, &chain_out), 1);
+    CHECK_EQ_STR(chain_out, chain);
+    free(chain_out);
+
     /* the answer's root is another one (same name) */
-    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, forged_chain, root), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, forged_chain, root, NULL, NULL), 0);
     /* our chain, a certificate from another issuer of the same name */
-    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, chain, root), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, chain, root, NULL, NULL), 0);
     /* a chain that does not end with the root in use */
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, mid_only, root), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, mid_only, root, NULL, NULL), 0);
     /* the root in use is the only anchor: a chain ending with it, the root itself forged */
     snprintf(scratch, sizeof scratch, "%s%s", mid_only, root);
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, forged_root), 0);
-    CHECK_EQ_INT(fa_certificate_chains_to("junk\n", chain, root), -1);
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, "junk\n", root), -1);
-    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, "junk\n"), -1);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, forged_root, NULL, NULL), 0);
+
+    /* Anything but whitespace and whole certificate blocks, each starting a line: refused. */
+    const char *const bad_chains[] = {
+        "%sx%s", /* a block hidden mid-line after the root */
+        "%s%s-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n", /* not base64 */
+        "text\n%s%s",                                                         /* text before */
+        "%s%stext\n",                                                         /* text after */
+        "%s  %s",                                 /* a BEGIN line that starts with spaces */
+        "%s%s-----BEGIN CERTIFICATE-----\nMII\n", /* a block without its END */
+        "%s%s%s%s%s",                             /* more than 4 certificates (5) */
+    };
+    for (size_t i = 0; i < sizeof bad_chains / sizeof bad_chains[0]; i++) {
+        snprintf(scratch, sizeof scratch, bad_chains[i], mid_only, root, mid_only, mid_only, root);
+        CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, NULL), 0);
+    }
+    /* 4 certificates are still a chain (the intermediate repeated, the root last) */
+    snprintf(scratch, sizeof scratch, "%s%s%s%s", mid_only, mid_only, mid_only, root);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, root, NULL, NULL), 1);
+    /* the device certificate: exactly one block */
+    snprintf(scratch, sizeof scratch, "%s%s", leaf, leaf);
+    CHECK_EQ_INT(fa_certificate_chains_to(scratch, chain, root, NULL, NULL), 0);
+    snprintf(scratch, sizeof scratch, "x%s", leaf);
+    CHECK_EQ_INT(fa_certificate_chains_to(scratch, chain, root, NULL, NULL), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to("junk\n", chain, root, NULL, NULL), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, "junk\n", root, NULL, NULL), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, "", root, NULL, NULL), 0);
+    /* the root in use cannot be read: a local failure */
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, "junk\n", NULL, NULL), -1);
 
     X509_free(r);
     X509_free(m);

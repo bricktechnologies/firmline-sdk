@@ -193,52 +193,117 @@ int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_befor
     return rc;
 }
 
-/* Every certificate of a PEM text, in order; NULL when there is none (or no memory). */
-static STACK_OF(X509) * read_certificates(const char *pem) {
+static const char PEM_BEGIN[] = "-----BEGIN CERTIFICATE-----";
+static const char PEM_END[] = "-----END CERTIFICATE-----";
+
+/* The certificates of a PEM text read strictly: nothing but whitespace and whole certificate
+ * blocks, each BEGIN at the start of a line, each block parsing on its own; 1..max of them. Each
+ * block is parsed alone, so no text can sit between blocks unseen (OpenSSL's reader would skip a
+ * BEGIN that does not start a line, or anything before a BEGIN). NULL when the text has another
+ * form (or memory runs out). */
+static STACK_OF(X509) * read_certificates_strict(const char *pem, int max) {
     STACK_OF(X509) *all = sk_X509_new_null();
-    size_t len = strlen(pem);
-    BIO *bio = all != NULL && len <= INT_MAX ? BIO_new_mem_buf(pem, (int)len) : NULL;
-    X509 *cert;
-    while (bio != NULL && (cert = PEM_read_bio_X509(bio, NULL, no_pass_phrase, NULL)) != NULL)
-        if (sk_X509_push(all, cert) <= 0) {
-            X509_free(cert);
+    const char *p = pem;
+    while (all != NULL) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+            p++;
+        if (*p == '\0')
             break;
+        if ((p != pem && p[-1] != '\n') || strncmp(p, PEM_BEGIN, sizeof PEM_BEGIN - 1) != 0)
+            goto refuse; /* text, or a BEGIN that does not start a line */
+        const char *body = p + sizeof PEM_BEGIN - 1;
+        const char *end = strstr(body, PEM_END);
+        const char *other = strstr(body, "-----BEGIN");
+        if (end == NULL || (other != NULL && other < end) || sk_X509_num(all) >= max)
+            goto refuse;
+        end += sizeof PEM_END - 1;
+        X509 *cert = read_certificate(p, (size_t)(end - p));
+        if (cert == NULL || sk_X509_push(all, cert) <= 0) {
+            X509_free(cert);
+            goto refuse;
         }
-    ERR_clear_error(); /* the end of the text reads as an error */
-    BIO_free(bio);
-    if (all != NULL && sk_X509_num(all) == 0) {
-        sk_X509_free(all);
-        all = NULL;
+        p = end;
     }
-    return all;
+    if (all != NULL && sk_X509_num(all) > 0)
+        return all;
+refuse:
+    ERR_clear_error();
+    sk_X509_pop_free(all, X509_free);
+    return NULL;
 }
 
-int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem) {
-    X509 *cert = read_certificate(cert_pem, strlen(cert_pem));
+/* certs[0..n-1] as PEM blocks, malloc'ed and NUL-terminated, or NULL. */
+static char *to_pem(X509 *const *certs, int n) {
+    BIO *bio = BIO_new(BIO_s_mem());
+    char *out = NULL, *data = NULL;
+    int ok = bio != NULL;
+    for (int i = 0; ok && i < n; i++)
+        ok = PEM_write_bio_X509(bio, certs[i]) == 1;
+    long len = ok ? BIO_get_mem_data(bio, &data) : -1;
+    if (len > 0 && (out = malloc((size_t)len + 1)) != NULL) {
+        memcpy(out, data, (size_t)len);
+        out[len] = '\0';
+    }
+    BIO_free(bio);
+    return out;
+}
+
+int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem,
+                             char **cert_out, char **chain_out) {
+    if (cert_out != NULL)
+        *cert_out = NULL;
+    if (chain_out != NULL)
+        *chain_out = NULL;
     X509 *root = read_certificate(root_pem, strlen(root_pem));
-    STACK_OF(X509) *chain = read_certificates(chain_pem);
+    STACK_OF(X509) *cert = read_certificates_strict(cert_pem, 1);
+    STACK_OF(X509) *chain = read_certificates_strict(chain_pem, FA_CHAIN_MAX);
     X509_STORE *store = NULL;
     X509_STORE_CTX *ctx = NULL;
-    int rc = -1;
-    if (cert == NULL || root == NULL || chain == NULL)
+    X509 *written[FA_CHAIN_MAX];
+    char *new_cert = NULL, *new_chain = NULL;
+    int rc = -1, n = chain != NULL ? sk_X509_num(chain) : 0;
+    if (root == NULL)
         goto done;
     rc = 0;
-    if (X509_cmp(sk_X509_value(chain, sk_X509_num(chain) - 1), root) != 0)
-        goto done; /* the answer brings another root */
+    if (cert == NULL || chain == NULL || X509_cmp(sk_X509_value(chain, n - 1), root) != 0)
+        goto done; /* not certificate blocks only, or another root */
     rc = -1;
     store = X509_STORE_new();
     ctx = X509_STORE_CTX_new();
     if (store == NULL || ctx == NULL || X509_STORE_add_cert(store, root) != 1 ||
-        X509_STORE_CTX_init(ctx, store, cert, chain) != 1)
+        X509_STORE_CTX_init(ctx, store, sk_X509_value(cert, 0), chain) != 1)
         goto done;
     X509_VERIFY_PARAM_set_flags(X509_STORE_CTX_get0_param(ctx), X509_V_FLAG_NO_CHECK_TIME);
-    rc = X509_verify_cert(ctx) == 1 ? 1 : 0;
+    if (X509_verify_cert(ctx) != 1) {
+        rc = 0;
+        goto done;
+    }
+    /* What is written: the checked objects, the chain ending with the root in use itself. */
+    for (int i = 0; i < n - 1; i++)
+        written[i] = sk_X509_value(chain, i);
+    written[n - 1] = root;
+    X509 *leaf = sk_X509_value(cert, 0);
+    new_cert = to_pem(&leaf, 1);
+    new_chain = to_pem(written, n);
+    if (new_cert == NULL || new_chain == NULL)
+        goto done;
+    rc = 1;
+    if (cert_out != NULL) {
+        *cert_out = new_cert;
+        new_cert = NULL;
+    }
+    if (chain_out != NULL) {
+        *chain_out = new_chain;
+        new_chain = NULL;
+    }
 done:
     ERR_clear_error();
+    free(new_cert);
+    free(new_chain);
     X509_STORE_CTX_free(ctx);
     X509_STORE_free(store);
     sk_X509_pop_free(chain, X509_free);
+    sk_X509_pop_free(cert, X509_free);
     X509_free(root);
-    X509_free(cert);
     return rc;
 }

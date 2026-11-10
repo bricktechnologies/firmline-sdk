@@ -28,18 +28,19 @@
 #define RENEWAL_PATH "/api/v1/provisioning/renewal"
 #define CSR_MAX 4096
 #define REQUEST_MAX 16384
-#define ROOT_MAX 8192
+#define SWAP_CERT "renewal-device.pem"
+#define SWAP_CHAIN "renewal-chain.pem"
+#define SWAP_IDENTITY "renewal-device.json"
 
-static const char CERT_BEGIN[] = "-----BEGIN CERTIFICATE-----";
-static const char CERT_END[] = "-----END CERTIFICATE-----";
-
-/* Pending name -> live name, in the order of the renames. */
+/* Pending name -> live name, in the order of the renames. root.pem is never replaced: the
+ * platform root does not change, and the answer's chain must end with it. */
 static const struct {
     const char *pending, *live;
 } SWAP[] = {
-    {"renewal-device.pem", "device.pem"},   {"renewal-chain.pem", "chain.pem"},
-    {"renewal-root.pem", "root.pem"},       {NEW_KEY, "device.key"},
-    {"renewal-device.json", "device.json"},
+    {SWAP_CERT, "device.pem"},
+    {SWAP_CHAIN, "chain.pem"},
+    {NEW_KEY, "device.key"},
+    {SWAP_IDENTITY, "device.json"},
 };
 #define SWAP_COUNT (sizeof SWAP / sizeof SWAP[0])
 
@@ -278,25 +279,11 @@ static void refused(fa_renewal *r, fl_time now, const char *code, int status) {
     save_last_attempt(r, now);
 }
 
-/* The last certificate of the chain (the platform root), up to its END line, plus a newline. */
-static int last_certificate(const char *chain, char *out, size_t cap) {
-    const char *begin = NULL;
-    for (const char *p = chain; (p = strstr(p, CERT_BEGIN)) != NULL; p++)
-        begin = p;
-    const char *end = begin != NULL ? strstr(begin, CERT_END) : NULL;
-    if (end == NULL)
-        return -1;
-    size_t n = (size_t)(end - begin) + strlen(CERT_END);
-    if (n + 2 > cap)
-        return -1;
-    memcpy(out, begin, n);
-    out[n] = '\n';
-    out[n + 1] = '\0';
-    return 0;
-}
-
-/* Step 1: the new identity under the pending names. 0, or -1. */
-static int write_pending(const fa_renewal *r, const fl_provisioned *p, const char *root) {
+/* Step 1: the new identity under the pending names: the certificate and chain serialised again
+ * from what fa_certificate_chains_to checked (never the answer's text), device.json from the
+ * answer. root.pem is not part of the swap: the root never changes. 0, or -1. */
+static int write_pending(const fa_renewal *r, const fl_provisioned *p, const char *cert,
+                         const char *chain) {
     const fa_identity *id = fa_service_identity(r->svc);
     char json[1024];
     fl_jw w;
@@ -309,12 +296,9 @@ static int write_pending(const fa_renewal *r, const fl_provisioned *p, const cha
     fl_jw_string(&w, "otaOfferTopic", p->ota_offer_topic);
     int n = fl_jw_end(&w);
     const char *dir = r->dir;
-    return n > 0 &&
-                   fa_store_write(dir, SWAP[0].pending, p->certificate, strlen(p->certificate),
-                                  0644) == 0 &&
-                   fa_store_write(dir, SWAP[1].pending, p->chain, strlen(p->chain), 0644) == 0 &&
-                   fa_store_write(dir, SWAP[2].pending, root, strlen(root), 0644) == 0 &&
-                   fa_store_write(dir, SWAP[4].pending, json, (size_t)n, 0644) == 0
+    return n > 0 && fa_store_write(dir, SWAP_CERT, cert, strlen(cert), 0644) == 0 &&
+                   fa_store_write(dir, SWAP_CHAIN, chain, strlen(chain), 0644) == 0 &&
+                   fa_store_write(dir, SWAP_IDENTITY, json, (size_t)n, 0644) == 0
                ? 0
                : -1;
 }
@@ -333,14 +317,11 @@ static void completed(fa_renewal *r, fl_time now) {
 }
 
 static void issued(fa_renewal *r, fl_time now) {
-    char *pem = malloc(FA_HTTP_BODY_MAX), *root = malloc(ROOT_MAX), *current_root = NULL;
+    char *pem = malloc(FA_HTTP_BODY_MAX), *current_root = NULL, *cert = NULL, *chain = NULL;
     size_t root_len = 0;
     fl_provisioned p;
     const fa_identity *id = fa_service_identity(r->svc);
-    if (pem == NULL || root == NULL ||
-        fl_provisioned_parse(r->body, r->len, pem, FA_HTTP_BODY_MAX, &p) != FL_OK ||
-        strstr(p.certificate, CERT_BEGIN) == NULL ||
-        last_certificate(p.chain, root, ROOT_MAX) != 0) {
+    if (pem == NULL || fl_provisioned_parse(r->body, r->len, pem, FA_HTTP_BODY_MAX, &p) != FL_OK) {
         keep("the answer cannot be read"); /* a 200 garbled on the way: the same answer again */
         goto done;
     }
@@ -352,21 +333,26 @@ static void issued(fa_renewal *r, fl_time now) {
         keep("the answer is for another device");
         goto done;
     }
-    int match = fa_key_matches_certificate(r->dir, NEW_KEY, p.certificate, strlen(p.certificate));
-    if (match != 1) {
-        keep(match < 0 ? "the certificate of the answer cannot be read"
-                       : "the certificate of the answer is not for the new key");
-        goto done;
-    }
     if (fa_store_read(r->dir, "root.pem", &current_root, &root_len) != 0) {
         keep("root.pem cannot be read");
         goto done;
     }
-    if (fa_certificate_chains_to(p.certificate, p.chain, current_root) != 1) {
-        keep("the certificate of the answer does not chain to the platform root in use");
+    /* From here on only `cert` and `chain`, serialised again from the checked certificates, are
+     * used: the answer's text is never written. */
+    int chains = fa_certificate_chains_to(p.certificate, p.chain, current_root, &cert, &chain);
+    if (chains != 1) {
+        keep(chains < 0 ? "the platform root in use cannot be read"
+                        : "the answer does not chain to the platform root in use (or is not "
+                          "whole certificate blocks)");
         goto done;
     }
-    if (write_pending(r, &p, root) != 0) {
+    int match = fa_key_matches_certificate(r->dir, NEW_KEY, cert, strlen(cert));
+    if (match != 1) {
+        keep(match < 0 ? "the new key cannot be read"
+                       : "the certificate of the answer is not for the new key");
+        goto done;
+    }
+    if (write_pending(r, &p, cert, chain) != 0) {
         remove_pending_identity(r->dir);
         keep("the new certificate cannot be written");
         goto done;
@@ -387,8 +373,9 @@ static void issued(fa_renewal *r, fl_time now) {
     completed(r, now);
 done:
     free(pem);
-    free(root);
     free(current_root);
+    free(cert);
+    free(chain);
 }
 
 void fa_renewal_tick(fa_renewal *r, fl_time now) {

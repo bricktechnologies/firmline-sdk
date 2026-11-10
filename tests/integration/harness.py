@@ -731,17 +731,40 @@ class FakePlatform:
 
         self.script(self.RENEWAL, lost)
 
+    def _until_stopped(self, route: str, entry: Callable[[Request], Optional[Reply]]):
+        """Scripts `entry` for every request to `route` (after the entries already scripted)
+        until the returned function is called; that removes its remaining entries, so entries
+        scripted later come next."""
+        self.script(route, *[entry] * 1000)
+
+        def stop() -> None:
+            with self._lock:
+                left = [e for e in self._scripts[route] if e is not entry]
+                self._scripts[route] = collections.deque(left)
+
+        return stop
+
     def renewals_unavailable(self) -> Callable[[], None]:
         """After the answers already scripted, every renewal is answered 503 service_unavailable
         until the returned function is called; then the platform answers normally again."""
-        down = threading.Event()
-        down.set()
+        return self._until_stopped(
+            self.RENEWAL, lambda request: problem(503, "service_unavailable")
+        )
 
-        def unavailable(request: Request) -> Optional[Reply]:
-            return problem(503, "service_unavailable") if down.is_set() else None
+    def tamper_renewals(self, change: Callable[[dict], None]) -> Callable[[], None]:
+        """After the answers already scripted, every renewal is processed as usual and
+        change(answer) edits the 200 answer before it leaves (a relay forwarding answers it
+        altered), until the returned function is called."""
 
-        self.script(self.RENEWAL, *[unavailable] * 1000)
-        return down.clear
+        def tampered(request: Request) -> Reply:
+            reply = self._renew(request)
+            if reply.status != 200:
+                return reply
+            answer = json.loads(reply.body)
+            change(answer)
+            return json_reply(200, answer)
+
+        return self._until_stopped(self.RENEWAL, tampered)
 
     def certificates(
         self, valid_for: datetime.timedelta, age: datetime.timedelta = datetime.timedelta(days=2)

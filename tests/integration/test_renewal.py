@@ -120,11 +120,13 @@ class RenewalTest(RenewalBase):
     def test_renews_within_60_days_and_reconnects(self):
         agent, identity = self.registered(status_interval=2)
         old_cert, old_key = agent.read_text("device.pem"), agent.read_text("device.key")
+        old_root = agent.path("root.pem").read_bytes()
         device = self.platform.devices[identity["deviceId"]]
 
         agent.start("run")
         agent.wait_for_log("device certificate renewed")
         started = utc_now()
+        self.assertEqual(old_root, agent.path("root.pem").read_bytes(), "the root never changes")
 
         requests = self.renewal_requests()
         self.assertEqual(1, len(requests))
@@ -307,32 +309,71 @@ class AnswerTrustTest(RenewalBase):
     """The platform root and the company intermediate never change: an answer that does not
     chain to the root in use is not installed (and the request is kept)."""
 
+    def assert_answers_refused(self, name, go_wrong):
+        """A registered agent whose renewal answers go wrong once go_wrong() was called (after the
+        registration; it returns the function that puts the platform right): each answer is
+        refused at each check, the request is kept, nothing of the identity changes (root.pem
+        byte for byte) and the device stays connected with its old pair."""
+        agent, identity = self.registered(name, status_interval=1)
+        old = self.identity_files(agent)
+        old_root, old_chain = agent.path("root.pem").read_bytes(), agent.read_text("chain.pem")
+        put_right = go_wrong()
+        try:
+            agent.start("run")
+            mark = "does not chain to the platform root"
+            wait_until(lambda: agent.running_log.count(mark) >= 2, 30, "two answers refused")
+            before = len(self.statuses(identity))
+            wait_until(lambda: len(self.statuses(identity)) > before, 30, "still connected")
+        finally:
+            put_right()
+
+        self.assertEqual(old, self.identity_files(agent))
+        self.assertEqual(old_root, agent.path("root.pem").read_bytes(), "the root never changes")
+        self.assertEqual(old_chain, agent.read_text("chain.pem"))
+        self.assertTrue(agent.path("renewal-new.key").exists(), "request kept")
+        self.assertTrue(agent.path("renewal-request.json").exists())
+        self.assertNotIn("device certificate renewed", agent.running_log)
+        self.stop_and_check(agent)
+
     def test_answer_not_chaining_to_current_root_is_not_installed(self):
         other = Pki(self.tmp / "other-pki", tenant_id=self.pki.tenant_id)
         cases = {
             "another root": (other, None),
             "our chain, another issuer": (other, self.pki.chain_pem),
         }
+        platform = self.platform
+
+        def wrong(issuer, chain):
+            platform.issuer, platform.chain_override = issuer, chain
+
+            def put_right():
+                platform.issuer, platform.chain_override = None, None
+
+            return put_right
+
         for case, (issuer, chain) in cases.items():
             with self.subTest(case=case):
-                agent, identity = self.registered(case.replace(" ", "-"), status_interval=1)
-                old = self.identity_files(agent)
-                self.platform.issuer, self.platform.chain_override = issuer, chain
+                self.assert_answers_refused(case.replace(" ", "-"), lambda: wrong(issuer, chain))
 
-                agent.start("run")
-                mark = "does not chain to the platform root"
-                wait_until(lambda: agent.running_log.count(mark) >= 2, 30, "two answers refused")
-                before = len(self.statuses(identity))
-                wait_until(lambda: len(self.statuses(identity)) > before, 30, "still connected")
-
-                self.platform.issuer, self.platform.chain_override = None, None
-                self.assertEqual(old, self.identity_files(agent))
-                self.assertEqual(cert_pem(self.pki.root), agent.read_text("root.pem"))
-                self.assertEqual(self.pki.chain_pem, agent.read_text("chain.pem"))
-                self.assertTrue(agent.path("renewal-new.key").exists(), "request kept")
-                self.assertTrue(agent.path("renewal-request.json").exists())
-                self.assertNotIn("device certificate renewed", agent.running_log)
-                self.stop_and_check(agent)
+    def test_chain_with_anything_but_certificate_blocks_is_not_installed(self):
+        evil = cert_pem(Pki(self.tmp / "evil-pki").root)
+        cases = {
+            # OpenSSL's PEM reader skips a BEGIN line that does not start a line: a text search
+            # for the last BEGIN would find this root.
+            "a root hidden mid-line": lambda chain: chain + "x" + evil,
+            "a last block that is not base64": lambda chain: (
+                chain + "-----BEGIN CERTIFICATE-----\n!!!!not base64!!!!\n"
+                "-----END CERTIFICATE-----\n"
+            ),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                self.assert_answers_refused(
+                    case.replace(" ", "-"),
+                    lambda: self.platform.tamper_renewals(
+                        lambda answer: answer.update(chain=change(answer["chain"]))
+                    ),
+                )
 
 
 class RenewalCrashTest(RenewalBase):
@@ -341,7 +382,6 @@ class RenewalCrashTest(RenewalBase):
     SWAP = [
         ("renewal-device.pem", "device.pem"),
         ("renewal-chain.pem", "chain.pem"),
-        ("renewal-root.pem", "root.pem"),
         ("renewal-new.key", "device.key"),
         ("renewal-device.json", "device.json"),
     ]
@@ -363,12 +403,11 @@ class RenewalCrashTest(RenewalBase):
         agent.path("renewal-request.json").write_text('{"certificate":"x","csr":"y","proof":"z"}')
         agent.path("renewal-device.pem").write_text(cert)
         agent.path("renewal-chain.pem").write_text(self.pki.chain_pem)
-        agent.path("renewal-root.pem").write_text(cert_pem(self.pki.root))
         agent.path("renewal-device.json").write_text(json.dumps(identity))
         return cert, key_pem(key)
 
     def test_crash_during_swap_is_finished_at_start(self):
-        for done in [0, 1, 3, 4, 5]:  # renames done before the crash, the marker written
+        for done in [0, 1, 2, 3, 4]:  # renames done before the crash, the marker written
             with self.subTest(done=done):
                 agent, identity = self.registered(f"agent-{done}", days_left=700)
                 cert, key = self.pending_identity(agent, identity)
