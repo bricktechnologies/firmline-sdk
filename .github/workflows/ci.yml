@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check.sh
+
+  test-arm64:
+    # Unit tests only, emulated: run only when the repository is public (private minutes are limited).
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - run: |
+          docker build -q -t firmline-dev --platform linux/arm64 -f docker/dev.Dockerfile docker
+          docker run --rm --platform linux/arm64 -v "$PWD:/work" firmline-dev bash -c '
+            set -euo pipefail
+            cmake -S . -B build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DFIRMLINE_BUILD_AGENT=OFF
+            cmake --build build-arm64 -j2
+            ctest --test-dir build-arm64 --output-on-failure'
