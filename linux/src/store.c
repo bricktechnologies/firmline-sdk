@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define READ_LIMIT (1024 * 1024)
@@ -65,7 +66,9 @@ int fa_store_write(const char *dir, const char *name, const void *data, size_t l
     if (fd < 0)
         return -1;
 
-    if (write_all(fd, data, len) != 0 || fsync(fd) != 0) {
+    /* The umask can only have narrowed the mode at creation. Set it exactly now, before any byte
+     * is written: the file is still empty and private to the agent, never wider than asked. */
+    if (fchmod(fd, mode) != 0 || write_all(fd, data, len) != 0 || fsync(fd) != 0) {
         close(fd);
         unlink(tmp);
         return -1;

@@ -7,14 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-/* Writes `text` to a new temp file and loads it. The file is removed afterwards. */
-static int load_text(const char *text, fa_config *cfg, char err[256]) {
+/* Writes n bytes to a new temp file and loads it. The file is removed afterwards. */
+static int load_bytes(const char *text, size_t n, fa_config *cfg, char err[256]) {
     char path[] = "/tmp/fa-conf-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0)
         return -2;
-    size_t n = strlen(text);
     if (write(fd, text, n) != (ssize_t)n) {
         close(fd);
         return -2;
@@ -23,6 +21,10 @@ static int load_text(const char *text, fa_config *cfg, char err[256]) {
     int rc = fa_config_load(path, cfg, err);
     unlink(path);
     return rc;
+}
+
+static int load_text(const char *text, fa_config *cfg, char err[256]) {
+    return load_bytes(text, strlen(text), cfg, err);
 }
 
 /* Seven lines: the platform section (1-4) and one main component (5-7); an added line is line 8. */
@@ -176,9 +178,9 @@ static void config_refuses_malformed_input(void) {
     CHECK_EQ_INT(load_text("[platform]\nurl\n", &cfg, err), -1);
     CHECK(strstr(err, "line 2") != NULL);
     /* repeated key, repeated section, repeated component code */
-    CHECK_EQ_INT(load_text("[platform]\nurl = a\nurl = b\n", &cfg, err), -1);
+    CHECK_EQ_INT(load_text("[platform]\nurl = https://a\nurl = b\n", &cfg, err), -1);
     CHECK(strstr(err, "line 3") != NULL);
-    CHECK_EQ_INT(load_text("[platform]\nurl = a\n[platform]\n", &cfg, err), -1);
+    CHECK_EQ_INT(load_text("[platform]\nurl = https://a\n[platform]\n", &cfg, err), -1);
     CHECK(strstr(err, "line 3") != NULL);
     snprintf(buf, sizeof buf, "%s[component os]\nversion = fixed:2\n", MINIMAL);
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
@@ -186,28 +188,28 @@ static void config_refuses_malformed_input(void) {
     /* bad component codes */
     const char *bad[] = {"UPPER", "-lead", "", "has space", ".dot"};
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        snprintf(buf, sizeof buf, "[platform]\nurl = a\n[component %s]\n", bad[i]);
+        snprintf(buf, sizeof buf, "[platform]\nurl = https://a\n[component %s]\n", bad[i]);
         CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
         CHECK(strstr(err, "line 3") != NULL);
     }
-    strcpy(buf, "[platform]\nurl = a\n[component ");
+    strcpy(buf, "[platform]\nurl = https://a\n[component ");
     memset(buf + strlen(buf), 'a', 65);
     strcpy(buf + strlen(buf) + 0, "]\n");
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
     /* more than 16 components */
-    strcpy(buf, "[platform]\nurl = a\n");
+    strcpy(buf, "[platform]\nurl = https://a\n");
     for (int i = 0; i < 17; i++)
         sprintf(buf + strlen(buf), "[component c%d]\nversion = fixed:1\n", i);
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
     CHECK(strstr(err, "line 35") != NULL);
     /* a line over 1023 bytes */
-    strcpy(buf, "[platform]\nurl = ");
+    strcpy(buf, "[platform]\nurl = https://");
     memset(buf + strlen(buf), 'x', 1100);
     strcpy(buf + strlen(buf), "\n");
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
     CHECK(strstr(err, "line 2") != NULL);
     /* a value too long for its field */
-    strcpy(buf, "[platform]\nurl = ");
+    strcpy(buf, "[platform]\nurl = https://");
     memset(buf + strlen(buf), 'x', 300);
     strcpy(buf + strlen(buf), "\n");
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
@@ -243,6 +245,57 @@ static void config_refuses_malformed_input(void) {
     CHECK_EQ_INT(fa_config_load("/nonexistent/agent.conf", &cfg, err), -1);
 }
 
+static void config_handles_line_endings_and_nul_bytes(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    char buf[1024];
+    /* CRLF line endings are accepted, the CR is not part of any value */
+    CHECK_EQ_INT(load_text("[platform]\r\nurl = https://p\r\nbroker = b\r\nupdate_key = /k\r\n"
+                           "[component os]\r\nmain = true\r\nversion = fixed:1.0\r\n",
+                           &cfg, err),
+                 0);
+    CHECK_EQ_STR(cfg.platform_url, "https://p");
+    CHECK_EQ_STR(cfg.component[0].source_arg, "1.0");
+    /* the last line without a newline is accepted */
+    CHECK_EQ_INT(load_text("[platform]\nurl = https://p\nbroker = b\nupdate_key = /k\n"
+                           "[component os]\nmain = true\nversion = fixed:2.0",
+                           &cfg, err),
+                 0);
+    CHECK_EQ_STR(cfg.component[0].source_arg, "2.0");
+    /* an equals sign inside a value is kept */
+    snprintf(buf, sizeof buf, "%sinstall = script:/opt/a=b\n", MINIMAL);
+    CHECK_EQ_INT(load_text(buf, &cfg, err), 0);
+    CHECK_EQ_STR(cfg.component[0].script, "/opt/a=b");
+    CHECK_EQ_INT(load_text("[platform]\nurl = https://p?a=b\nbroker = b\nupdate_key = /k\n"
+                           "[component os]\nmain = true\nversion = fixed:a=b\n",
+                           &cfg, err),
+                 0);
+    CHECK_EQ_STR(cfg.platform_url, "https://p?a=b");
+    CHECK_EQ_STR(cfg.component[0].source_arg, "a=b");
+    /* a NUL byte anywhere is an error with its line number */
+    CHECK_EQ_INT(load_bytes("[platform]\n\0url = https://p\n", 29, &cfg, err), -1);
+    CHECK(strstr(err, "line 2") != NULL);
+    CHECK_EQ_INT(load_bytes("[platform]\nurl = https://p\0junk\n", 32, &cfg, err), -1);
+    CHECK(strstr(err, "line 2") != NULL);
+    CHECK_EQ_INT(load_bytes("\0", 1, &cfg, err), -1);
+    CHECK(strstr(err, "line 1") != NULL);
+}
+
+static void config_platform_value_rules(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    CHECK_EQ_INT(load_text("[platform]\nurl = http://p\n", &cfg, err), -1);
+    CHECK(strstr(err, "line 2") != NULL);
+    CHECK(strstr(err, "https://") != NULL);
+    CHECK_EQ_INT(load_text("[platform]\nurl = https://\n", &cfg, err), -1);
+    CHECK_EQ_INT(load_text("[platform]\nupdate_key = key.pem\n", &cfg, err), -1);
+    CHECK(strstr(err, "line 2") != NULL);
+    CHECK(strstr(err, "absolute") != NULL);
+    CHECK_EQ_INT(load_text("[platform]\nreboot_command = reboot now\n", &cfg, err), -1);
+    CHECK(strstr(err, "line 2") != NULL);
+    CHECK(strstr(err, "absolute") != NULL);
+}
+
 static void config_key_table_is_exposed(void) {
     size_t n = 0;
     const char *const *keys = fa_config_keys(&n);
@@ -265,6 +318,8 @@ int main(void) {
     RUN(config_refuses_unknown_key_with_line_number);
     RUN(config_refuses_docker_compose_for_now);
     RUN(config_refuses_malformed_input);
+    RUN(config_handles_line_endings_and_nul_bytes);
+    RUN(config_platform_value_rules);
     RUN(config_key_table_is_exposed);
     return CHECK_RESULT;
 }

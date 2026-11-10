@@ -150,7 +150,9 @@ static int platform_value(parser *p, key_id key, const char *v) {
     case K_URL:
         if (!set_str(c->platform_url, sizeof c->platform_url, v))
             return fail(p, "url is too long");
-        p->have_url = v[0] != '\0';
+        if (strncmp(v, "https://", 8) != 0 || v[8] == '\0')
+            return fail(p, "url must start with https://");
+        p->have_url = true;
         return 0;
     case K_BROKER:
         if (!set_str(c->broker_host, sizeof c->broker_host, v))
@@ -166,7 +168,9 @@ static int platform_value(parser *p, key_id key, const char *v) {
     case K_UPDATE_KEY:
         if (!set_str(c->update_key, sizeof c->update_key, v))
             return fail(p, "update_key is too long");
-        p->have_update_key = v[0] != '\0';
+        if (!is_abs_path(v))
+            return fail(p, "update_key must be an absolute path");
+        p->have_update_key = true;
         return 0;
     case K_FAMILY:
         return set_str(c->family, sizeof c->family, v) ? 0 : fail(p, "family is too long");
@@ -183,6 +187,9 @@ static int platform_value(parser *p, key_id key, const char *v) {
         return set_str(c->os_release, sizeof c->os_release, v) ? 0
                                                                : fail(p, "os_release is too long");
     case K_REBOOT_COMMAND:
+        /* split on spaces and spawned without a shell: the program must be a full path */
+        if (v[0] != '\0' && !is_abs_path(v))
+            return fail(p, "reboot_command must start with an absolute path");
         return set_str(c->reboot_command, sizeof c->reboot_command, v)
                    ? 0
                    : fail(p, "reboot_command is too long");
@@ -363,15 +370,33 @@ int fa_config_load(const char *path, fa_config *out, char err[256]) {
     p.cfg = out;
     p.err = err;
 
-    char buf[MAX_LINE + 2]; /* the line, its newline and the terminator */
+    char buf[MAX_LINE + 1];
     int rc = 0;
-    while (rc == 0 && fgets(buf, sizeof buf, f) != NULL) {
+    for (;;) {
+        /* Read byte by byte, so the real length is known: a NUL byte is an error, not a cut. */
+        size_t n = 0;
+        int ch, got_any = 0, too_long = 0, has_nul = 0;
+        while ((ch = fgetc(f)) != EOF && ch != '\n') {
+            got_any = 1;
+            if (ch == '\0')
+                has_nul = 1;
+            if (n < MAX_LINE)
+                buf[n++] = (char)ch;
+            else
+                too_long = 1;
+        }
+        if (ch == EOF && !got_any)
+            break;
         p.line++;
-        size_t n = strlen(buf);
-        if (buf[n - 1] != 0x0a && n > MAX_LINE) {
+        if (has_nul) {
+            rc = fail(&p, "the file contains a NUL byte");
+            break;
+        }
+        if (too_long) {
             rc = fail(&p, "line is longer than %d bytes", MAX_LINE);
             break;
         }
+        buf[n] = '\0';
         char *line = trim(buf);
         if (*line == '\0' || *line == '#' || *line == ';')
             continue;
@@ -386,6 +411,8 @@ int fa_config_load(const char *path, fa_config *out, char err[256]) {
         } else {
             rc = key_value(&p, line);
         }
+        if (rc != 0)
+            break;
     }
     if (rc == 0 && ferror(f)) {
         p.line = 0;

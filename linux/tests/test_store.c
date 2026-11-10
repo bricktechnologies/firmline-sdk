@@ -27,6 +27,7 @@ static int count_entries(const char *dir) {
 }
 
 static void store_write_is_atomic(void) {
+    umask(022);
     char dir[64];
     make_dir(dir, sizeof dir);
     CHECK_EQ_INT(fa_store_write(dir, "device.key", "old", 3, 0600), 0);
@@ -66,6 +67,25 @@ static void store_write_is_atomic(void) {
 
     /* a folder that does not exist */
     CHECK_EQ_INT(fa_store_write("/nonexistent-dir-fa", "x", "x", 1, 0600), -1);
+}
+
+static void store_mode_is_exact_whatever_the_umask(void) {
+    mode_t saved = umask(0);
+    mode_t umasks[] = {077, 0, 027};
+    mode_t modes[] = {0644, 0600, 0640, 0755};
+    for (size_t u = 0; u < sizeof umasks / sizeof umasks[0]; u++) {
+        umask(umasks[u]);
+        for (size_t m = 0; m < sizeof modes / sizeof modes[0]; m++) {
+            char dir[64], path[128];
+            make_dir(dir, sizeof dir);
+            CHECK_EQ_INT(fa_store_write(dir, "f", "x", 1, modes[m]), 0);
+            snprintf(path, sizeof path, "%s/f", dir);
+            struct stat st;
+            CHECK_EQ_INT(stat(path, &st), 0);
+            CHECK_EQ_INT(st.st_mode & 0777, modes[m]);
+        }
+    }
+    umask(saved);
 }
 
 static void store_refuses_bad_names(void) {
@@ -125,6 +145,7 @@ static void store_remove_deletes_and_tolerates_missing(void) {
 
 int main(void) {
     RUN(store_write_is_atomic);
+    RUN(store_mode_is_exact_whatever_the_umask);
     RUN(store_refuses_bad_names);
     RUN(store_read_missing_is_error);
     RUN(store_read_limit_is_one_mebibyte);
