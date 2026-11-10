@@ -29,7 +29,13 @@ typedef struct {
     void *ctx;
 } fl_device;
 
-typedef enum { FL_OFFER_INSTALL, FL_OFFER_WAIT, FL_OFFER_REJECT, FL_OFFER_IGNORE } fl_offer_action;
+/* IGNORE is 0, so a zero-initialised fl_offer never reads as INSTALL. */
+typedef enum {
+    FL_OFFER_IGNORE = 0,
+    FL_OFFER_REJECT = 1,
+    FL_OFFER_WAIT = 2,
+    FL_OFFER_INSTALL = 3
+} fl_offer_action;
 
 /* The decision on an offer.
  * INSTALL and WAIT: every field below is filled from the verified manifest and the offer.
@@ -67,7 +73,8 @@ typedef struct {
  * GUIDs and kid are compared ignoring case. `release` is kept as written in the manifest.
  * Returns FL_OK with a decision in *out. Errors (out->action IGNORE, all zero): FL_ERR_ARG for a
  * NULL argument or callback, or an update key that is not a P-256 SubjectPublicKeyInfo;
- * FL_ERR_CRYPTO when the crypto library fails (fl_init not called, out of memory).
+ * FL_ERR_CRYPTO when the crypto library fails (fl_init not called, out of memory, any PSA
+ * status other than PSA_ERROR_INVALID_SIGNATURE): never a refusal the platform would count.
  * No allocation of its own (Mbed TLS allocates while verifying); about 7 KB of stack. */
 int fl_offer_check(const fl_device *dev, const char *json, size_t len, fl_time now, fl_offer *out);
 

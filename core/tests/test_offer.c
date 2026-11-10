@@ -887,6 +887,136 @@ static void repeated_checks_do_not_leak_keys(void) {
     CHECK_EQ_INT(after.locked_slots, 0);
 }
 
+/* Review Focus 2: with the clock at 1970 and notBefore in 2027, an offer refused for any reason
+ * is refused, never kept waiting. */
+static void wait_comes_after_every_other_check(void) {
+    static char zeros[80];
+    test_ctx c;
+    fl_device dv = vector_device(&c), d = signer_device(&c);
+    fl_time boot = at("1970-01-01T00:01:00Z");
+    manifest_spec m;
+    fl_offer o;
+    uint8_t sig[64];
+    char b64[89];
+    size_t n = 0;
+
+    /* a flipped signature byte */
+    CHECK_EQ_INT(mbedtls_base64_decode(sig, sizeof sig, &n, (const unsigned char *)vector_sig,
+                                       strlen(vector_sig)),
+                 0);
+    sig[10] ^= 0x01;
+    CHECK_EQ_INT(mbedtls_base64_encode((unsigned char *)b64, sizeof b64, &n, sig, sizeof sig), 0);
+    dirty(&o);
+    CHECK_EQ_INT(check_raw(&dv, (const uint8_t *)vector_manifest, vector_manifest_len, "ES256", b64,
+                           boot, &o),
+                 FL_OK);
+    check_reject(&o, FL_RESULT_REJECTED_SIGNATURE, "signature_invalid");
+
+    /* a manifest kid that is not the device key's */
+    manifest_default(&m, &test_signer);
+    m.kid = quoted(zeros, '0', 64);
+    dirty(&o);
+    CHECK_EQ_INT(check_signed(&m, &d, boot, NULL, &o), FL_OK);
+    check_reject(&o, FL_RESULT_REJECTED_SIGNATURE, "kid_mismatch");
+
+    /* size 0 */
+    manifest_default(&m, &test_signer);
+    m.size = "0";
+    dirty(&o);
+    CHECK_EQ_INT(check_signed(&m, &d, boot, NULL, &o), FL_OK);
+    check_reject(&o, FL_RESULT_FAILED, "format_unknown");
+
+    /* another tenant */
+    manifest_default(&m, &test_signer);
+    m.tenant = "\"11111111-2222-4333-8444-555555555556\"";
+    dirty(&o);
+    CHECK_EQ_INT(check_signed(&m, &d, boot, NULL, &o), FL_OK);
+    check_reject(&o, FL_RESULT_FAILED, "tenant_mismatch");
+
+    /* another family, a `none` component */
+    manifest_default(&m, &test_signer);
+    m.family = "\"66666666-7777-4888-9999-aaaaaaaaaaab\"";
+    dirty(&o);
+    CHECK_EQ_INT(check_signed(&m, &d, boot, NULL, &o), FL_OK);
+    check_reject(&o, FL_RESULT_FAILED, "family_mismatch");
+    manifest_default(&m, &test_signer);
+    m.component = "\"torizon-os\"";
+    dirty(&o);
+    CHECK_EQ_INT(check_signed(&m, &d, boot, NULL, &o), FL_OK);
+    check_reject(&o, FL_RESULT_FAILED, "component_mismatch");
+}
+
+/* r or s zero or not below the order n of P-256: what Mbed TLS returns for them is pinned here
+ * (PSA_ERROR_INVALID_SIGNATURE), and fl_offer_check refuses them as signature_invalid. */
+static void out_of_range_signatures_are_signature_invalid(void) {
+    static const uint8_t order[32] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+                                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                      0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+                                      0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51};
+    psa_key_attributes_t a = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key = 0;
+    test_ctx c;
+    fl_device d = vector_device(&c);
+    uint8_t good[64], sigs[7][64];
+    size_t n = 0, i;
+    CHECK_EQ_INT(mbedtls_base64_decode(good, sizeof good, &n, (const unsigned char *)vector_sig,
+                                       strlen(vector_sig)),
+                 0);
+    memset(sigs[0], 0x00, 64); /* r = s = 0 */
+    memset(sigs[1], 0xff, 64); /* r, s > n */
+    memcpy(sigs[2], good, 64); /* r = 0 */
+    memset(sigs[2], 0x00, 32);
+    memcpy(sigs[3], good, 64); /* s = 0 */
+    memset(sigs[3] + 32, 0x00, 32);
+    memcpy(sigs[4], good, 64); /* r = n */
+    memcpy(sigs[4], order, 32);
+    memcpy(sigs[5], good, 64); /* s = n */
+    memcpy(sigs[5] + 32, order, 32);
+    memcpy(sigs[6], good, 64); /* r = n + 1 */
+    memcpy(sigs[6], order, 32);
+    sigs[6][31]++;
+
+    /* The vector key (the point after the 26-byte SPKI prefix) straight into PSA. */
+    CHECK(vector_key_len == 91);
+    psa_set_key_type(&a, PSA_KEY_TYPE_ECC_PUBLIC_KEY(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&a, 256);
+    psa_set_key_usage_flags(&a, PSA_KEY_USAGE_VERIFY_MESSAGE);
+    psa_set_key_algorithm(&a, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    CHECK_EQ_INT(psa_import_key(&a, vector_key + 26, 65, &key), PSA_SUCCESS);
+    CHECK_EQ_INT(psa_verify_message(key, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                                    (const uint8_t *)vector_manifest, vector_manifest_len, good,
+                                    64),
+                 PSA_SUCCESS);
+
+    for (i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        char b64[89];
+        fl_offer o;
+        CHECK_EQ_INT(psa_verify_message(key, PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                                        (const uint8_t *)vector_manifest, vector_manifest_len,
+                                        sigs[i], 64),
+                     PSA_ERROR_INVALID_SIGNATURE);
+        CHECK_EQ_INT(mbedtls_base64_encode((unsigned char *)b64, sizeof b64, &n, sigs[i], 64), 0);
+        dirty(&o);
+        CHECK_EQ_INT(check_raw(&d, (const uint8_t *)vector_manifest, vector_manifest_len, "ES256",
+                               b64, at(NOT_BEFORE), &o),
+                     FL_OK);
+        check_reject(&o, FL_RESULT_REJECTED_SIGNATURE, "signature_invalid");
+    }
+    psa_destroy_key(key);
+}
+
+/* A zero-initialised fl_offer must never read as INSTALL. */
+static void zeroed_offer_is_not_install(void) {
+    fl_offer o;
+    memset(&o, 0, sizeof o);
+    CHECK(o.action != FL_OFFER_INSTALL);
+    CHECK_EQ_INT(o.action, FL_OFFER_IGNORE);
+    CHECK_EQ_INT(FL_OFFER_IGNORE, 0);
+    CHECK_EQ_INT(FL_OFFER_REJECT, 1);
+    CHECK_EQ_INT(FL_OFFER_WAIT, 2);
+    CHECK_EQ_INT(FL_OFFER_INSTALL, 3);
+}
+
 int main(void) {
     if (fl_init() != FL_OK || !load_vector() || signer_init(&test_signer) != 0) {
         fprintf(stderr, "setup failed\n");
@@ -918,6 +1048,9 @@ int main(void) {
     RUN(unreadable_offers_are_ignored);
     RUN(invalid_arguments);
     RUN(repeated_checks_do_not_leak_keys);
+    RUN(wait_comes_after_every_other_check);
+    RUN(out_of_range_signatures_are_signature_invalid);
+    RUN(zeroed_offer_is_not_install);
     signer_free(&test_signer);
     return CHECK_RESULT;
 }
