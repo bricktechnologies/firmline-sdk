@@ -6,12 +6,21 @@ connection, verified with the root received at registration."""
 
 import datetime
 import json
+import socket
+import ssl
 import unittest
 import uuid
 
 from cryptography import x509
 
-from harness import FakePlatform, Pki, assert_no_secrets, utc_now, wait_until
+from harness import (
+    FakePlatform,
+    Pki,
+    assert_no_secrets,
+    trust_system_wide,
+    utc_now,
+    wait_until,
+)
 from test_ota import OtaBase, payload
 
 DAY = datetime.timedelta(days=1)
@@ -210,6 +219,57 @@ class EndpointTest(CommandsBase):
 
         result = agent.run("endpoint", "--direct")  # nothing to remove: fine
         self.assertEqual(0, result.code, result.stderr)
+
+
+class SystemTrustTest(CommandsBase):
+    """A CA file in use (root.pem through a relay, ca_file directly) is the only trust: an HTTPS
+    certificate of an authority the system trusts (a public CA) is refused."""
+
+    def public_certificate(self):
+        """A certificate for localhost from a CA put into the system's CA directory; checked to
+        be trusted by the system's default verification, so that a refusal means something."""
+        public = Pki(self.tmp / "public-ca", name="Public Test")  # a subject of its own
+        trust_system_wide(self, public.root_path)
+        return public.server_certificate("public-https")
+
+    def assert_system_trusts(self, port):
+        context = ssl.create_default_context()  # the system's authorities only
+        with socket.create_connection(("localhost", port), timeout=10) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost"):
+                pass
+
+    def test_relay_with_certificate_of_a_system_authority_is_refused(self):
+        relay = self.platform.relay(self.public_certificate()).start()
+        self.addCleanup(relay.stop)
+        self.assert_system_trusts(relay.port)
+        agent = self.make_agent(broker=self.broker)
+        self.platform.certificates(datetime.timedelta(days=59))
+        self.register(agent)
+        self.platform.default_certificates()
+        args = ["--relay", "localhost", "--https-port", relay.port]
+        self.assertEqual(0, agent.run("endpoint", *args, "--broker-port", self.broker.port).code)
+
+        agent.start("run")
+        agent.wait_for_log("certificate renewal: no answer")
+
+        self.assertEqual([], relay.requests_to(FakePlatform.RENEWAL), "no request reached it")
+        self.assertTrue(agent.path("renewal-request.json").exists(), "kept for a later check")
+        self.assertNotIn("device certificate renewed", agent.running_log)
+        self.assertEqual(0, agent.stop())
+        assert_no_secrets(agent.log, [agent.read_text("device.key")])
+
+    def test_ca_file_excludes_the_system_authorities(self):
+        platform = FakePlatform(self.pki, server_cert=self.public_certificate()).start()
+        self.addCleanup(platform.stop)
+        self.assert_system_trusts(platform.port)
+        agent = self.make_agent(platform=platform)  # ca_file = the test root
+
+        token = platform.new_token()
+        result = agent.run("register", "--token", token, "--serial", "SN-public")
+
+        self.assertEqual((3, "network_error"), (result.code, result.stdout.strip()))
+        self.assertEqual([], platform.requests_to(FakePlatform.PROVISIONING))
+        assert_no_secrets(agent.log, [token])
 
 
 if __name__ == "__main__":
