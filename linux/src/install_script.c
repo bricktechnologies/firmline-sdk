@@ -19,6 +19,7 @@ extern char **environ;
 
 #define REBOOT_TIMEOUT_S 60
 #define STOP_GRACE_MS 5000
+#define KILL_WAIT_MS 1000
 #define MAX_ARGS 16
 
 static long long now_ms(void) {
@@ -103,6 +104,8 @@ static int spawn(fa_child *c, char *const argv[], int timeout_s) {
         posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO) == 0 &&
         posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDERR_FILENO) == 0 &&
         posix_spawn_file_actions_addchdir_np(&actions, "/") == 0 &&
+        /* nothing of the agent beyond 0-2 (the broker socket, the download, the data folder) */
+        posix_spawn_file_actions_addclosefrom_np(&actions, 3) == 0 &&
         posix_spawnattr_setsigmask(&attr, &none) == 0 &&
         posix_spawnattr_setsigdefault(&attr, &defaults) == 0 &&
         posix_spawnattr_setpgroup(&attr, 0) == 0 &&
@@ -167,12 +170,9 @@ static void kill_group(fa_child *c, int sig, bool reaped) {
         kill(c->pid, sig);
 }
 
-/* Waits for the process after SIGKILL (it cannot refuse) and closes its output. */
-static void reap(fa_child *c) {
-    int status;
-    while (waitpid(c->pid, &status, 0) < 0 && errno == EINTR) {
-    }
-    read_output(c);
+/* The program is gone (reaped, or no longer our child): its output is closed. */
+static void forget(fa_child *c) {
+    read_output(c); /* what it wrote last; a background process it left may keep the pipe */
     if (c->out >= 0) {
         close(c->out);
         c->out = -1;
@@ -183,64 +183,58 @@ static void reap(fa_child *c) {
 
 int fa_child_poll(fa_child *c, int *exit_code, bool *timed_out) {
     *exit_code = -1;
-    *timed_out = false;
+    *timed_out = c->timed_out;
     if (c->pid == 0)
         return 0;
     read_output(c);
     int status = 0;
     pid_t w = waitpid(c->pid, &status, WNOHANG);
     if (w == c->pid) {
-        /* What it wrote last; a background process it left may keep the pipe open: no wait. */
-        read_output(c);
-        if (c->out >= 0) {
-            close(c->out);
-            c->out = -1;
-        }
-        flush_line(c);
-        c->pid = 0;
-        *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        forget(c);
+        if (!c->killed)
+            *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         return 0;
     }
     if (w < 0 && errno != EINTR) { /* not our child any more: nothing to wait for */
-        if (c->out >= 0) {
-            close(c->out);
-            c->out = -1;
-        }
-        flush_line(c);
-        c->pid = 0;
+        forget(c);
         return 0;
     }
-    if (c->deadline != 0 && now_ms() >= c->deadline) {
+    if (!c->killed && c->deadline != 0 && now_ms() >= c->deadline) {
+        /* Never waited for here: a process in uninterruptible sleep would block the loop. It is
+         * reaped by a later poll. */
         kill_group(c, SIGKILL, false);
-        reap(c);
-        *timed_out = true;
-        return 0;
+        c->killed = true;
+        c->timed_out = true;
     }
     return 1;
+}
+
+/* Polls for the exit until `until` (monotonic ms) without blocking longer than 100 ms at once.
+ * True when it was reaped. */
+static bool wait_exit(fa_child *c, long long until) {
+    int status;
+    while (now_ms() < until) {
+        read_output(c);
+        pid_t w = waitpid(c->pid, &status, WNOHANG);
+        if (w == c->pid || (w < 0 && errno != EINTR))
+            return true;
+        struct pollfd pfd = {c->out, POLLIN, 0};
+        poll(&pfd, c->out >= 0 ? 1 : 0, 100);
+    }
+    return false;
 }
 
 void fa_child_stop(fa_child *c) {
     if (c->pid == 0)
         return;
-    kill_group(c, SIGTERM, false);
-    long long until = now_ms() + STOP_GRACE_MS;
-    int status;
-    while (now_ms() < until) {
-        read_output(c);
-        pid_t w = waitpid(c->pid, &status, WNOHANG);
-        if (w == c->pid || (w < 0 && errno != EINTR)) {
-            kill_group(c, SIGKILL, true); /* what it left behind in its group */
-            if (c->out >= 0) {
-                close(c->out);
-                c->out = -1;
-            }
-            flush_line(c);
-            c->pid = 0;
-            return;
-        }
-        struct pollfd pfd = {c->out, POLLIN, 0};
-        poll(&pfd, c->out >= 0 ? 1 : 0, 100);
+    if (!c->killed)
+        kill_group(c, SIGTERM, false);
+    if (!wait_exit(c, now_ms() + STOP_GRACE_MS)) {
+        kill_group(c, SIGKILL, false);
+        if (!wait_exit(c, now_ms() + KILL_WAIT_MS))
+            fa_log("warning", "process %ld does not end after SIGKILL: left behind", (long)c->pid);
+    } else {
+        kill_group(c, SIGKILL, true); /* what it left behind in its group */
     }
-    kill_group(c, SIGKILL, false);
-    reap(c);
+    forget(c);
 }

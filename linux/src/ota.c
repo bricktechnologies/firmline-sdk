@@ -18,6 +18,7 @@
 #include "firmline/fl_offer.h"
 #include "firmline/fl_policy.h"
 #include "firmline/fl_queue.h"
+#include "firmline/fl_version.h"
 #include "http.h"
 #include "install_script.h"
 #include "log.h"
@@ -43,6 +44,7 @@
 #define RESULT_TOPIC "ota/result"
 #define INSTALL_STATE "install.json"
 #define RELEASE_LEN 36
+#define CLOSE_GRACE_S 5 /* for a running script to end when the agent stops */
 
 typedef struct {
     char release[RELEASE_LEN + 1]; /* lower case */
@@ -79,6 +81,7 @@ struct fa_ota {
 
     job_state state;
     bool reboot_pending; /* a script exited 10: nothing more is installed before the restart */
+    bool stopping;       /* fa_ota_close: no reboot_command any more */
     char reboot_release[RELEASE_LEN + 1];
     fl_offer job; /* the release being worked on (its link refreshed from the queue) */
     const fa_component *comp;
@@ -354,6 +357,7 @@ static void finish(fa_ota *o, fl_result result, const char *detail, const char *
     remove_file(o, "download-", o->job.release, ".part");
     remove_file(o, "download-", o->job.release, ".bin");
     forget_offer(o, o->job.release);
+    fa_store_remove(o->cfg->data_dir, INSTALL_STATE); /* after the result: it settles it now */
     if (result == FL_RESULT_INSTALLED)
         fa_service_request_status(o->svc);
 }
@@ -560,14 +564,66 @@ static int on_bytes(void *ctx, int status, int64_t range_start, const void *data
     return 0;
 }
 
+/* The boot id of the running system (a new one at every boot), "" when unreadable. The path can
+ * be changed with the environment variable FIRMLINE_BOOT_ID_FILE: for the integration tests only,
+ * which play a reboot without rebooting. */
+static void boot_id(char out[65]) {
+    const char *path = getenv("FIRMLINE_BOOT_ID_FILE");
+    if (path == NULL || path[0] == '\0')
+        path = "/proc/sys/kernel/random/boot_id";
+    char buf[128];
+    FILE *f = fopen(path, "r");
+    size_t n = f != NULL ? fread(buf, 1, sizeof buf, f) : 0;
+    if (f != NULL)
+        fclose(f);
+    if (fa_first_line_value(buf, n, out) != 0)
+        out[0] = '\0';
+}
+
+/* install.json for the job: {release, component, version, state, bootId}. state "running" while
+ * the script runs, "reboot" after it exited 10. 0, or -1. */
+static int save_install_state(fa_ota *o, const char *state) {
+    char json[512], boot[65];
+    boot_id(boot);
+    fl_jw w;
+    fl_jw_begin(&w, json, sizeof json);
+    fl_jw_string(&w, "release", o->job.release);
+    fl_jw_string(&w, "component", o->comp->code);
+    fl_jw_string(&w, "version", o->job.version);
+    fl_jw_string(&w, "state", state);
+    fl_jw_string(&w, "bootId", boot);
+    int n = fl_jw_end(&w);
+    if (n < 0 || fa_store_write(o->cfg->data_dir, INSTALL_STATE, json, (size_t)n, 0644) != 0) {
+        fa_log("error", "cannot write %s/%s", o->cfg->data_dir, INSTALL_STATE);
+        return -1;
+    }
+    return 0;
+}
+
 static void start_install(fa_ota *o) {
     char part[96], bin[96], path[PATH_MAX];
     file_name(part, sizeof part, "download-", o->job.release, ".part");
     file_name(bin, sizeof bin, "download-", o->job.release, ".bin");
     end_job(o); /* closes the .part */
+    /* The version again right before the script: another release may have installed a newer one
+     * since the offer was checked (no rollback without `rollback`). */
+    const char *installed = current_version(o);
+    if (!o->job.rollback && fl_version_too_old(o->job.version, installed)) {
+        fa_log("warning", "release %s: %s %s is installed now", o->job.release, o->comp->code,
+               installed);
+        finish(o, FL_RESULT_FAILED, "older_version", NULL);
+        return;
+    }
     if (fa_store_rename(o->cfg->data_dir, part, bin) != 0 || data_path(o, bin, path) != 0) {
         fa_log("error", "cannot rename %s/%s: %s", o->cfg->data_dir, part, strerror(errno));
         give_up(o, "the verified file cannot be kept");
+        return;
+    }
+    /* Recorded before the script starts: a stop or a power loss while it runs must not make the
+     * release look new at the next start (installed again, or refused as older_version). */
+    if (save_install_state(o, "running") != 0) {
+        remove_file(o, "download-", o->job.release, ".bin");
+        give_up(o, "the installation cannot be recorded");
         return;
     }
     fa_log("info", "release %s: installing %s version %s with %s", o->job.release, o->comp->code,
@@ -671,16 +727,9 @@ static void download_step(fa_ota *o, fl_time now) {
 
 /* A script exited 10: the installation completes at the next start. */
 static void install_later(fa_ota *o) {
-    char json[256];
-    fl_jw w;
-    fl_jw_begin(&w, json, sizeof json);
-    fl_jw_string(&w, "release", o->job.release);
-    fl_jw_string(&w, "component", o->comp->code);
-    fl_jw_string(&w, "version", o->job.version);
-    int n = fl_jw_end(&w);
-    if (n < 0 || fa_store_write(o->cfg->data_dir, INSTALL_STATE, json, (size_t)n, 0644) != 0) {
-        fa_log("error", "cannot write %s/%s: the installation cannot be followed after the restart",
-               o->cfg->data_dir, INSTALL_STATE);
+    if (save_install_state(o, "reboot") != 0) {
+        fa_log("error", "release %s: the installation cannot be followed after the restart",
+               o->job.release);
         finish(o, FL_RESULT_FAILED, "install_failed", current_version(o));
         return;
     }
@@ -690,6 +739,8 @@ static void install_later(fa_ota *o) {
     o->reboot_pending = true;
     lower_release(o->job.release, o->reboot_release);
     fa_log("info", "release %s: installed at the next start of the device", o->job.release);
+    if (o->stopping) /* the agent stops (the system may be going down already) */
+        return;
     if (o->cfg->reboot_command[0] == '\0') {
         fa_log("info", "no reboot_command: the install script restarts the device");
         return;
@@ -742,7 +793,42 @@ static void start_next(fa_ota *o, fl_time now) {
     const fl_offer *next = fl_queue_next(&o->queue, now);
     if (next == NULL)
         return;
-    o->job = *next;
+    fl_offer d = *next;
+    /* The offer is checked again now, with the time and the versions installed now: since it was
+     * queued, another release may have installed a newer version (no rollback through the queue),
+     * and notBefore may not have passed yet. */
+    char name[96];
+    char *text = NULL;
+    size_t len = 0;
+    file_name(name, sizeof name, "offer-", d.release, ".json");
+    if (fa_store_read(o->cfg->data_dir, name, &text, &len) == 0) {
+        char release[RELEASE_LEN + 1];
+        lower_release(d.release, release);
+        int rc = fl_offer_check(&o->dev, text, len, now, &d);
+        free(text);
+        if (rc != FL_OK || d.action == FL_OFFER_IGNORE || !same_release(d.release, release)) {
+            fa_log("warning", "release %s: the queued offer no longer passes the check (error %d)",
+                   release, rc);
+            forget_offer(o, release);
+            return;
+        }
+        if (d.action == FL_OFFER_REJECT) {
+            fa_log("warning", "release %s: queued offer refused", d.release);
+            add_result(o, d.release, d.result, NULL, d.detail);
+            forget_offer(o, d.release);
+            remove_file(o, "download-", d.release, ".part");
+            return;
+        }
+        fl_queue_put(&o->queue, &d); /* same release: replaced in place */
+        if (d.action == FL_OFFER_WAIT)
+            return; /* notBefore not reached by this clock: it stays queued */
+    } else if (!d.rollback && fl_version_too_old(d.version, installed_version(o, d.component))) {
+        /* The stored offer is missing (it could not be written): the version at least. */
+        add_result(o, d.release, FL_RESULT_FAILED, NULL, "older_version");
+        forget_offer(o, d.release);
+        return;
+    }
+    o->job = d;
     o->comp = find_component(o->cfg, o->job.component);
     if (o->comp == NULL || o->comp->install != FA_INSTALL_SCRIPT) { /* checked with the offer */
         finish(o, FL_RESULT_FAILED, "component_mismatch", NULL);
@@ -863,7 +949,13 @@ static void load_results(fa_ota *o) {
     closedir(d);
 }
 
-/* A script exited 10 before this start: its version tells the result. */
+/* An installation the former run left (install.json), settled before the queue is rebuilt: its
+ * release is never checked again as a new offer.
+ *  - the component reports the manifest version: installed;
+ *  - state "running" (the script was stopped with the agent, or the power went): install_failed;
+ *  - state "reboot" (the script exited 10): a new boot without the version is boot_failed; in the
+ *    same boot (only the agent restarted) it keeps waiting for the reboot, with no result and
+ *    nothing run again. */
 static void settle_install(fa_ota *o) {
     char *text = NULL;
     size_t len = 0;
@@ -871,27 +963,49 @@ static void settle_install(fa_ota *o) {
         return;
     fl_json j;
     char release[RELEASE_LEN + 2], component[65], version[65], now_version[65];
+    char state[16] = "reboot", stored_boot[65] = "", boot[65];
     bool ok = fl_json_parse(&j, text, len) == FL_OK &&
               fl_json_string(&j, "release", release, sizeof release) == FL_OK &&
               strlen(release) == RELEASE_LEN &&
               fl_json_string(&j, "component", component, sizeof component) == FL_OK &&
               fl_json_string(&j, "version", version, sizeof version) == FL_OK;
+    if (ok && fl_json_string(&j, "state", state, sizeof state) != FL_OK)
+        snprintf(state, sizeof state, "reboot");
+    if (ok && fl_json_string(&j, "bootId", stored_boot, sizeof stored_boot) != FL_OK)
+        stored_boot[0] = '\0';
     free(text);
     const fa_component *c = ok ? find_component(o->cfg, component) : NULL;
     if (c == NULL) {
         fa_log("warning", "%s/%s cannot be read or names an unknown component: removed",
                o->cfg->data_dir, INSTALL_STATE);
-    } else if (find_result(o, release) == NULL) {
-        bool readable = fa_component_version(o->cfg, c, now_version) == 0;
-        if (readable && strcmp(now_version, version) == 0) {
-            add_result(o, release, FL_RESULT_INSTALLED, version, NULL);
-            fa_service_request_status(o->svc);
-        } else {
-            fa_log("warning", "release %s: component %s reports %s after the restart, not %s",
-                   release, component, readable ? now_version : "no version", version);
-            add_result(o, release, FL_RESULT_FAILED, readable ? now_version : NULL, "boot_failed");
-        }
-        remove_file(o, "offer-", release, ".json");
+        fa_store_remove(o->cfg->data_dir, INSTALL_STATE);
+        return;
+    }
+    remove_file(o, "offer-", release, ".json"); /* never a new offer again */
+    if (find_result(o, release) != NULL) {      /* stored just before the former run ended */
+        fa_store_remove(o->cfg->data_dir, INSTALL_STATE);
+        return;
+    }
+    bool readable = fa_component_version(o->cfg, c, now_version) == 0;
+    boot_id(boot);
+    if (readable && strcmp(now_version, version) == 0) {
+        add_result(o, release, FL_RESULT_INSTALLED, version, NULL);
+        fa_service_request_status(o->svc);
+    } else if (strcmp(state, "running") == 0) {
+        fa_log("warning", "release %s: the install script was stopped before it ended", release);
+        add_result(o, release, FL_RESULT_FAILED, readable ? now_version : NULL, "install_failed");
+    } else if (stored_boot[0] != '\0' && strcmp(stored_boot, boot) == 0) {
+        o->reboot_pending = true;
+        lower_release(release, o->reboot_release);
+        fa_log("info",
+               "release %s: installed at the next start of the device: waiting for the "
+               "restart",
+               release);
+        return; /* install.json stays for the next start */
+    } else {
+        fa_log("warning", "release %s: component %s reports %s after the restart, not %s", release,
+               component, readable ? now_version : "no version", version);
+        add_result(o, release, FL_RESULT_FAILED, readable ? now_version : NULL, "boot_failed");
     }
     fa_store_remove(o->cfg->data_dir, INSTALL_STATE);
 }
@@ -997,6 +1111,26 @@ fa_ota *fa_ota_open(fa_service *s, fl_time now) {
 void fa_ota_close(fa_ota *o) {
     if (o == NULL)
         return;
+    o->stopping = true;
+    if (o->state == JOB_INSTALL && o->child.pid != 0) {
+        /* A script that has ended, or ends within a short grace, still gets its outcome stored
+         * (the signal may have come between its exit and the next tick); otherwise it is stopped
+         * and install.json ("running") settles it at the next start. */
+        struct timespec until;
+        clock_gettime(CLOCK_MONOTONIC, &until);
+        until.tv_sec += CLOSE_GRACE_S;
+        for (;;) {
+            install_step(o);
+            if (o->state != JOB_INSTALL || o->child.pid == 0)
+                break;
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            if (t.tv_sec > until.tv_sec || (t.tv_sec == until.tv_sec && t.tv_nsec >= until.tv_nsec))
+                break;
+            struct pollfd pfd = {o->child.out, POLLIN, 0};
+            poll(&pfd, o->child.out >= 0 ? 1 : 0, 100);
+        }
+    }
     if (o->child.pid != 0) {
         fa_log("warning", "the agent stops: ending %s",
                o->state == JOB_INSTALL ? "the install script" : "reboot_command");

@@ -8,5 +8,9 @@ set -eu
 here=$(dirname "$0")
 printf '%s %s %s %s\n' "$1" "$2" "$3" "$(pwd)" >>"$here/runs"
 cp "$1" "$here/installed.bin"
+# The descriptors of this shell, to stdout (the agent logs them as "script: ... N -> target"): no
+# redirection or pipe here, which would add descriptors of the shell itself. Only 0-2 should
+# come from the agent; the shell holds the script file open itself.
+ls -l "/proc/$$/fd"
 printf '%s\n' "$2" >"$here/version"
 echo "installing version $2"
