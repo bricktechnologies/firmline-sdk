@@ -37,12 +37,23 @@ int fa_key_matches_certificate(const char *dir, const char *key_name, const char
 int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_before,
                             fl_time *not_after);
 
-/* Whether a certificate issued by the platform keeps the trust anchor: the last certificate of
- * chain_pem is DER-equal to the (first) certificate of root_pem, and the first certificate of
- * cert_pem verifies through the certificates of chain_pem against root_pem's certificate as the
- * only trusted one (no system authority, no partial chain; the time is not checked: the clock of
- * a device may be wrong). All three are NUL-terminated PEM texts. 1 when both hold, 0 when not,
- * -1 when a text holds no certificate or memory runs out. */
-int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem);
+#define FA_CHAIN_MAX 4 /* certificates in a chain of the platform (intermediate, root: 2) */
+
+/* Whether the certificate and chain of a renewal answer keep the trust anchor (root_pem, the
+ * root.pem in use; all three NUL-terminated PEM texts):
+ *   - cert_pem is exactly one certificate block, chain_pem 1..FA_CHAIN_MAX blocks: nothing but
+ *     whitespace and whole "-----BEGIN CERTIFICATE-----" ... "-----END CERTIFICATE-----" blocks,
+ *     each BEGIN starting a line, each parsing as a certificate;
+ *   - the last certificate of the chain is DER-equal to root_pem's certificate;
+ *   - the certificate verifies through the chain against root_pem's certificate as the only
+ *     trusted one (no system authority, no partial chain; the time is not checked: the clock of
+ *     a device may be wrong).
+ * 1 when all hold: then *cert_out (when not NULL) is the certificate and *chain_out (when not
+ * NULL) the chain before the root followed by the root in use, both serialised again from the
+ * checked certificates (PEM, LF line ends, malloc'ed, NUL-terminated: the caller frees them), so
+ * that what is installed is what was checked. 0 when the answer is refused; -1 when root_pem
+ * holds no certificate or memory runs out (outputs NULL in both cases). */
+int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem,
+                             char **cert_out, char **chain_out);
 
 #endif

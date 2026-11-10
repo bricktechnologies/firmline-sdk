@@ -16,16 +16,19 @@
  * clock reads past the certificate's notAfter nothing is sent (said once) but nothing is removed
  * either: a clock that jumped forward comes back.
  *
- * The answer must keep the trust anchor: its last certificate is the root.pem in use (DER-equal)
- * and the new certificate verifies through the answer's chain against that root alone. The
- * platform root and the company intermediate never change.
+ * The answer must keep the trust anchor (fa_certificate_chains_to): its certificate and chain are
+ * whole certificate blocks and nothing else, the chain's last certificate is the root.pem in use
+ * (DER-equal) and the new certificate verifies through the chain against that root alone. What
+ * is installed is what was checked: the certificate and the chain (ending with the root in use)
+ * are serialised again from the parsed certificates, never copied from the answer's text, and
+ * root.pem is never replaced. The platform root and the company intermediate never change.
  *
  * The swap after a 200, so that a crash at any step leaves a device that connects:
- *   1. the new certificate, chain, root and device.json are written under pending names
- *      (renewal-device.pem, renewal-chain.pem, renewal-root.pem, renewal-device.json);
+ *   1. the new certificate, chain and device.json are written under pending names
+ *      (renewal-device.pem, renewal-chain.pem, renewal-device.json);
  *   2. the commit marker renewal-commit is written: from here on the swap is decided;
  *   3. each pending file, and renewal-new.key, is renamed over its live name (device.pem,
- *      chain.pem, root.pem, device.key, device.json), each rename atomic and synced;
+ *      chain.pem, device.key, device.json), each rename atomic and synced;
  *   4. the marker is removed, then renewal-request.json.
  * Before the marker, the live files are untouched (the pending ones are removed at the next
  * start); after it, the next start completes the renames (fa_renewal_recover) before anything
