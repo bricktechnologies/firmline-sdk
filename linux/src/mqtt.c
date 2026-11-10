@@ -136,7 +136,9 @@ fa_mqtt *fa_mqtt_connect(const fa_mqtt_settings *s, const fa_mqtt_events *events
     if (rc == MOSQ_ERR_SUCCESS)
         rc = mosquitto_tls_set(q, s->ca_file, NULL, s->cert_file, s->key_file, no_pass_phrase);
     if (rc == MOSQ_ERR_SUCCESS)
-        rc = mosquitto_tls_opts_set(q, 1 /* SSL_VERIFY_PEER */, "tlsv1.2", NULL);
+        /* No version given: the library's default, TLS 1.2 or later (a version string could pin
+         * one version only in some libmosquitto releases). */
+        rc = mosquitto_tls_opts_set(q, 1 /* SSL_VERIFY_PEER */, NULL, NULL);
     if (rc == MOSQ_ERR_SUCCESS)
         rc = mosquitto_tls_insecure_set(q, false); /* the broker's name is checked */
     int saved_errno = 0;

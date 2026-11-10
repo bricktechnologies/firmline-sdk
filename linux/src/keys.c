@@ -4,6 +4,7 @@
 
 #include "store.h"
 
+#include <limits.h>
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* A key file is never encrypted: never ask for a pass phrase (OpenSSL would prompt on the tty). */
 static int no_pass_phrase(char *buf, int size, int rwflag, void *u) {
@@ -144,5 +146,48 @@ int fa_update_key_load(const char *path, uint8_t *der, size_t cap, size_t *len) 
         }
     }
     EVP_PKEY_free(key);
+    return rc;
+}
+
+/* The first certificate of a PEM text, or NULL. */
+static X509 *read_certificate(const char *pem, size_t len) {
+    if (len > INT_MAX)
+        return NULL;
+    BIO *bio = BIO_new_mem_buf(pem, (int)len);
+    X509 *cert = bio != NULL ? PEM_read_bio_X509(bio, NULL, no_pass_phrase, NULL) : NULL;
+    BIO_free(bio);
+    return cert;
+}
+
+int fa_key_matches_certificate(const char *dir, const char *key_name, const char *cert_pem,
+                               size_t len) {
+    EVP_PKEY *key = load_key(dir, key_name);
+    X509 *cert = key != NULL ? read_certificate(cert_pem, len) : NULL;
+    EVP_PKEY *public = cert != NULL ? X509_get0_pubkey(cert) : NULL;
+    int rc = public == NULL ? -1 : EVP_PKEY_eq(key, public) == 1;
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+/* An ASN1_TIME as UTC seconds, through the ISO text the core reads (no timegm, no time zone). */
+static int asn1_seconds(const ASN1_TIME *t, fl_time *out) {
+    struct tm tm;
+    char iso[32];
+    if (t == NULL || ASN1_TIME_to_tm(t, &tm) != 1)
+        return -1;
+    int n = snprintf(iso, sizeof iso, "%04d-%02d-%02dT%02d:%02d:%02dZ", tm.tm_year + 1900,
+                     tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    return n > 0 && (size_t)n < sizeof iso && fl_time_parse(iso, (size_t)n, out) == FL_OK ? 0 : -1;
+}
+
+int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_before,
+                            fl_time *not_after) {
+    X509 *cert = read_certificate(cert_pem, len);
+    int rc = cert != NULL && asn1_seconds(X509_get0_notBefore(cert), not_before) == 0 &&
+                     asn1_seconds(X509_get0_notAfter(cert), not_after) == 0
+                 ? 0
+                 : -1;
+    X509_free(cert);
     return rc;
 }

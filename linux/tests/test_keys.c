@@ -240,6 +240,82 @@ static void signature_halves_are_padded(void) {
     EVP_PKEY_free(key);
 }
 
+/* A self-signed certificate for the key dir/key_name, valid from `from` until `until` (ASN.1 time
+ * text, YYYYMMDDHHMMSSZ), as PEM in out. 0, or -1. */
+static int make_certificate(const char *dir, const char *key_name, const char *from,
+                            const char *until, char *out, size_t cap) {
+    EVP_PKEY *key = read_key(dir, key_name);
+    X509 *cert = X509_new();
+    BIO *bio = BIO_new(BIO_s_mem());
+    int rc = -1;
+    if (key != NULL && cert != NULL && bio != NULL &&
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), 7) == 1 &&
+        ASN1_TIME_set_string_X509(X509_getm_notBefore(cert), from) == 1 &&
+        ASN1_TIME_set_string_X509(X509_getm_notAfter(cert), until) == 1 &&
+        X509_NAME_add_entry_by_txt(X509_get_subject_name(cert), "CN", MBSTRING_ASC,
+                                   (const unsigned char *)"device", -1, -1, 0) == 1 &&
+        X509_set_issuer_name(cert, X509_get_subject_name(cert)) == 1 &&
+        X509_set_pubkey(cert, key) == 1 && X509_sign(cert, key, EVP_sha256()) > 0 &&
+        PEM_write_bio_X509(bio, cert) == 1) {
+        char *data = NULL;
+        long len = BIO_get_mem_data(bio, &data);
+        if (len > 0 && (size_t)len < cap) {
+            memcpy(out, data, (size_t)len);
+            out[len] = '\0';
+            rc = 0;
+        }
+    }
+    BIO_free(bio);
+    X509_free(cert);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+static fl_time utc(const char *iso) {
+    fl_time t = -1;
+    fl_time_parse(iso, strlen(iso), &t);
+    return t;
+}
+
+static void certificate_validity_is_read_in_utc(void) {
+    char dir[64], pem[4096], chain[8192];
+    make_dir(dir, sizeof dir);
+    CHECK_EQ_INT(fa_key_generate(dir, "device.key"), 0);
+    /* UTCTime before 2050, GeneralizedTime from 2050 on */
+    CHECK_EQ_INT(
+        make_certificate(dir, "device.key", "20270310080000Z", "20510101000000Z", pem, sizeof pem),
+        0);
+    fl_time not_before = 0, not_after = 0;
+    CHECK_EQ_INT(fa_certificate_validity(pem, strlen(pem), &not_before, &not_after), 0);
+    CHECK_EQ_INT(not_before, utc("2027-03-10T08:00:00Z"));
+    CHECK_EQ_INT(not_after, utc("2051-01-01T00:00:00Z"));
+
+    /* The first certificate of a chain counts. */
+    char second[4096];
+    CHECK_EQ_INT(make_certificate(dir, "device.key", "20200101000000Z", "20210101000000Z", second,
+                                  sizeof second),
+                 0);
+    snprintf(chain, sizeof chain, "%s%s", pem, second);
+    CHECK_EQ_INT(fa_certificate_validity(chain, strlen(chain), &not_before, &not_after), 0);
+    CHECK_EQ_INT(not_after, utc("2051-01-01T00:00:00Z"));
+
+    CHECK_EQ_INT(fa_certificate_validity("junk\n", 5, &not_before, &not_after), -1);
+    CHECK_EQ_INT(fa_certificate_validity(pem, 40, &not_before, &not_after), -1); /* cut */
+}
+
+static void key_matches_only_its_certificate(void) {
+    char dir[64], pem[4096];
+    make_dir(dir, sizeof dir);
+    CHECK_EQ_INT(fa_key_generate(dir, "a.key"), 0);
+    CHECK_EQ_INT(fa_key_generate(dir, "b.key"), 0);
+    CHECK_EQ_INT(
+        make_certificate(dir, "a.key", "20260101000000Z", "20280101000000Z", pem, sizeof pem), 0);
+    CHECK_EQ_INT(fa_key_matches_certificate(dir, "a.key", pem, strlen(pem)), 1);
+    CHECK_EQ_INT(fa_key_matches_certificate(dir, "b.key", pem, strlen(pem)), 0);
+    CHECK_EQ_INT(fa_key_matches_certificate(dir, "missing.key", pem, strlen(pem)), -1);
+    CHECK_EQ_INT(fa_key_matches_certificate(dir, "a.key", "junk\n", 5), -1);
+}
+
 int main(void) {
     RUN(key_is_p256_pkcs8_and_private);
     RUN(keys_are_new_each_time);
@@ -250,5 +326,7 @@ int main(void) {
     RUN(signature_halves_are_padded);
     RUN(update_key_is_p256_public_key_der);
     RUN(update_key_of_another_kind_is_refused);
+    RUN(certificate_validity_is_read_in_utc);
+    RUN(key_matches_only_its_certificate);
     return CHECK_RESULT;
 }
