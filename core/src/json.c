@@ -187,11 +187,16 @@ static int check_root_keys(const fl_json *j) {
     int a = 1;
     for (int p = 0; p < j->tok[0].size; p++) {
         size_t alen;
-        int b = after_value(j, a + 1);
+        int b;
+        if (a + 1 >= j->count)
+            return FL_ERR_FORMAT;
+        b = after_value(j, a + 1);
         if (unescape_token(j, a, first, MAX_KEY_BYTES, &alen) != FL_OK)
             return FL_ERR_FORMAT;
         for (int q = p + 1; q < j->tok[0].size; q++) {
             size_t blen;
+            if (b + 1 >= j->count)
+                return FL_ERR_FORMAT;
             if (unescape_token(j, b, other, MAX_KEY_BYTES, &blen) != FL_OK)
                 return FL_ERR_FORMAT;
             if (alen == blen && memcmp(first, other, alen) == 0)
@@ -200,6 +205,128 @@ static int check_root_keys(const fl_json *j) {
         }
         a = after_value(j, a + 1);
     }
+    return FL_OK;
+}
+
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+/* RFC 8259: true, false, null, or -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? */
+static bool primitive_is_valid(const char *s, size_t n) {
+    size_t i = 0;
+    if ((n == 4 && memcmp(s, "true", 4) == 0) || (n == 5 && memcmp(s, "false", 5) == 0) ||
+        (n == 4 && memcmp(s, "null", 4) == 0))
+        return true;
+    if (i < n && s[i] == '-')
+        i++;
+    if (i >= n || !is_digit(s[i]))
+        return false;
+    if (s[i] == '0')
+        i++;
+    else
+        while (i < n && is_digit(s[i]))
+            i++;
+    if (i < n && s[i] == '.') {
+        i++;
+        if (i >= n || !is_digit(s[i]))
+            return false;
+        while (i < n && is_digit(s[i]))
+            i++;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-'))
+            i++;
+        if (i >= n || !is_digit(s[i]))
+            return false;
+        while (i < n && is_digit(s[i]))
+            i++;
+    }
+    return i == n;
+}
+
+/* Extent of a token in the text including the quotes of a string. */
+static int tok_begin(const jsmntok_t *t) {
+    return t->type == JSMN_STRING ? t->start - 1 : t->start;
+}
+static int tok_end(const jsmntok_t *t) { return t->type == JSMN_STRING ? t->end + 1 : t->end; }
+
+/* True if js[from..to) is white space and, when sep is not 0, exactly one sep. */
+static bool gap_ok(const fl_json *j, int from, int to, int sep) {
+    int seps = 0;
+    if (from < 0 || to < from || (size_t)to > j->len)
+        return false;
+    for (int i = from; i < to; i++) {
+        char c = j->js[i];
+        if (sep != 0 && c == sep)
+            seps++;
+        else if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+            return false;
+    }
+    return seps == (sep != 0 ? 1 : 0);
+}
+
+/* Walks the value at token i the way a reader will: objects are string keys each followed by one
+ * value, sizes must match the walk, every index stays below count, primitives follow RFC 8259.
+ * Sets *next to the index after the value. Recursion is bounded by check_depth. */
+static int validate_value(const fl_json *j, int i, int *next) {
+    const jsmntok_t *t;
+    int k;
+    if (i < 0 || i >= j->count)
+        return FL_ERR_FORMAT;
+    t = &j->tok[i];
+    if (t->start < 0 || t->end < t->start || (size_t)t->end > j->len)
+        return FL_ERR_FORMAT;
+    k = i + 1;
+    switch (t->type) {
+    case JSMN_STRING:
+        break;
+    case JSMN_PRIMITIVE:
+        if (!primitive_is_valid(j->js + t->start, (size_t)(t->end - t->start)))
+            return FL_ERR_FORMAT;
+        break;
+    case JSMN_OBJECT:
+    case JSMN_ARRAY: {
+        int cursor = t->start + 1; /* just after the opening bracket */
+        for (int p = 0; p < t->size; p++) {
+            int sep = p > 0 ? ',' : 0;
+            int v;
+            if (t->type == JSMN_OBJECT) {
+                if (k >= j->count || j->tok[k].type != JSMN_STRING)
+                    return FL_ERR_FORMAT;
+                if (!gap_ok(j, cursor, tok_begin(&j->tok[k]), sep))
+                    return FL_ERR_FORMAT;
+                cursor = tok_end(&j->tok[k]);
+                k++;
+                sep = ':';
+            }
+            v = k;
+            if (v >= j->count || !gap_ok(j, cursor, tok_begin(&j->tok[v]), sep))
+                return FL_ERR_FORMAT;
+            if (validate_value(j, v, &k) != FL_OK)
+                return FL_ERR_FORMAT;
+            cursor = tok_end(&j->tok[v]);
+        }
+        if (!gap_ok(j, cursor, t->end - 1, 0)) /* no trailing comma */
+            return FL_ERR_FORMAT;
+        break;
+    }
+    default:
+        return FL_ERR_FORMAT;
+    }
+    /* the tokens walked are exactly those inside the value */
+    for (int m = i + 1; m < k; m++)
+        if (j->tok[m].start < t->start || j->tok[m].end > t->end)
+            return FL_ERR_FORMAT;
+    if (k < j->count && j->tok[k].start < t->end)
+        return FL_ERR_FORMAT;
+    *next = k;
+    return FL_OK;
+}
+
+static int check_structure(const fl_json *j) {
+    int next = 0;
+    if (validate_value(j, 0, &next) != FL_OK || next != j->count)
+        return FL_ERR_FORMAT;
     return FL_OK;
 }
 
@@ -223,7 +350,7 @@ int fl_json_parse(fl_json *j, const char *js, size_t len) {
     j->js = js;
     j->len = len;
     j->count = n;
-    if (check_depth(j) != FL_OK || check_root_keys(j) != FL_OK) {
+    if (check_depth(j) != FL_OK || check_structure(j) != FL_OK || check_root_keys(j) != FL_OK) {
         memset(j, 0, sizeof *j);
         return FL_ERR_FORMAT;
     }
@@ -244,8 +371,6 @@ int fl_json_string(const fl_json *j, const char *key, char *out, size_t cap) {
     out[len] = '\0';
     return FL_OK;
 }
-
-static bool is_digit(char c) { return c >= '0' && c <= '9'; }
 
 int fl_json_int(const fl_json *j, const char *key, int64_t *out) {
     int v;
@@ -418,4 +543,10 @@ int fl_jw_end(fl_jw *w) {
     if (w->err != FL_OK)
         return w->err;
     return (int)w->len;
+}
+
+int fl_json_next(const fl_json *j, int index) {
+    if (j == NULL || index < 0 || index >= j->count)
+        return j == NULL ? 0 : j->count;
+    return after_value(j, index);
 }
