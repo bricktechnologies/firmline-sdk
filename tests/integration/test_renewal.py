@@ -375,6 +375,18 @@ class AnswerTrustTest(RenewalBase):
                     ),
                 )
 
+    def test_chain_with_certificates_off_the_verified_path_is_not_installed(self):
+        # Verification finds the intermediate by name and ignores the unrelated certificate; if
+        # the chain were written as sent, device-chain.pem would present it after the new
+        # certificate and the broker would refuse the device, its old key already replaced.
+        unrelated = cert_pem(Pki(self.tmp / "unrelated-pki", name="Unrelated").intermediate)
+        self.assert_answers_refused(
+            "unrelated-first",
+            lambda: self.platform.tamper_renewals(
+                lambda answer: answer.update(chain=unrelated + answer["chain"])
+            ),
+        )
+
 
 class RenewalCrashTest(RenewalBase):
     """A crash (power loss) during the swap: the state found at the next start."""
