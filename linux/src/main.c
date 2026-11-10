@@ -11,6 +11,7 @@ static const struct {
     int (*run)(int argc, char **argv);
 } COMMANDS[] = {
     {"register", fa_cmd_register},
+    {"run", fa_cmd_run},
 };
 
 static void usage(FILE *out) {
@@ -20,6 +21,8 @@ static void usage(FILE *out) {
           "  register (--token <token> | --token-file <path>) [--serial <serial>]\n"
           "           [--config <path>]\n"
           "           create the device key and register the device with the platform\n"
+          "  run [--config <path>]\n"
+          "           the service: broker connection, status, updates (stops on SIGTERM)\n"
           "\n"
           "  --config  the configuration file (default " FA_DEFAULT_CONFIG ")\n"
           "  --help    show this text\n",

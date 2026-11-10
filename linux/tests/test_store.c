@@ -169,6 +169,38 @@ static void store_rename_replaces_in_one_step(void) {
     CHECK_EQ_INT(count_entries(dir), 1);
 }
 
+static int present(const char *dir, const char *name) {
+    char path[128];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    return lstat(path, &st) == 0;
+}
+
+static void store_removes_stale_temp_files(void) {
+    char dir[64], own[64];
+    make_dir(dir, sizeof dir);
+    /* the temporary file of a write cut by a power loss: its process is gone; one with this
+     * process id is from before a reboot (nothing is being written yet at start-up) */
+    snprintf(own, sizeof own, ".device.json.%ld.0.tmp", (long)getpid());
+    const char *stale[] = {".device.json.4194304.0.tmp", ".device.key.4194304.12.tmp", own};
+    /* a write in progress in a living process (pid 1 always exists), and other files */
+    const char *kept[] = {
+        ".device.json.1.0.tmp", "device.json", ".hidden", "x.tmp", ".a.b.tmp", ".a.12.tmp",
+        ".a.x1.0.tmp"};
+    for (size_t i = 0; i < sizeof stale / sizeof stale[0]; i++)
+        CHECK_EQ_INT(fa_store_write(dir, stale[i], "{", 1, 0644), 0);
+    for (size_t i = 0; i < sizeof kept / sizeof kept[0]; i++)
+        CHECK_EQ_INT(fa_store_write(dir, kept[i], "{", 1, 0644), 0);
+
+    CHECK_EQ_INT(fa_store_remove_stale(dir), 3);
+    for (size_t i = 0; i < sizeof stale / sizeof stale[0]; i++)
+        CHECK(!present(dir, stale[i]));
+    for (size_t i = 0; i < sizeof kept / sizeof kept[0]; i++)
+        CHECK(present(dir, kept[i]));
+    CHECK_EQ_INT(fa_store_remove_stale(dir), 0);
+    CHECK_EQ_INT(fa_store_remove_stale("/nonexistent/fa-store"), -1);
+}
+
 int main(void) {
     RUN(store_write_is_atomic);
     RUN(store_mode_is_exact_whatever_the_umask);
@@ -177,5 +209,6 @@ int main(void) {
     RUN(store_read_limit_is_one_mebibyte);
     RUN(store_remove_deletes_and_tolerates_missing);
     RUN(store_rename_replaces_in_one_step);
+    RUN(store_removes_stale_temp_files);
     return CHECK_RESULT;
 }

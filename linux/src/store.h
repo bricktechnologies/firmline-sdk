@@ -22,4 +22,11 @@ int fa_store_remove(const char *dir, const char *name);
  * -1 when a name is not valid, `from` is missing or the rename fails. */
 int fa_store_rename(const char *dir, const char *from, const char *to);
 
+/* Removes the temporary files that a write cut short (power loss, kill) left in the folder: names
+ * of the form ".<name>.<pid>.<n>.tmp" whose process is gone or is this one (at start-up nothing
+ * is being written yet; after a reboot the same pid can come back). A write in progress in
+ * another living process is left alone. The number of files removed, or -1 when the folder cannot
+ * be read. */
+int fa_store_remove_stale(const char *dir);
+
 #endif

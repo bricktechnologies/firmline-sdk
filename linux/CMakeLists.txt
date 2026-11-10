@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # The agent's modules live in a static library so that the unit tests link the same code as the
-# executable. libmosquitto is linked by the task that first uses it.
+# executable.
 find_package(OpenSSL 3.0 REQUIRED)
 find_package(CURL REQUIRED)
+# libmosquitto 2.0 installs no CMake package: its header and library are looked up directly.
+find_path(MOSQUITTO_INCLUDE_DIR mosquitto.h REQUIRED)
+find_library(MOSQUITTO_LIBRARY mosquitto REQUIRED)
 
 add_library(firmline_agent_lib STATIC
   src/config.c
@@ -10,14 +13,18 @@ add_library(firmline_agent_lib STATIC
   src/log.c
   src/components.c
   src/keys.c
-  src/http.c)
+  src/http.c
+  src/mqtt.c
+  src/service.c)
 target_include_directories(firmline_agent_lib PUBLIC src)
-target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CURL::libcurl)
+target_include_directories(firmline_agent_lib SYSTEM PRIVATE ${MOSQUITTO_INCLUDE_DIR})
+target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CURL::libcurl
+                                                ${MOSQUITTO_LIBRARY})
 # OpenSSL 3 APIs only: what OpenSSL deprecated (EC_KEY and the like) does not even compile.
 target_compile_definitions(firmline_agent_lib PUBLIC OPENSSL_API_COMPAT=30000 OPENSSL_NO_DEPRECATED)
 target_compile_options(firmline_agent_lib PRIVATE ${FIRMLINE_WARNINGS})
 
-add_executable(firmline-agent src/main.c src/cmd_register.c)
+add_executable(firmline-agent src/main.c src/cmd_register.c src/cmd_run.c)
 target_link_libraries(firmline-agent PRIVATE firmline_agent_lib)
 target_compile_options(firmline-agent PRIVATE ${FIRMLINE_WARNINGS})
 
