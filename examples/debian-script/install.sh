@@ -17,6 +17,9 @@
 #     system, a kernel); this example does not need it;
 #   - any other exit code, or no exit within `timeout`, is `failed install_failed`.
 set -eu
+# The character ranges below are the ASCII ones, whatever the locale of the device.
+LC_ALL=C
+export LC_ALL
 
 target_dir=/opt/acme
 target="$target_dir/app"
@@ -62,9 +65,14 @@ printf '%s\n' "$version" >"$version_file.new.$$"
 sync "$version_file.new.$$"
 mv -f "$version_file.new.$$" "$version_file"
 
-# Restart the application (adapt to your device).
+# Make the renames durable. `sync <path>` needs coreutils 8.24 or later (Debian 9 and later); on an
+# older system use plain `sync`.
+sync "$target_dir"
+
+# Restart the application (adapt to your device). The file is installed and the version file is
+# written: a failed restart is logged, but it must not turn an installed file into install_failed.
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet acme-app.service; then
-    systemctl restart acme-app.service
+    systemctl restart acme-app.service || echo "warning: acme-app.service did not restart" >&2
 fi
 echo "installed"
 exit 0

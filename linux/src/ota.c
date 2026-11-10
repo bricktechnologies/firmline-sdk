@@ -767,7 +767,8 @@ static void install_step(fa_ota *o) {
     } else if (code == FA_SCRIPT_LATER) {
         install_later(o);
     } else if (code < 0 && (o->stopping || fa_service_stopping(o->svc))) {
-        /* The stop signal reached the script too (systemd KillMode=control-group): its death
+        /* The stop signal reached the script too (the unit uses KillMode=mixed, which avoids it,
+         * but another setup may signal the whole group): its death
          * says nothing of the update, which may already be in place. install.json stays
          * "running", and the next start decides from the version. */
         fa_log("warning",
