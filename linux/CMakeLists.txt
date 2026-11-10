@@ -1,16 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # The agent's modules live in a static library so that the unit tests link the same code as the
-# executable. OpenSSL, libcurl and libmosquitto are linked by the task that first uses each one.
+# executable. libmosquitto is linked by the task that first uses it.
+find_package(OpenSSL 3.0 REQUIRED)
+find_package(CURL REQUIRED)
+
 add_library(firmline_agent_lib STATIC
   src/config.c
   src/store.c
   src/log.c
-  src/components.c)
+  src/components.c
+  src/keys.c
+  src/http.c)
 target_include_directories(firmline_agent_lib PUBLIC src)
-target_link_libraries(firmline_agent_lib PUBLIC firmline_core)
+target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CURL::libcurl)
+# OpenSSL 3 APIs only: what OpenSSL deprecated (EC_KEY and the like) does not even compile.
+target_compile_definitions(firmline_agent_lib PUBLIC OPENSSL_API_COMPAT=30000 OPENSSL_NO_DEPRECATED)
 target_compile_options(firmline_agent_lib PRIVATE ${FIRMLINE_WARNINGS})
 
-add_executable(firmline-agent src/main.c)
+add_executable(firmline-agent src/main.c src/cmd_register.c)
 target_link_libraries(firmline-agent PRIVATE firmline_agent_lib)
 target_compile_options(firmline-agent PRIVATE ${FIRMLINE_WARNINGS})
 
