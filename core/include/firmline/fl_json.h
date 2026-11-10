@@ -54,6 +54,12 @@ int fl_json_bool(const fl_json *j, const char *key, bool *out);
  * number of pairs. FL_ERR_FORMAT if missing or not an object. */
 int fl_json_object(const fl_json *j, const char *key, int *first, int *pairs);
 
+/* Index of the token after the whole value at index (a nested value and all its tokens are
+ * skipped), at most j->count; j->count for an index outside the table. To walk the pairs of an
+ * object found with fl_json_object: i = first; then, pairs times, the key is j->tok[i], its value
+ * is j->tok[i + 1], and i = fl_json_next(j, i + 1) moves to the next key. */
+int fl_json_next(const fl_json *j, int index);
+
 /* Writer of a flat or one-level-nested object into a caller buffer. After the first error nothing
  * more is written; fl_jw_end reports it. The text is NUL-terminated (cap must hold it). */
 typedef struct {

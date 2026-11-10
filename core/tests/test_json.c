@@ -157,13 +157,92 @@ static void json_reads_integers_strictly(void) {
     CHECK(n == INT64_MIN);
     CHECK_EQ_INT(PARSE(j, "{\"a\":9223372036854775808}"), FL_OK);
     CHECK_EQ_INT(fl_json_int(&j, "a", &n), FL_ERR_FORMAT);
-    CHECK_EQ_INT(PARSE(j, "{\"a\":1.5,\"b\":1e3,\"c\":01,\"d\":-,\"e\":true,\"f\":null}"), FL_OK);
+    /* valid JSON, but not integers */
+    CHECK_EQ_INT(PARSE(j, "{\"a\":1.5,\"b\":1e3,\"e\":true,\"f\":null,\"g\":-0.5E+2}"), FL_OK);
     CHECK_EQ_INT(fl_json_int(&j, "a", &n), FL_ERR_FORMAT);
     CHECK_EQ_INT(fl_json_int(&j, "b", &n), FL_ERR_FORMAT);
-    CHECK_EQ_INT(fl_json_int(&j, "c", &n), FL_ERR_FORMAT);
-    CHECK_EQ_INT(fl_json_int(&j, "d", &n), FL_ERR_FORMAT);
     CHECK_EQ_INT(fl_json_int(&j, "e", &n), FL_ERR_FORMAT);
     CHECK_EQ_INT(fl_json_int(&j, "f", &n), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_int(&j, "g", &n), FL_ERR_FORMAT);
+}
+
+static void json_refuses_malformed_primitives(void) {
+    static const char *const bad[] = {
+        "{\"a\":tru}", "{\"a\":1.}",    "{\"a\":-}",     "{\"a\":1e}",  "{\"a\":01}",
+        "{\"a\":.5}",  "{\"a\":+1}",    "{\"a\":1e+}",   "{\"a\":nul}", "{\"a\":True}",
+        "{\"a\":--1}", "{\"a\":1.2.3}", "{\"a\":truee}",
+    };
+    fl_json j;
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        int rc = fl_json_parse(&j, bad[i], strlen(bad[i]));
+        if (rc != FL_ERR_FORMAT)
+            fprintf(stderr, "not refused: %s\n", bad[i]);
+        CHECK_EQ_INT(rc, FL_ERR_FORMAT);
+    }
+}
+
+static void json_refuses_broken_structure(void) {
+    static const char *const bad[] = {
+        "{\"v\":1 \"v\":2}",     /* missing comma hides a repeated key */
+        "{\"a\":1 \"b\":2}",     /* missing comma */
+        "{\"a\":,\"b\":1}",      /* missing value */
+        "{\"a\":}",              /* missing value */
+        "{\"a\"}",               /* key without value */
+        "{\"a\":1,}",            /* trailing comma */
+        "{\"a\":[1 2]}",         /* missing comma in array */
+        "{\"a\":{\"b\" \"c\"}}", /* nested key without value */
+        "{1:2}",                 /* key not a string */
+    };
+    fl_json j;
+    char text[1024];
+    size_t n = 0;
+    int i;
+    for (size_t k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        int rc = fl_json_parse(&j, bad[k], strlen(bad[k]));
+        if (rc != FL_ERR_FORMAT)
+            fprintf(stderr, "not refused: %s\n", bad[k]);
+        CHECK_EQ_INT(rc, FL_ERR_FORMAT);
+    }
+    /* 63 keys without values: 64 tokens, root size 63, used to read past the table */
+    text[n++] = '{';
+    for (i = 0; i < 63; i++)
+        n += (size_t)snprintf(text + n, sizeof text - n, "%s\"k%d\":", i ? "," : "", i);
+    text[n++] = '}';
+    CHECK_EQ_INT(fl_json_parse(&j, text, n), FL_ERR_FORMAT);
+    /* same, one value-less key last */
+    CHECK_EQ_INT(PARSE(j, "{\"a\":1,\"b\":}"), FL_ERR_FORMAT);
+}
+
+static void json_walks_a_nested_object_with_next(void) {
+    fl_json j;
+    int first = 0, pairs = 0, i, seen = 0;
+    char s[8];
+    static const char *const keys[] = {"x", "arr", "o", "y"};
+    CHECK_EQ_INT(
+        PARSE(j, "{\"c\":{\"x\":\"1\",\"arr\":[1,[2,3],{\"q\":4}],\"o\":{\"p\":[]},\"y\":true},"
+                 "\"z\":\"after\"}"),
+        FL_OK);
+    CHECK_EQ_INT(fl_json_object(&j, "c", &first, &pairs), FL_OK);
+    CHECK_EQ_INT(pairs, 4);
+    i = first;
+    for (int p = 0; p < pairs; p++) {
+        const jsmntok_t *k = &j.tok[i];
+        CHECK_EQ_INT(k->type, JSMN_STRING);
+        CHECK_EQ_INT((size_t)(k->end - k->start), strlen(keys[p]));
+        CHECK_EQ_MEM(j.js + k->start, keys[p], strlen(keys[p]));
+        i = fl_json_next(&j, i + 1); /* past the value, however nested */
+        seen++;
+    }
+    CHECK_EQ_INT(seen, 4);
+    /* after the last pair we are at the key "z" of the root */
+    CHECK_EQ_INT(j.tok[i].type, JSMN_STRING);
+    CHECK_EQ_INT(j.js[j.tok[i].start], 'z');
+    CHECK_EQ_INT(fl_json_string(&j, "z", s, sizeof s), FL_OK);
+    CHECK_EQ_STR(s, "after");
+    /* past the end of the table */
+    CHECK_EQ_INT(fl_json_next(&j, j.count - 1), j.count);
+    CHECK_EQ_INT(fl_json_next(&j, j.count + 5), j.count);
+    CHECK_EQ_INT(fl_json_next(&j, 0), j.count);
 }
 
 static void json_reads_booleans_and_nested_objects(void) {
@@ -260,6 +339,9 @@ int main(void) {
     RUN(json_decodes_unicode_escapes);
     RUN(json_string_too_long_is_space_error);
     RUN(json_reads_integers_strictly);
+    RUN(json_refuses_malformed_primitives);
+    RUN(json_refuses_broken_structure);
+    RUN(json_walks_a_nested_object_with_next);
     RUN(json_reads_booleans_and_nested_objects);
     RUN(json_writer_writes_and_escapes);
     RUN(json_writer_escapes_and_never_cuts);
