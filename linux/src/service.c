@@ -13,6 +13,7 @@
 #include "keys.h"
 #include "log.h"
 #include "mqtt.h"
+#include "ota.h"
 #include "store.h"
 
 #include <errno.h>
@@ -57,6 +58,9 @@ struct fa_service {
 
     uint32_t unreadable;   /* bit i: the version of component i could not be read last time */
     bool nothing_readable; /* the last status had nothing to report (logged once) */
+
+    unsigned session; /* grows at every subscription of the offer topic */
+    fa_ota *ota;      /* the updates */
 };
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -66,7 +70,9 @@ static void on_stop_signal(int sig) {
     stop_requested = 1;
 }
 
-/* ---- Hook points: empty until Tasks 9 and 10 --------------------------------------------- */
+/* ---- Hook points: updates (Task 9); the renewal comes with Task 10 ------------------------ */
+
+static fl_time wall_clock(void);
 
 void fa_hook_before_connect(fa_service *s, fl_time now) {
     (void)s;
@@ -74,15 +80,10 @@ void fa_hook_before_connect(fa_service *s, fl_time now) {
 }
 
 void fa_hook_offer(fa_service *s, const char *payload, size_t len) {
-    (void)s;
-    (void)payload;
-    (void)len;
+    fa_ota_offer(s->ota, payload, len, wall_clock());
 }
 
-void fa_hook_tick(fa_service *s, fl_time now) {
-    (void)s;
-    (void)now;
-}
+void fa_hook_tick(fa_service *s, fl_time now) { fa_ota_tick(s->ota, now); }
 
 void fa_hook_after_status(fa_service *s, fl_time now) {
     (void)s;
@@ -209,11 +210,15 @@ const uint8_t *fa_service_update_key(const fa_service *s, size_t *len) {
 
 int fa_service_publish(fa_service *s, const char *subtopic, const char *payload, size_t len) {
     char topic[256];
+    int mid = 0;
     if (s->mqtt == NULL || s->lost || s->state != LINK_SUBSCRIBED ||
-        join_path(topic, sizeof topic, s->id.topic_root, subtopic) != 0)
+        join_path(topic, sizeof topic, s->id.topic_root, subtopic) != 0 ||
+        fa_mqtt_publish(s->mqtt, topic, payload, len, &mid) != 0 || mid <= 0)
         return -1;
-    return fa_mqtt_publish(s->mqtt, topic, payload, len);
+    return mid;
 }
+
+unsigned fa_service_session(const fa_service *s) { return s->session; }
 
 void fa_service_request_status(fa_service *s) { s->status_requested = true; }
 
@@ -275,6 +280,7 @@ static void on_subscribe(void *ctx, int granted) {
         return;
     }
     s->state = LINK_SUBSCRIBED;
+    s->session++;
     s->status_requested = true;
     fa_log("info", "subscribed to %s (QoS %d)", s->id.ota_offer_topic, granted);
 }
@@ -283,6 +289,11 @@ static void on_message(void *ctx, const char *topic, const void *payload, size_t
     fa_service *s = ctx;
     if (s->state == LINK_SUBSCRIBED && strcmp(topic, s->id.ota_offer_topic) == 0)
         fa_hook_offer(s, payload, len);
+}
+
+static void on_published(void *ctx, int mid, int reason) {
+    fa_service *s = ctx;
+    fa_ota_published(s->ota, mid, reason);
 }
 
 static void start_attempt(fa_service *s) {
@@ -298,7 +309,7 @@ static void start_attempt(fa_service *s) {
     }
     const fa_mqtt_settings settings = {s->cfg->broker_host, s->cfg->broker_port, s->id.client_id,
                                        s->ca_path,          s->cert_path,        s->key_path};
-    const fa_mqtt_events events = {on_connect, on_subscribe, on_message, s};
+    const fa_mqtt_events events = {on_connect, on_subscribe, on_message, on_published, s};
     char err[FA_MQTT_ERROR_MAX];
     fa_log("info", "connecting to the broker %s:%d", s->cfg->broker_host, s->cfg->broker_port);
     s->mqtt = fa_mqtt_connect(&settings, &events, err);
@@ -381,7 +392,7 @@ static void send_status(fa_service *s) {
         fa_log("error", "the status cannot be built (error %d)", len);
         return;
     }
-    if (fa_mqtt_publish(s->mqtt, s->status_topic, payload, (size_t)len) != 0) {
+    if (fa_mqtt_publish(s->mqtt, s->status_topic, payload, (size_t)len, NULL) != 0) {
         lose(s, "the status cannot be sent");
         return;
     }
@@ -399,7 +410,11 @@ static void loop_turn(fa_service *s) {
     if (s->mqtt == NULL && s->state == LINK_DOWN) {
         if (now < s->next_attempt_at) {
             long long left = s->next_attempt_at - now;
-            sleep_ms(left < TICK_MS ? left : TICK_MS);
+            left = left < TICK_MS ? left : TICK_MS;
+            if (fa_ota_busy(s->ota)) /* a download or a script goes on without the broker */
+                fa_ota_wait(s->ota, -1, false, (int)left);
+            else
+                sleep_ms(left);
             return;
         }
         start_attempt(s);
@@ -419,6 +434,13 @@ static void loop_turn(fa_service *s) {
         long long timeout = TICK_MS;
         if (s->state == LINK_SUBSCRIBED && s->next_status_at - now < timeout)
             timeout = s->next_status_at - now > 0 ? s->next_status_at - now : 0;
+        if (fa_ota_busy(s->ota)) {
+            /* One wait for the broker, the transfer and the script's output; then libmosquitto
+             * handles what came without waiting again. */
+            fa_ota_wait(s->ota, fa_mqtt_socket(s->mqtt), fa_mqtt_want_write(s->mqtt) != 0,
+                        (int)timeout);
+            timeout = 0;
+        }
         char err[FA_MQTT_ERROR_MAX];
         if (fa_mqtt_loop(s->mqtt, (int)timeout, err) != 0)
             lose(s, "%s", err);
@@ -486,6 +508,12 @@ int fa_service_run(const fa_config *cfg) {
         free(s);
         return 1;
     }
+    s->ota = fa_ota_open(s, wall_clock());
+    if (s->ota == NULL) {
+        fa_mqtt_lib_cleanup();
+        free(s);
+        return 1;
+    }
 
     /* No SA_RESTART: a signal interrupts the waits, and the loop sees the flag at once. A broken
      * connection must be an error of the write, not the end of the process. */
@@ -509,6 +537,7 @@ int fa_service_run(const fa_config *cfg) {
         fa_mqtt_close(s->mqtt); /* DISCONNECT with "normal disconnection" when connected */
         fa_log("info", "disconnected from the broker");
     }
+    fa_ota_close(s->ota);
     fa_mqtt_lib_cleanup();
     fa_log("info", "stopped");
     free(s);

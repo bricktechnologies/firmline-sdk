@@ -75,11 +75,13 @@ static void on_message(struct mosquitto *mosq, void *obj, const struct mosquitto
 static void on_publish(struct mosquitto *mosq, void *obj, int mid, int reason,
                        const mosquitto_property *props) {
     (void)mosq;
-    (void)obj;
     (void)props;
+    fa_mqtt *m = obj;
     if (reason >= 0x80)
         fa_log("warning", "the broker refused message %d: %s", mid,
                mosquitto_reason_string(reason));
+    if (m->events.on_published != NULL)
+        m->events.on_published(m->events.ctx, mid, reason);
 }
 
 /* libmosquitto logs the reason of a TLS failure (OpenSSL's error text, no key or certificate):
@@ -177,13 +179,17 @@ int fa_mqtt_subscribe(fa_mqtt *m, const char *topic, int qos) {
     return mosquitto_subscribe(m->mosq, NULL, topic, qos) == MOSQ_ERR_SUCCESS ? 0 : -1;
 }
 
-int fa_mqtt_publish(fa_mqtt *m, const char *topic, const void *payload, size_t len) {
+int fa_mqtt_publish(fa_mqtt *m, const char *topic, const void *payload, size_t len, int *mid) {
     if (len > (size_t)MQTT_MAX_PAYLOAD)
         return -1;
-    return mosquitto_publish(m->mosq, NULL, topic, (int)len, payload, 1, false) == MOSQ_ERR_SUCCESS
+    return mosquitto_publish(m->mosq, mid, topic, (int)len, payload, 1, false) == MOSQ_ERR_SUCCESS
                ? 0
                : -1;
 }
+
+int fa_mqtt_socket(fa_mqtt *m) { return m != NULL ? mosquitto_socket(m->mosq) : -1; }
+
+int fa_mqtt_want_write(fa_mqtt *m) { return m != NULL && mosquitto_want_write(m->mosq); }
 
 void fa_mqtt_close(fa_mqtt *m) {
     if (m == NULL)

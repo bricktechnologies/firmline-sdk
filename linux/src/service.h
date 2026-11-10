@@ -51,9 +51,14 @@ const fa_identity *fa_service_identity(const fa_service *s);
 const uint8_t *fa_service_update_key(const fa_service *s, size_t *len);
 
 /* Publishes payload on {topicRoot}/{subtopic} (for example "ota/result") with QoS 1, without
- * retain. -1 when the service is not connected with the offer topic subscribed: the caller keeps
- * the message and tries again later (a tick, or after the next status). */
+ * retain: its message id (> 0), whose PUBACK the service hands to fa_ota_published. -1 when the
+ * service is not connected with the offer topic subscribed: the caller keeps the message and tries
+ * again later (a tick, or after the next status). */
 int fa_service_publish(fa_service *s, const char *subtopic, const char *payload, size_t len);
+
+/* The number of the current connection with the offer topic subscribed (it grows at every
+ * subscription): a message id belongs to the connection it was published on. */
+unsigned fa_service_session(const fa_service *s);
 
 /* A status as soon as the service is connected (for example after an installation). */
 void fa_service_request_status(fa_service *s);

@@ -24,6 +24,9 @@ typedef struct {
     void (*on_subscribe)(void *ctx, int granted);
     /* A message of a subscription. The topic is NUL-terminated; the payload is not. */
     void (*on_message)(void *ctx, const char *topic, const void *payload, size_t len);
+    /* The PUBACK of a message published with fa_mqtt_publish: its mid, and the reason code (0 =
+     * accepted, >= 0x80 refused). NULL when not wanted. */
+    void (*on_published)(void *ctx, int mid, int reason);
     void *ctx;
 } fa_mqtt_events;
 
@@ -56,8 +59,14 @@ int fa_mqtt_loop(fa_mqtt *m, int timeout_ms, char err[FA_MQTT_ERROR_MAX]);
 /* Queues a SUBSCRIBE (no options but the QoS). 0, or -1. */
 int fa_mqtt_subscribe(fa_mqtt *m, const char *topic, int qos);
 
-/* Queues a PUBLISH with QoS 1, without retain. 0, or -1. */
-int fa_mqtt_publish(fa_mqtt *m, const char *topic, const void *payload, size_t len);
+/* Queues a PUBLISH with QoS 1, without retain; *mid (when not NULL) is its message id, which
+ * on_published reports. 0, or -1. */
+int fa_mqtt_publish(fa_mqtt *m, const char *topic, const void *payload, size_t len, int *mid);
+
+/* The socket of the connection (-1 when there is none) and whether libmosquitto has bytes to
+ * write: for a caller that waits on other descriptors too, then calls fa_mqtt_loop with 0. */
+int fa_mqtt_socket(fa_mqtt *m);
+int fa_mqtt_want_write(fa_mqtt *m);
 
 /* Sends DISCONNECT (normal disconnection) when the connection is up, waits up to 2 s for it to
  * leave, then frees everything. NULL is allowed. */

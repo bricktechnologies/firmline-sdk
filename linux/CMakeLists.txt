@@ -15,7 +15,9 @@ add_library(firmline_agent_lib STATIC
   src/keys.c
   src/http.c
   src/mqtt.c
-  src/service.c)
+  src/service.c
+  src/ota.c
+  src/install_script.c)
 target_include_directories(firmline_agent_lib PUBLIC src)
 target_include_directories(firmline_agent_lib SYSTEM PRIVATE ${MOSQUITTO_INCLUDE_DIR})
 target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CURL::libcurl

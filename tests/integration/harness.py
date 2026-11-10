@@ -8,13 +8,17 @@ folder per test; nothing is committed.
   certificates, device certificates issued for a CSR's key, and the update verification key.
 - FakePlatform: HTTPS server on a free port with the device endpoints of the real platform
   (POST /api/v1/provisioning, POST /api/v1/provisioning/renewal, GET /api/v1/ota/downloads/<token>
-  with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`.
+  with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`,
+  and per download link (cut_after, STATUS_429, STATUS_404, slow). With connect(broker) it
+  signs manifests with the update key, publishes offers (offer, repeat) and collects the
+  results of the devices.
 - Broker: mosquitto with client certificates required, the certificate CN as the user name, and
   a topic ACL per registered device as on the platform (rebuilt at every registration).
 - MqttClient: a paho client with a root-signed certificate, by default the platform's side (it
   may read and write every t/# topic): collects messages, publishes offers.
 - Agent: writes the configuration, runs `firmline-agent`, keeps its stderr as `log` (a running
   `run` in `running_log`, see wait_for_log); a sanitizer report in that stderr fails the test.
+  kill() stops it as a power loss would.
 - assert_no_secrets(log, secrets): none of the secrets, and no PEM block at all, is in the log.
 - wait_until(condition, timeout), count_connections(port, seconds): polling and a TCP listener
   that only counts the connections made to it (a broker that is down, seen from the agent).
@@ -51,7 +55,7 @@ from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, encode_dss_signature
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 REPO = Path(__file__).resolve().parents[2]
@@ -388,6 +392,7 @@ class Request:
     path: str
     headers: dict  # names in lower case
     body: bytes
+    time: float = dataclasses.field(default_factory=time.monotonic)  # arrival
 
     def json(self):
         return json.loads(self.body)
@@ -398,6 +403,47 @@ class Reply:
     status: int
     body: bytes = b""
     headers: dict = dataclasses.field(default_factory=dict)
+    # Faults of the transfer: send only the first `send_only` bytes of the body (Content-Length
+    # still announces it all), then close the connection; `rate` limits the body to that many
+    # bytes per second.
+    send_only: Optional[int] = None
+    rate: Optional[float] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Cut:
+    """A download fault: the connection is closed once the file reached `at` bytes."""
+
+    at: int
+
+
+def cut_after(at: int) -> Cut:
+    return Cut(at)
+
+
+# Download faults answered instead of the file, one request each.
+STATUS_429 = "status_429"  # 429 too_many_requests
+STATUS_404 = "status_404"  # 404 ota_download_not_found
+
+
+@dataclasses.dataclass
+class Download:
+    content: bytes
+    faults: collections.deque  # one entry per request (Cut, STATUS_429, STATUS_404), then normal
+    slow: Optional[float] = None  # bytes per second of every answer
+
+
+@dataclasses.dataclass
+class Offer:
+    """An offer the fake published: its release, link, raw payload and the signed manifest."""
+
+    device_id: str
+    release: str
+    url: str
+    payload: bytes
+    manifest: bytes
+    signature: bytes  # r||s
+    content: bytes  # what the link serves
 
 
 # The `type` ASP.NET Core writes into problem details, by status.
@@ -500,8 +546,20 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(reply.body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(reply.body)
+        if self.command == "HEAD":
+            return
+        body = reply.body if reply.send_only is None else reply.body[: max(reply.send_only, 0)]
+        if reply.rate is None:
+            self.wfile.write(body)
+            return
+        chunk = max(1, int(reply.rate / 10))  # ten pieces a second
+        try:
+            for start in range(0, len(body), chunk):
+                self.wfile.write(body[start : start + chunk])
+                self.wfile.flush()
+                time.sleep(chunk / reply.rate)
+        except (OSError, ssl.SSLError):
+            pass  # the client went away (an agent stopped or killed mid-download)
 
     do_GET = _handle
     do_POST = _handle
@@ -536,6 +594,7 @@ class FakePlatform:
         self._downloads: dict = {}
         self._scripts = collections.defaultdict(collections.deque)
         self._device_listeners: list = []  # called with each new Device (the broker ACL)
+        self.mqtt: Optional["MqttClient"] = None  # set by connect()
         self._lock = threading.RLock()
         self._server = None
         self._thread = None
@@ -586,12 +645,128 @@ class FakePlatform:
     def refuse(self, route: str, status: int, code: str, times: int = 1) -> None:
         self.script(route, *([problem(status, code)] * times))
 
-    def add_download(self, content: bytes) -> str:
-        """Serves `content` at a new download link and returns the link."""
+    def add_download(self, content: bytes, faults=(), slow: Optional[float] = None) -> str:
+        """Serves `content` at a new download link and returns the link. `faults` are answered
+        one per request, in order, before the file is served normally: cut_after(n) closes the
+        connection once the file reached n bytes, STATUS_429 and STATUS_404 answer that error.
+        `slow` limits every answer to that many bytes per second."""
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._downloads[token] = content
+            self._downloads[token] = Download(content, collections.deque(faults), slow)
         return f"{self.url}{self.DOWNLOADS}{token}"
+
+    # -- OTA offers (the broker side needs connect())
+
+    def connect(self, broker: "Broker") -> "MqttClient":
+        """The platform's MQTT client on `broker`, subscribed to t/#: offers go out through it
+        and the results of the devices are collected by it."""
+        self.mqtt = broker.client()
+        self.mqtt.subscribe("t/#")
+        return self.mqtt
+
+    @staticmethod
+    def iso(moment: datetime.datetime) -> str:
+        """yyyy-MM-ddTHH:mm:ssZ, as the platform writes times in manifests and offers."""
+        return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def topic_root(self, device_id: str) -> str:
+        return self.devices[device_id].response["topicRoot"]
+
+    def offer(
+        self,
+        device_id: str,
+        component: str,
+        version: str,
+        data: bytes,
+        rollback: bool = False,
+        not_before: Optional[datetime.datetime] = None,
+        url_expires: Optional[datetime.datetime] = None,
+        release: Optional[str] = None,
+        served: Optional[bytes] = None,
+        tamper: Optional[Callable[[bytes], bytes]] = None,
+        faults=(),
+        slow: Optional[float] = None,
+        publish: bool = True,
+    ) -> Offer:
+        """Builds and signs a manifest exactly like the platform (compact JSON, fields in the
+        order v, release, tenant, family, component, kid, version, sha256, size, notBefore,
+        rollback; ES256 with the test update key, r||s), serves `served` (default `data`) at a
+        new link and publishes the offer on the device's otaOfferTopic. `tamper` changes the
+        manifest bytes after signing."""
+        now = utc_now()
+        public_der = public_key_der(self.pki.update_key.public_key())
+        kid = hashlib.sha256(public_der).hexdigest()
+        manifest = json.dumps(
+            {
+                "v": 1,
+                "release": release or str(uuid.uuid4()),
+                "tenant": self.pki.tenant_id,
+                "family": self.family_id,
+                "component": component,
+                "kid": kid,
+                "version": version,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+                "notBefore": self.iso(not_before or now - datetime.timedelta(minutes=1)),
+                "rollback": rollback,
+            },
+            separators=(",", ":"),
+        ).encode()
+        der = self.pki.update_key.sign(manifest, ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der)
+        signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        if tamper is not None:
+            manifest = tamper(manifest)
+        offer = Offer(
+            device_id,
+            json.loads(manifest)["release"],
+            "",
+            b"",
+            manifest,
+            signature,
+            data if served is None else served,
+        )
+        return self.repeat(offer, url_expires=url_expires, faults=faults, slow=slow, publish=publish)
+
+    def repeat(
+        self,
+        offer: Offer,
+        url_expires: Optional[datetime.datetime] = None,
+        faults=(),
+        slow: Optional[float] = None,
+        publish: bool = True,
+    ) -> Offer:
+        """The same signed manifest again with a new link, as the platform repeats an offer."""
+        url = self.add_download(offer.content, faults, slow)
+        payload = json.dumps(
+            {
+                "manifest": base64.b64encode(offer.manifest).decode(),
+                "alg": "ES256",
+                "kid": hashlib.sha256(public_key_der(self.pki.update_key.public_key())).hexdigest(),
+                "sig": base64.b64encode(offer.signature).decode(),
+                "url": url,
+                "urlExpires": self.iso(url_expires or utc_now() + datetime.timedelta(hours=1)),
+            },
+            separators=(",", ":"),
+        ).encode()
+        offer = dataclasses.replace(offer, url=url, payload=payload)
+        if publish:
+            reason = self.mqtt.publish(self.devices[offer.device_id].response["otaOfferTopic"], payload)
+            if getattr(reason, "is_failure", False):
+                raise AssertionError(f"the broker refused the offer: {reason}")
+        return offer
+
+    def results(self, device_id: str) -> list:
+        """The results the device published, as parsed JSON, in arrival order."""
+        topic = self.topic_root(device_id) + "/ota/result"
+        return [m.json() for m in self.mqtt.received(topic)]
+
+    def wait_results(self, device_id: str, count: int = 1, timeout: float = 60) -> list:
+        self.mqtt.wait_for(self.topic_root(device_id) + "/ota/result", count, timeout)
+        return self.results(device_id)
+
+    def download_requests(self, url: str) -> list:
+        return self.requests_to(url[len(self.url) :])
 
     def on_device(self, listener: Callable[[Device], None]) -> None:
         """Calls listener(device) after each new registration."""
@@ -745,21 +920,31 @@ class FakePlatform:
     def _download(self, request: Request) -> Reply:
         token = request.path.split("?", 1)[0][len(self.DOWNLOADS) :]
         with self._lock:
-            content = self._downloads.get(token)
-        if content is None:
+            download = self._downloads.get(token)
+            fault = download.faults.popleft() if download and download.faults else None
+        if download is None or fault == STATUS_404:
             return problem(404, "ota_download_not_found")
+        if fault == STATUS_429:
+            return problem(429, "too_many_requests")
+        content = download.content
         headers = {"Content-Type": "application/octet-stream", "Accept-Ranges": "bytes"}
         match = re.fullmatch(r"bytes=(\d+)-(\d*)", request.headers.get("range", ""))
+        start = 0
         if not match:
-            return Reply(200, content, headers)
-        start = int(match.group(1))
-        end = int(match.group(2)) if match.group(2) else len(content) - 1
-        if start >= len(content) or end < start:
-            headers["Content-Range"] = f"bytes */{len(content)}"
-            return Reply(416, b"", headers)
-        end = min(end, len(content) - 1)
-        headers["Content-Range"] = f"bytes {start}-{end}/{len(content)}"
-        return Reply(206, content[start : end + 1], headers)
+            reply = Reply(200, content, headers)
+        else:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else len(content) - 1
+            if start >= len(content) or end < start:
+                headers["Content-Range"] = f"bytes */{len(content)}"
+                return Reply(416, b"", headers)
+            end = min(end, len(content) - 1)
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(content)}"
+            reply = Reply(206, content[start : end + 1], headers)
+        if isinstance(fault, Cut):
+            reply.send_only = fault.at - start
+        reply.rate = download.slow
+        return reply
 
 
 # --------------------------------------------------------------------------------------------
@@ -1050,8 +1235,7 @@ class Agent:
             command += ["--config", str(self.config_path)]
         return command
 
-    @staticmethod
-    def _env() -> dict:
+    def _env(self) -> dict:
         env = dict(os.environ)
         env.setdefault("ASAN_OPTIONS", "detect_leaks=1")
         env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1")
@@ -1125,6 +1309,16 @@ class Agent:
         stderr = self._run_log_path.read_text(errors="replace")
         self._take_log(stderr)
         return process.returncode
+
+    def kill(self) -> None:
+        """SIGKILL, as a power loss would stop it: no cleanup at all. The log so far is kept
+        (without the sanitizer check: a killed process writes no report)."""
+        process, self._process = self._process, None
+        if process is None:
+            return
+        process.kill()
+        process.wait()
+        self.log += self._run_log_path.read_text(errors="replace")
 
     def path(self, name: str) -> Path:
         return self.data_dir / name
