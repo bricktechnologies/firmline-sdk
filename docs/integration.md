@@ -147,7 +147,7 @@ The agent creates the device key (ECDSA P-256) and a certificate signing request
 sends the request with the token and the serial number to the platform, and writes the identity
 in the data folder: `device.pem`, `chain.pem`, `root.pem`, `device.key` and, last, `device.json`.
 A device is registered when `device.json` exists; a crash in between leaves a device that is not
-registered, and `register` can run again with the same token.
+registered. After a refusal or a network error that did not reach the platform's answer, `register` can run again (with the same token when the file was kept, see the table). After a successful `register`, start the service: `systemctl start firmline-agent` (or reboot); a unit enabled before registration is skipped at boot (see "The systemd unit").
 
 Prefer `--token-file <path>` to `--token <token>`: an argument is visible to every user in the
 process list. The first line of the file is the token. The agent deletes the file after a
@@ -162,9 +162,9 @@ Exit codes and standard output:
 | Exit | Standard output | Meaning |
 | --- | --- | --- |
 | `0` | the `deviceId` | Registered. |
-| `1` | empty, or `already_registered` | Usage error, configuration error or a local failure (the message is on the log, standard error). `already_registered` when `device.json` already exists: the agent never registers twice. |
+| `1` | empty, or `already_registered` | Usage error, configuration error or a local failure (the message is on the log, standard error). `already_registered` when `device.json` already exists: the agent never registers twice. If the platform answered 200 but the data folder cannot be written, the token is used up and deleted: revoke the device on the platform and register again with a new token. |
 | `2` | the platform's error code (`http_<status>` when the answer has no readable code) | The platform refused. The token file is deleted, except after the answer 429 (too many requests), when it is kept. |
-| `3` | `network_error` | A network or TLS error, a platform error (5xx) or an answer that cannot be read. The token file is kept; try again. |
+| `3` | `network_error` | A network or TLS error, or a platform error (5xx): the request did not get an answer, the token file is kept, try again with the same token. Also when a 200 cannot be read: the token is probably already used, so a retry gets `provisioning_token_invalid`; revoke the device on the platform and register again with a new token. |
 
 A test station reads standard output and the exit code; it never has to parse the log.
 
@@ -359,14 +359,14 @@ connection to the broker does not use a proxy: for a site that only has a proxy,
 - `TimeoutStopSec=30`: a stop during an install can take about 11 seconds (up to 5 seconds for a
   script that is ending, then SIGTERM and SIGKILL to the script).
 - `ConditionPathExists=/var/lib/firmline/device.json`: the service does not start on a device that
-  is not registered yet. If you change `data_dir`, change this line too.
+  is not registered yet, which avoids a restart loop. A unit enabled in the image and booted before registration is skipped, and nothing starts it after `register`: run `systemctl start firmline-agent` (or reboot). If you change `data_dir`, change this line too.
 
 ## Check list for a trial on a real device
 
 1. `firmline-agent --version` works on the device, and `agent.conf` loads: `firmline-agent status
    --config /etc/firmline/agent.conf` prints `registered` as false and does not complain.
 2. The update key is the one of the «OTA releases» page, and the install script is executable.
-3. `register` at the test station prints a `deviceId` and exits 0; `status` then shows
+3. `register` at the test station prints a `deviceId` and exits 0; then run `systemctl start firmline-agent` (or reboot); `status` shows
    `registered` as true, a `certificateNotAfter` date and the `familyId`.
 4. After `systemctl start firmline-agent`, the log shows the connection and `status sent`, and the
    platform shows the device with its last contact and version.

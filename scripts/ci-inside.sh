@@ -21,9 +21,17 @@ if [ -f linux/src/config.c ]; then
         exit 1
     fi
     missing=0
+    # Each key must be a table row ("| `key` |") in the guide's section of its INI section: the
+    # "### `[platform]`" or "### `[component <code>]`" heading up to the next heading.
+    guide_section() { # $1 = platform | component
+        awk -v want="### \`[$1" '/^#/ { on = (index($0, want) == 1) } on' docs/integration.md
+    }
+    platform_rows=$(guide_section platform)
+    component_rows=$(guide_section component)
     for key in "${config_keys[@]}"; do
-        if ! grep -qF "\`${key#*.}\`" docs/integration.md 2>/dev/null; then
-            echo "docs/integration.md does not document the configuration key [${key%%.*}] \`${key#*.}\`" >&2
+        if [ "${key%%.*}" = platform ]; then rows=$platform_rows; else rows=$component_rows; fi
+        if ! printf '%s\n' "$rows" | grep -qF "| \`${key#*.}\` |"; then
+            echo "docs/integration.md has no table row for [${key%%.*}] \`${key#*.}\` in its section" >&2
             missing=1
         fi
     done
