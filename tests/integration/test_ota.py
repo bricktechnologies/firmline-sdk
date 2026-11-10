@@ -6,6 +6,7 @@ on {topicRoot}/ota/result, stored before it is sent."""
 import datetime
 import os
 import shutil
+import signal
 import time
 import unittest
 import uuid
@@ -228,20 +229,31 @@ class OtaTest(OtaBase):
         app, folder = self.component("app", script="install-later-broken.sh")
         boot = self.tmp / "boot_id"  # played reboots: FIRMLINE_BOOT_ID_FILE (tests only)
         boot.write_text("boot-a\n")
-        agent, device = self.start_agent({"app": app}, env={"FIRMLINE_BOOT_ID_FILE": str(boot)})
+        rebooted = folder / "rebooted"
+        agent, device = self.start_agent(
+            {"app": app},
+            env={"FIRMLINE_BOOT_ID_FILE": str(boot)},
+            reboot_command=f"{folder / 'reboot.sh'} first",
+        )
 
         offer = self.offer(device, "app", "1.1.0", payload(2000))
-        wait_until(lambda: agent.path("install.json").exists(), 30, "install.json")
+        wait_until(lambda: rebooted.exists(), 30, "the reboot command")
         self.assertEqual("reboot", agent.read_json("install.json")["state"])
         self.assertEqual(0, agent.stop())
         self.assertEqual([], self.platform.results(device))
 
-        # Only the agent restarted, in the same boot: it keeps waiting for the reboot.
+        # Only the agent restarted, in the same boot (the reboot did not happen): it keeps
+        # waiting, and runs reboot_command once more, else nothing would ever reboot the device.
+        rebooted.unlink()
+        agent.settings["reboot_command"] = f"{folder / 'reboot.sh'} again"
         self.run_agent(agent)
         agent.wait_for_log(f"release {offer.release}: installed at the next start")
+        wait_until(lambda: rebooted.exists(), 10, "reboot_command run again")
+        self.assertEqual("again\n", rebooted.read_text())
         time.sleep(2)
         self.assertEqual([], self.platform.results(device), "no result before the reboot")
         self.assertTrue(agent.path("install.json").exists())
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()), "no script again")
         self.assertEqual(0, agent.stop())
 
         boot.write_text("boot-b\n")  # the device rebooted, the old version came back
@@ -290,6 +302,43 @@ class OtaTest(OtaBase):
 
     def test_stop_killing_a_long_script_sends_install_failed(self):
         self.stop_during_script(0, 60, "failed", detail="install_failed", fw="1.0.0")
+
+    def stop_with_the_script(self, early, expected, detail, fw):
+        """A systemd stop with KillMode=control-group: SIGTERM to the agent and to the script at
+        the same moment. The script's death by that signal is no outcome of its own: the next
+        start decides from the version (exactly one result, the script never run again)."""
+        app, folder = self.component("app", script="install-sleep.sh")
+        (folder / "exit").write_text("0\n")
+        (folder / "sleep").write_text("60\n")
+        if early:
+            (folder / "early").write_text("")
+        agent, device = self.start_agent({"app": app})
+
+        offer = self.offer(device, "app", "1.1.0", payload(2000))
+        agent.wait_for_log("script: sleeping before the installation")
+        script = int((folder / "pid").read_text())
+        agent._process.send_signal(signal.SIGTERM)
+        os.killpg(script, signal.SIGTERM)
+        self.assertEqual(0, agent.stop())
+        self.assertEqual("running", agent.read_json("install.json")["state"])
+
+        self.run_agent(agent)
+        self.platform.wait_results(device)
+        time.sleep(2)
+        expected_result = {"release": offer.release, "result": expected, "fw": fw}
+        if detail is not None:
+            expected_result["detail"] = detail
+        self.assertEqual([expected_result], self.platform.results(device))
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()), "never run again")
+        self.assertEqual(1, len(self.platform.download_requests(offer.url)))
+        self.assert_clean(agent)
+        self.finish(agent)
+
+    def test_stop_signalling_script_with_version_in_place_sends_installed(self):
+        self.stop_with_the_script(True, "installed", None, "1.1.0")
+
+    def test_stop_signalling_script_without_version_sends_install_failed(self):
+        self.stop_with_the_script(False, "failed", "install_failed", "1.0.0")
 
     def test_waiting_older_release_is_refused_after_a_newer_install(self):
         app, folder = self.component("app")

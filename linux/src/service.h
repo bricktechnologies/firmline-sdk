@@ -12,6 +12,7 @@
 #include "config.h"
 #include "firmline/fl_common.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -59,6 +60,9 @@ int fa_service_publish(fa_service *s, const char *subtopic, const char *payload,
 /* The number of the current connection with the offer topic subscribed (it grows at every
  * subscription): a message id belongs to the connection it was published on. */
 unsigned fa_service_session(const fa_service *s);
+
+/* True once SIGTERM or SIGINT has come (the loop ends at the end of this turn). */
+bool fa_service_stopping(const fa_service *s);
 
 /* A status as soon as the service is connected (for example after an installation). */
 void fa_service_request_status(fa_service *s);
