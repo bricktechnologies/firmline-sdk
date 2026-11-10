@@ -12,6 +12,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -122,6 +123,26 @@ int fa_sign_sha256(const char *dir, const char *key_name, const uint8_t hash[32]
         }
     }
     EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return rc;
+}
+
+int fa_update_key_load(const char *path, uint8_t *der, size_t cap, size_t *len) {
+    *len = 0;
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return -1;
+    EVP_PKEY *key = PEM_read_PUBKEY(f, NULL, no_pass_phrase, NULL);
+    fclose(f);
+    int rc = -1;
+    if (key != NULL && is_p256(key)) {
+        int n = i2d_PUBKEY(key, NULL);
+        unsigned char *p = der;
+        if (n > 0 && (size_t)n <= cap && i2d_PUBKEY(key, &p) == n) {
+            *len = (size_t)n;
+            rc = 0;
+        }
+    }
     EVP_PKEY_free(key);
     return rc;
 }

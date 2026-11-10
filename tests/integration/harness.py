@@ -9,10 +9,15 @@ folder per test; nothing is committed.
 - FakePlatform: HTTPS server on a free port with the device endpoints of the real platform
   (POST /api/v1/provisioning, POST /api/v1/provisioning/renewal, GET /api/v1/ota/downloads/<token>
   with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`.
-- Broker: mosquitto with client certificates required, the certificate CN as the user name.
-- Agent: writes the configuration, runs `firmline-agent`, keeps its stderr as `log`; a sanitizer
-  report in that stderr fails the test.
+- Broker: mosquitto with client certificates required, the certificate CN as the user name, and
+  a topic ACL per registered device as on the platform (rebuilt at every registration).
+- MqttClient: a paho client with a root-signed certificate, by default the platform's side (it
+  may read and write every t/# topic): collects messages, publishes offers.
+- Agent: writes the configuration, runs `firmline-agent`, keeps its stderr as `log` (a running
+  `run` in `running_log`, see wait_for_log); a sanitizer report in that stderr fails the test.
 - assert_no_secrets(log, secrets): none of the secrets, and no PEM block at all, is in the log.
+- wait_until(condition, timeout), count_connections(port, seconds): polling and a TCP listener
+  that only counts the connections made to it (a broker that is down, seen from the agent).
 - IntegrationTest: unittest base class with a temporary folder, a Pki and a started FakePlatform.
 """
 
@@ -28,6 +33,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -81,6 +87,38 @@ def wait_for_port(port: int, timeout: float = 10.0) -> None:
         except OSError:
             time.sleep(0.05)
     raise TimeoutError(f"nothing listens on port {port} after {timeout} s")
+
+
+def wait_until(condition: Callable[[], object], timeout: float, what: str = "the condition"):
+    """Polls condition() every 0.1 s until it returns something true, and returns that."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = condition()
+        if value:
+            return value
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{what} did not happen within {timeout} s")
+        time.sleep(0.1)
+
+
+def count_connections(port: int, seconds: float) -> list:
+    """Listens on 127.0.0.1:port for `seconds`, closes every connection at once (as a broker that
+    is down would refuse it) and returns the monotonic times of the connections."""
+    times = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", port))
+        server.listen(16)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            server.settimeout(left)
+            try:
+                connection, _ = server.accept()
+            except socket.timeout:
+                break
+            times.append(time.monotonic())
+            connection.close()
+    return times
 
 
 def cert_pem(cert: x509.Certificate) -> str:
@@ -497,6 +535,7 @@ class FakePlatform:
         self._tokens: set = set()
         self._downloads: dict = {}
         self._scripts = collections.defaultdict(collections.deque)
+        self._device_listeners: list = []  # called with each new Device (the broker ACL)
         self._lock = threading.RLock()
         self._server = None
         self._thread = None
@@ -553,6 +592,11 @@ class FakePlatform:
         with self._lock:
             self._downloads[token] = content
         return f"{self.url}{self.DOWNLOADS}{token}"
+
+    def on_device(self, listener: Callable[[Device], None]) -> None:
+        """Calls listener(device) after each new registration."""
+        with self._lock:
+            self._device_listeners.append(listener)
 
     def requests_to(self, path: str) -> list:
         with self._lock:
@@ -653,6 +697,8 @@ class FakePlatform:
             self._issue(device, key)
             self._tokens.discard(token.strip())  # single use, only on success
             self.devices[device.device_id] = device
+            for listener in self._device_listeners:
+                listener(device)
             return json_reply(200, self._provisioned(device))
 
     def _renew(self, request: Request) -> Reply:
@@ -720,19 +766,71 @@ class FakePlatform:
 # Broker
 
 
+# The user name (certificate CN) of the platform's side in the test broker: it may read and
+# write every topic under t/.
+PLATFORM_USER = "firmline-test-platform"
+
+
 class Broker:
     """mosquitto on 127.0.0.1 and a free port: TLS only, a client certificate required (verified
     with the root; a device sends its certificate with the intermediate), the certificate CN as
-    the user name. Everything it does goes to `log`."""
+    the user name. Everything it does goes to `log`.
 
-    def __init__(self, pki: Pki, directory, port: Optional[int] = None):
+    Topic ACL as on the platform: mosquitto patterns cannot turn the user name {tenant}.{device}
+    into t/{tenant}/d/{device}, so the ACL file lists every device of `platform` explicitly and is
+    rebuilt (and reloaded with SIGHUP) at every registration. A device may publish only on
+    {topicRoot}/status and {topicRoot}/ota/result and receive only {topicRoot}/ota/offer;
+    PLATFORM_USER may read and write t/#; anyone else nothing. Unlike the platform, mosquitto
+    grants a SUBSCRIBE to any topic the user may write too (it filters only what it delivers),
+    so a subscription to {topicRoot}/status is not refused here."""
+
+    def __init__(
+        self,
+        pki: Pki,
+        directory,
+        port: Optional[int] = None,
+        platform: Optional[FakePlatform] = None,
+    ):
         self.pki = pki
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.port = port or free_port()
         self.config_path = self.dir / "mosquitto.conf"
         self.log_path = self.dir / "mosquitto.log"
+        self.acl_path = self.dir / "acl"
+        self.platform = platform
         self._process = None
+        self.write_acl()
+        if platform is not None:
+            platform.on_device(lambda device: self.reload_acl())
+
+    def _acl(self) -> str:
+        lines = [f"user {PLATFORM_USER}", "topic readwrite t/#", ""]
+        tenant = self.pki.tenant_id
+        devices = list(self.platform.devices) if self.platform is not None else []
+        for device_id in devices:
+            root = f"t/{tenant}/d/{device_id}"
+            lines += [
+                f"user {tenant}.{device_id}",
+                f"topic write {root}/status",
+                f"topic write {root}/ota/result",
+                f"topic read {root}/ota/offer",
+                "",
+            ]
+        return "\n".join(lines)
+
+    def write_acl(self) -> None:
+        temp = self.acl_path.with_suffix(".tmp")
+        temp.write_text(self._acl())
+        os.replace(temp, self.acl_path)
+
+    def reload_acl(self) -> None:
+        """Rewrites the ACL file and has a running broker read it again (waits for it)."""
+        self.write_acl()
+        if self._process is not None and self._process.poll() is None:
+            reloads = self.log.count("Reloading config")
+            self._process.send_signal(signal.SIGHUP)
+            wait_until(lambda: self.log.count("Reloading config") > reloads, 10, "ACL reload")
 
     def _config(self) -> str:
         return "\n".join(
@@ -750,11 +848,13 @@ class Broker:
                 f"keyfile {self.pki.broker_key_path}",
                 "require_certificate true",
                 "use_identity_as_username true",
+                f"acl_file {self.acl_path}",
                 "",
             ]
         )
 
     def start(self) -> "Broker":
+        self.write_acl()
         self.config_path.write_text(self._config())
         self._process = subprocess.Popen(
             ["mosquitto", "-c", str(self.config_path)],
@@ -791,6 +891,99 @@ class Broker:
 
     def __exit__(self, *exc):
         self.stop()
+
+    def client(self, **kwargs) -> "MqttClient":
+        return MqttClient(self, **kwargs)
+
+
+@dataclasses.dataclass
+class Message:
+    topic: str
+    payload: bytes
+    qos: int
+    retain: bool
+    time: float  # time.monotonic() at arrival
+
+    def json(self):
+        return json.loads(self.payload)
+
+
+class MqttClient:
+    """A paho MQTT 5 client of the test broker with a certificate signed by the root; by default
+    the platform's side (PLATFORM_USER, every t/# topic). Messages of its subscriptions are
+    collected in `messages`; subscribe() and publish() wait for the broker's answer. With
+    certfile and keyfile it connects with those instead (a device: client id = common_name)."""
+
+    def __init__(
+        self,
+        broker: Broker,
+        name: str = "platform",
+        common_name: str = PLATFORM_USER,
+        certfile=None,
+        keyfile=None,
+    ):
+        import paho.mqtt.client as mqtt  # only the tests that talk MQTT need paho
+
+        if certfile is None:
+            cert, key = broker.pki.client_certificate(f"mqtt-{name}", common_name)
+        else:
+            cert, key = str(certfile), str(keyfile)
+        self.messages: list = []
+        self._lock = threading.Lock()
+        self._acks: dict = {}
+        self._connected = threading.Event()
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2, client_id=common_name, protocol=mqtt.MQTTv5
+        )
+        self.client.tls_set(ca_certs=str(broker.pki.root_path), certfile=cert, keyfile=key)
+        self.client.on_connect = lambda c, u, flags, reason, props: (
+            self._connected.set() if not reason.is_failure else None
+        )
+        self.client.on_message = self._on_message
+        self.client.on_subscribe = lambda c, u, mid, reasons, props: self._ack(mid, reasons)
+        self.client.on_publish = lambda c, u, mid, reason, props: self._ack(mid, reason)
+        self.client.connect("localhost", broker.port)
+        self.client.loop_start()
+        if not self._connected.wait(10):
+            self.close()
+            raise AssertionError("the test MQTT client cannot connect to the broker")
+
+    def _on_message(self, client, userdata, msg) -> None:
+        message = Message(msg.topic, bytes(msg.payload), msg.qos, bool(msg.retain), time.monotonic())
+        with self._lock:
+            self.messages.append(message)
+
+    def _ack(self, mid, reason) -> None:
+        with self._lock:
+            self._acks[mid] = (reason,)  # a tuple: true even when the reason code is 0
+
+    def _wait_ack(self, mid):
+        return wait_until(lambda: self._acks.get(mid), 10, f"the answer to message {mid}")[0]
+
+    def subscribe(self, topic: str, qos: int = 1):
+        """Subscribes and returns the granted reason codes."""
+        _, mid = self.client.subscribe(topic, qos)
+        return self._wait_ack(mid)
+
+    def publish(self, topic: str, payload, qos: int = 1, retain: bool = False):
+        info = self.client.publish(topic, payload, qos=qos, retain=retain)
+        return self._wait_ack(info.mid) if qos > 0 else None
+
+    def received(self, topic: Optional[str] = None) -> list:
+        with self._lock:
+            return [m for m in self.messages if topic is None or m.topic == topic]
+
+    def wait_for(self, topic: str, count: int = 1, timeout: float = 30) -> list:
+        """Waits until `count` messages arrived on `topic` and returns them all."""
+        return wait_until(
+            lambda: (lambda got: got if len(got) >= count else None)(self.received(topic)),
+            timeout,
+            f"{count} message(s) on {topic}",
+        )
+
+    def close(self) -> None:
+        self.client.disconnect()
+        self.client.loop_stop()
 
 
 # --------------------------------------------------------------------------------------------
@@ -839,7 +1032,8 @@ class Agent:
         }
         self.log = ""
         self._process = None
-        self._process_stderr = None
+        self._run_log_path = None
+        self._runs = 0
 
     def write_config(self) -> Path:
         lines = ["[platform]"]
@@ -887,16 +1081,34 @@ class Agent:
     def start(self, *args) -> subprocess.Popen:
         """Starts a long-running command (`run`); stop() ends it and collects its log."""
         self.write_config()
-        self._process_stderr = tempfile.TemporaryFile(mode="w+", errors="replace")
-        self._process = subprocess.Popen(
-            self._command(args),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=self._process_stderr,
-            text=True,
-            env=self._env(),
-        )
+        self._runs += 1
+        # A file of its own opened for appending, so that the test can read it while it grows.
+        self._run_log_path = self.dir / f"run-{self._runs}.log"
+        with open(self._run_log_path, "a") as stderr:
+            self._process = subprocess.Popen(
+                self._command(args),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+                text=True,
+                env=self._env(),
+            )
         return self._process
+
+    @property
+    def running_log(self) -> str:
+        """What the running command has written to stderr so far (not yet in `log`)."""
+        if self._process is None or self._run_log_path is None:
+            return ""
+        return self._run_log_path.read_text(errors="replace")
+
+    def wait_for_log(self, text: str, timeout: float = 30, count: int = 1) -> str:
+        """Waits until the running command has logged `text` `count` times; returns its log."""
+        return wait_until(
+            lambda: (lambda log: log if log.count(text) >= count else None)(self.running_log),
+            timeout,
+            f"the agent logging {text!r}",
+        )
 
     def stop(self, timeout: float = 15) -> int:
         """SIGTERM, then the exit code; the stderr of the run is added to the log."""
@@ -910,9 +1122,7 @@ class Agent:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        self._process_stderr.seek(0)
-        stderr = self._process_stderr.read()
-        self._process_stderr.close()
+        stderr = self._run_log_path.read_text(errors="replace")
         self._take_log(stderr)
         return process.returncode
 
@@ -956,6 +1166,6 @@ class IntegrationTest(unittest.TestCase):
         return agent
 
     def make_broker(self, name: str = "broker") -> Broker:
-        broker = Broker(self.pki, self.tmp / name).start()
+        broker = Broker(self.pki, self.tmp / name, platform=self.platform).start()
         self.addCleanup(broker.stop)
         return broker

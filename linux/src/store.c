@@ -2,9 +2,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include "store.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,6 +131,53 @@ int fa_store_remove(const char *dir, const char *name) {
     if (unlink(path) != 0)
         return errno == ENOENT ? 0 : -1;
     return sync_dir(dir);
+}
+
+/* The pid in a temporary name ".<name>.<pid>.<n>.tmp" of fa_store_write, or -1 when the name has
+ * another form. */
+static long temp_pid(const char *entry) {
+    size_t len = strlen(entry);
+    if (len < 9 || entry[0] != '.' || strcmp(entry + len - 4, ".tmp") != 0)
+        return -1;
+    size_t end = len - 4, dots[2] = {0, 0},
+           found = 0; /* the two dots before ".tmp", from the right */
+    for (size_t i = end; i-- > 1 && found < 2;)
+        if (entry[i] == '.')
+            dots[found++] = i;
+    if (found < 2 || dots[1] < 2) /* ".<name>" needs a name */
+        return -1;
+    long pid = 0;
+    for (size_t i = dots[1] + 1; i < dots[0]; i++) {
+        if (entry[i] < '0' || entry[i] > '9' || pid > 99999999)
+            return -1;
+        pid = pid * 10 + (entry[i] - '0');
+    }
+    for (size_t i = dots[0] + 1; i < end; i++)
+        if (entry[i] < '0' || entry[i] > '9')
+            return -1;
+    return dots[0] > dots[1] + 1 && end > dots[0] + 1 && pid > 0 ? pid : -1;
+}
+
+int fa_store_remove_stale(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d == NULL)
+        return -1;
+    int removed = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        long pid = temp_pid(e->d_name);
+        if (pid < 0)
+            continue;
+        if (pid != (long)getpid() && (kill((pid_t)pid, 0) == 0 || errno != ESRCH))
+            continue; /* its process lives: a write in progress */
+        char path[PATH_MAX];
+        if (make_path(path, sizeof path, dir, e->d_name) == 0 && unlink(path) == 0)
+            removed++;
+    }
+    closedir(d);
+    if (removed > 0)
+        sync_dir(dir);
+    return removed;
 }
 
 int fa_store_rename(const char *dir, const char *from, const char *to) {

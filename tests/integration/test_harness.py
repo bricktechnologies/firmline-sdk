@@ -46,11 +46,11 @@ class HarnessTest(IntegrationTest):
         except urllib.error.HTTPError as e:
             return e.code, dict(e.headers), e.read()
 
-    def register(self, key):
+    def register(self, key, serial="SN-1"):
         status, _, body = self.call(
             "POST",
             FakePlatform.PROVISIONING,
-            {"token": self.platform.new_token(), "serialNumber": "SN-1", "csr": make_csr(key)},
+            {"token": self.platform.new_token(), "serialNumber": serial, "csr": make_csr(key)},
         )
         self.assertEqual(200, status)
         return json.loads(body)
@@ -152,6 +152,45 @@ class HarnessTest(IntegrationTest):
         self.assertEqual(0, connect(str(chain_path), str(key_path)))
         self.assertIsNone(connect(None, None))
         self.assertIn(f"u'{answer['clientId']}'", broker.log)
+
+    def test_broker_acl_limits_device_to_its_topics(self):
+        broker = self.make_broker()  # before the registration: the ACL is reloaded by it
+        key = ec.generate_private_key(ec.SECP256R1())
+        answer = self.register(key)
+        other = self.register(ec.generate_private_key(ec.SECP256R1()), serial="SN-2")
+        key_path = write_private(self.tmp / "device.key", key_pem(key))
+        chain_path = self.tmp / "device-chain.pem"
+        chain_path.write_text(answer["certificate"] + cert_pem(self.pki.intermediate))
+        device = broker.client(
+            name="device", common_name=answer["clientId"], certfile=chain_path, keyfile=key_path
+        )
+        self.addCleanup(device.close)
+        root, not_authorized = answer["topicRoot"], 0x87
+
+        # mosquitto 2.0 grants every SUBSCRIBE and applies the ACL to what it delivers (the
+        # platform refuses the subscription itself): only its own offers reach the device.
+        offer_of_other = other["topicRoot"] + "/ota/offer"
+        for topic in [root + "/ota/offer", root + "/status", offer_of_other]:
+            self.assertEqual(1, device.subscribe(topic)[0].value)
+        platform = broker.client()
+        self.addCleanup(platform.close)
+        self.assertEqual(1, platform.subscribe("t/#")[0].value)
+
+        self.assertEqual(0, device.publish(root + "/status", b"{}").value)
+        self.assertEqual(0, device.publish(root + "/ota/result", b"{}").value)
+        for topic in [root + "/ota/offer", root + "/other", other["topicRoot"] + "/status"]:
+            with self.subTest(topic=topic):
+                self.assertEqual(not_authorized, device.publish(topic, b"{}").value)
+        platform.wait_for(root + "/ota/result")
+        self.assertEqual(
+            [root + "/status", root + "/ota/result"], [m.topic for m in platform.received()]
+        )
+
+        for topic in [offer_of_other, root + "/status", root + "/ota/offer"]:
+            self.assertEqual(0, platform.publish(topic, topic.encode()).value)
+        device.wait_for(root + "/ota/offer")
+        time.sleep(0.5)  # anything else would have arrived by now
+        self.assertEqual([root + "/ota/offer"], [m.topic for m in device.received()])
 
 
 if __name__ == "__main__":

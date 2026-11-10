@@ -12,4 +12,9 @@
  * usage or configuration error, already_registered on stdout when device.json exists. */
 int fa_cmd_register(int argc, char **argv);
 
+/* run [--config <path>]: the service (broker connection, status, offers, renewal) until SIGTERM
+ * or SIGINT, then exit 0. Exit 1 when it cannot start (usage, configuration, not registered,
+ * update_key not a P-256 public key). */
+int fa_cmd_run(int argc, char **argv);
+
 #endif

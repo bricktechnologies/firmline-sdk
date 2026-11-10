@@ -19,4 +19,10 @@ int fa_csr_create(const char *dir, const char *key_name, char *pem, size_t cap);
  * padded to 32 bytes). */
 int fa_sign_sha256(const char *dir, const char *key_name, const uint8_t hash[32], uint8_t sig[64]);
 
+/* The update verification key of the file at path (a "PUBLIC KEY" PEM, SubjectPublicKeyInfo, from
+ * the page "OTA releases"), which must be P-256: its DER (91 bytes) into der, the length in *len.
+ * -1 (*len = 0) when the file is missing, holds no public key, a key of another type or curve, or
+ * the DER does not fit in cap. */
+int fa_update_key_load(const char *path, uint8_t *der, size_t cap, size_t *len);
+
 #endif

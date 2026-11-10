@@ -132,6 +132,54 @@ static void key_of_another_curve_is_refused(void) {
     CHECK_EQ_INT(fa_sign_sha256(dir, "p384.key", hash, sig), -1);
 }
 
+/* The public key of a new key of the curve as a SubjectPublicKeyInfo PEM file dir/name; the key is
+ * returned (the caller frees it). */
+static EVP_PKEY *write_public(const char *dir, const char *name, const char *curve) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    EVP_PKEY *key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", curve);
+    FILE *f = fopen(path, "w");
+    if (f != NULL) {
+        PEM_write_PUBKEY(f, key);
+        fclose(f);
+    }
+    return key;
+}
+
+static void update_key_is_p256_public_key_der(void) {
+    char dir[64], path[128];
+    make_dir(dir, sizeof dir);
+    EVP_PKEY *key = write_public(dir, "update.pem", "P-256");
+    unsigned char *expected = NULL;
+    int expected_len = i2d_PUBKEY(key, &expected);
+    uint8_t der[128];
+    size_t len = 0;
+    snprintf(path, sizeof path, "%s/update.pem", dir);
+    CHECK_EQ_INT(fa_update_key_load(path, der, sizeof der, &len), 0);
+    CHECK_EQ_INT(len, 91); /* P-256 SubjectPublicKeyInfo */
+    CHECK_EQ_INT(len, expected_len);
+    CHECK(expected != NULL && memcmp(der, expected, len) == 0);
+    CHECK_EQ_INT(fa_update_key_load(path, der, 90, &len), -1); /* does not fit */
+    OPENSSL_free(expected);
+    EVP_PKEY_free(key);
+}
+
+static void update_key_of_another_kind_is_refused(void) {
+    char dir[64], path[128];
+    make_dir(dir, sizeof dir);
+    EVP_PKEY_free(write_public(dir, "p384.pem", "P-384"));
+    CHECK_EQ_INT(fa_key_generate(dir, "private.pem"), 0); /* a private key, not a public one */
+    CHECK_EQ_INT(fa_store_write(dir, "junk.pem", "not a key\n", 10, 0644), 0);
+    const char *names[] = {"p384.pem", "private.pem", "junk.pem", "missing.pem"};
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        uint8_t der[128];
+        size_t len = 7;
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        CHECK_EQ_INT(fa_update_key_load(path, der, sizeof der, &len), -1);
+        CHECK_EQ_INT(len, 0);
+    }
+}
+
 /* r||s back to DER, then verified with the public key over the same SHA-256. */
 static int verifies(EVP_PKEY *key, const uint8_t hash[32], const uint8_t sig[64]) {
     ECDSA_SIG *s = ECDSA_SIG_new();
@@ -200,5 +248,7 @@ int main(void) {
     RUN(key_of_another_curve_is_refused);
     RUN(signature_is_r_and_s_over_the_hash);
     RUN(signature_halves_are_padded);
+    RUN(update_key_is_p256_public_key_der);
+    RUN(update_key_of_another_kind_is_refused);
     return CHECK_RESULT;
 }
