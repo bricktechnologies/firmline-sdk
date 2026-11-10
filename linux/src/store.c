@@ -130,3 +130,14 @@ int fa_store_remove(const char *dir, const char *name) {
         return errno == ENOENT ? 0 : -1;
     return sync_dir(dir);
 }
+
+int fa_store_rename(const char *dir, const char *from, const char *to) {
+    char from_path[PATH_MAX], to_path[PATH_MAX];
+    if (!valid_name(from) || !valid_name(to) ||
+        make_path(from_path, sizeof from_path, dir, from) != 0 ||
+        make_path(to_path, sizeof to_path, dir, to) != 0)
+        return -1;
+    if (rename(from_path, to_path) != 0)
+        return -1;
+    return sync_dir(dir);
+}

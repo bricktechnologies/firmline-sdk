@@ -143,6 +143,32 @@ static void store_remove_deletes_and_tolerates_missing(void) {
     CHECK_EQ_INT(fa_store_remove(dir, "token"), 0);
 }
 
+static void store_rename_replaces_in_one_step(void) {
+    umask(022);
+    char dir[64];
+    make_dir(dir, sizeof dir);
+    CHECK_EQ_INT(fa_store_write(dir, "new.key", "fresh", 5, 0600), 0);
+    CHECK_EQ_INT(fa_store_write(dir, "device.key", "old", 3, 0600), 0);
+    CHECK_EQ_INT(fa_store_rename(dir, "new.key", "device.key"), 0);
+    CHECK_EQ_INT(count_entries(dir), 1);
+
+    char *data = NULL;
+    size_t len = 0;
+    CHECK_EQ_INT(fa_store_read(dir, "device.key", &data, &len), 0);
+    CHECK_EQ_STR(data, "fresh");
+    free(data);
+    char path[128];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/device.key", dir);
+    CHECK_EQ_INT(stat(path, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0600); /* the mode moves with the file */
+
+    CHECK_EQ_INT(fa_store_rename(dir, "missing", "device.key"), -1);
+    CHECK_EQ_INT(fa_store_rename(dir, "device.key", "../device.key"), -1);
+    CHECK_EQ_INT(fa_store_rename(dir, "..", "device.key"), -1);
+    CHECK_EQ_INT(count_entries(dir), 1);
+}
+
 int main(void) {
     RUN(store_write_is_atomic);
     RUN(store_mode_is_exact_whatever_the_umask);
@@ -150,5 +176,6 @@ int main(void) {
     RUN(store_read_missing_is_error);
     RUN(store_read_limit_is_one_mebibyte);
     RUN(store_remove_deletes_and_tolerates_missing);
+    RUN(store_rename_replaces_in_one_step);
     return CHECK_RESULT;
 }
