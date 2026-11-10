@@ -1,0 +1,123 @@
+# The agent image: ghcr.io/bricktechnologies/firmline-agent for linux/amd64, linux/arm64 and linux/arm/v7.
+# Published only on a tag v{X.Y.Z} (the tag without the v is the version printed by `firmline-agent --version`);
+# by hand it only builds the three architectures, to try the Dockerfile, and pushes nothing. Never on a pull request.
+# Tags of the image: X.Y.Z and X (the major version), the latter only for a version without a suffix.
+# On a tag the SBOMs (Syft, CycloneDX JSON) of the image and of the source are attached to the GitHub release.
+# Actions are pinned to commit SHAs (tag in the comment).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the v (nothing is pushed by hand)"
+        required: true
+        default: "0.0.0-dev"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bricktechnologies/firmline-agent
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      packages: write
+    env:
+      PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Version and tags
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$version' is not a version X.Y.Z"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The major label moves only with a released version: a candidate (X.Y.Z-rc.1) gets its own tag only.
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$version"
+            if [[ "$version" != *-* ]]; then echo "$IMAGE:${version%%.*}"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Sign in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build for amd64, arm64 and armv7 (pushed on a tag)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: linux/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ env.PUBLISH == 'true' }}
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          provenance: mode=max
+          tags: ${{ steps.version.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      # Syft reads the pushed image by its digest, so the SBOM describes exactly what was published.
+      - name: SBOM of the image
+        if: env.PUBLISH == 'true'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: firmline-agent-image.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: SBOM of the source
+        if: env.PUBLISH == 'true'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: firmline-agent-source.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: GitHub release with the SBOMs
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "$TAG" == *-* ]]; then flags+=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber firmline-agent-image.cdx.json firmline-agent-source.cdx.json
+          else
+            gh release create "$TAG" "${flags[@]}" --title "$TAG" --generate-notes \
+              firmline-agent-image.cdx.json firmline-agent-source.cdx.json
+          fi
