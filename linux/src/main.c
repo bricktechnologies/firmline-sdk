@@ -35,7 +35,8 @@ static void usage(FILE *out) {
           "           with the root received at registration), or the configuration again\n"
           "\n"
           "  --config  the configuration file (default " FA_DEFAULT_CONFIG ")\n"
-          "  --help    show this text\n",
+          "  --help    show this text\n"
+          "  --version print the version\n",
           out);
 }
 

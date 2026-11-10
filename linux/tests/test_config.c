@@ -311,6 +311,24 @@ static void config_key_table_is_exposed(void) {
     CHECK_EQ_INT(component, 4);
 }
 
+/* The example of the guide (examples/debian-script/agent.conf) is a configuration the agent loads.
+ * The test file's own path (absolute in the CMake build) gives the repository root. */
+static void example_configuration_is_valid(void) {
+    static fa_config cfg;
+    char err[256] = "", path[1024];
+    const char *here = __FILE__;
+    const char *tail = "linux/tests/test_config.c";
+    size_t n = strlen(here), t = strlen(tail);
+    CHECK(n > t && strcmp(here + n - t, tail) == 0);
+    snprintf(path, sizeof path, "%.*sexamples/debian-script/agent.conf", (int)(n - t), here);
+    CHECK_EQ_INT(fa_config_load(path, &cfg, err), 0);
+    CHECK_EQ_STR(err, "");
+    CHECK_EQ_INT(cfg.component_count, 1);
+    CHECK(cfg.component[0].main);
+    CHECK_EQ_INT(cfg.component[0].install, FA_INSTALL_SCRIPT);
+    CHECK_EQ_STR(cfg.component[0].script, "/usr/lib/firmline/install.sh");
+}
+
 int main(void) {
     RUN(config_reads_every_key);
     RUN(config_defaults);
@@ -321,5 +339,6 @@ int main(void) {
     RUN(config_handles_line_endings_and_nul_bytes);
     RUN(config_platform_value_rules);
     RUN(config_key_table_is_exposed);
+    RUN(example_configuration_is_valid);
     return CHECK_RESULT;
 }
