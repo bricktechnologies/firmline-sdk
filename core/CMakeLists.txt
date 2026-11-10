@@ -20,4 +20,6 @@ if(FIRMLINE_BUILD_TESTS)
                                PRIVATE FL_VECTOR_DIR="${PROJECT_SOURCE_DIR}/tests/vector")
     add_test(NAME ${test_name} COMMAND ${test_name})
   endforeach()
+  # Test helper, not in the library: a key generated at run time that signs manifests and offers.
+  target_sources(test_offer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests/signer.c")
 endif()
