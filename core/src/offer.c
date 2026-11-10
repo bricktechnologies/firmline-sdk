@@ -116,7 +116,7 @@ static int verify(const uint8_t *key_der, size_t key_len, const uint8_t *msg, si
     status = psa_verify_message(key, PSA_ALG_ECDSA(PSA_ALG_SHA_256), msg, msg_len, sig, SIG_LEN);
     if (status == PSA_SUCCESS)
         rc = FL_OK;
-    else if (status == PSA_ERROR_INVALID_SIGNATURE || status == PSA_ERROR_INVALID_ARGUMENT)
+    else if (status == PSA_ERROR_INVALID_SIGNATURE) /* also r or s zero or not below n */
         rc = FL_ERR_FORMAT;
     else
         rc = FL_ERR_CRYPTO;
