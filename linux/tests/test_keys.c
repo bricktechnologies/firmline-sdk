@@ -10,6 +10,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -271,6 +272,100 @@ static int make_certificate(const char *dir, const char *key_name, const char *f
     return rc;
 }
 
+/* A certificate with subject CN=cn for `key`, signed by issuer_key as issuer (NULL: self-signed),
+ * a CA when `ca`, appended as PEM to out (cap bytes, NUL-terminated). The X509 is returned (the
+ * caller frees it), or NULL. */
+static X509 *add_certificate(EVP_PKEY *key, const char *cn, EVP_PKEY *issuer_key, X509 *issuer,
+                             int ca, char *out, size_t cap) {
+    X509 *cert = X509_new();
+    BIO *bio = BIO_new(BIO_s_mem());
+    X509_EXTENSION *ext = NULL;
+    X509V3_CTX v3;
+    int ok =
+        cert != NULL && bio != NULL && X509_set_version(cert, 2) == 1 &&
+        ASN1_INTEGER_set(X509_get_serialNumber(cert), 9) == 1 &&
+        ASN1_TIME_set_string_X509(X509_getm_notBefore(cert), "20200101000000Z") == 1 &&
+        ASN1_TIME_set_string_X509(X509_getm_notAfter(cert), "20400101000000Z") == 1 &&
+        X509_NAME_add_entry_by_txt(X509_get_subject_name(cert), "CN", MBSTRING_ASC,
+                                   (const unsigned char *)cn, -1, -1, 0) == 1 &&
+        X509_set_issuer_name(cert, X509_get_subject_name(issuer != NULL ? issuer : cert)) == 1 &&
+        X509_set_pubkey(cert, key) == 1;
+    if (ok) {
+        X509V3_set_ctx(&v3, issuer != NULL ? issuer : cert, cert, NULL, NULL, 0);
+        ext = X509V3_EXT_conf_nid(NULL, &v3, NID_basic_constraints,
+                                  ca ? "critical,CA:TRUE" : "critical,CA:FALSE");
+        ok = ext != NULL && X509_add_ext(cert, ext, -1) == 1 &&
+             X509_sign(cert, issuer_key != NULL ? issuer_key : key, EVP_sha256()) > 0 &&
+             PEM_write_bio_X509(bio, cert) == 1;
+    }
+    char *data = NULL;
+    long len = ok ? BIO_get_mem_data(bio, &data) : 0;
+    size_t used = strlen(out);
+    if (ok && len > 0 && used + (size_t)len < cap) {
+        memcpy(out + used, data, (size_t)len);
+        out[used + (size_t)len] = '\0';
+    } else {
+        X509_free(cert);
+        cert = NULL;
+    }
+    X509_EXTENSION_free(ext);
+    BIO_free(bio);
+    return cert;
+}
+
+static void certificate_chains_only_to_the_root_in_use(void) {
+    EVP_PKEY *root_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    EVP_PKEY *mid_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    EVP_PKEY *leaf_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    EVP_PKEY *forged_root_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    EVP_PKEY *forged_mid_key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "P-256");
+    static char root[4096], chain[8192], mid_only[4096], leaf[4096];
+    static char forged_root[4096], forged_chain[8192], forged_leaf[4096], scratch[8192];
+    root[0] = chain[0] = mid_only[0] = leaf[0] = '\0';
+    forged_root[0] = forged_chain[0] = forged_leaf[0] = scratch[0] = '\0';
+
+    X509 *r = add_certificate(root_key, "Root", NULL, NULL, 1, root, sizeof root);
+    X509 *m = add_certificate(mid_key, "Device CA", root_key, r, 1, chain, sizeof chain);
+    X509_free(add_certificate(mid_key, "Device CA", root_key, r, 1, mid_only, sizeof mid_only));
+    strcat(chain, root); /* the answer's chain: intermediate, then root */
+    X509 *l = add_certificate(leaf_key, "device", mid_key, m, 0, leaf, sizeof leaf);
+    /* A forged hierarchy with the same names. */
+    X509 *fr =
+        add_certificate(forged_root_key, "Root", NULL, NULL, 1, forged_root, sizeof forged_root);
+    X509 *fm = add_certificate(forged_mid_key, "Device CA", forged_root_key, fr, 1, forged_chain,
+                               sizeof forged_chain);
+    strcat(forged_chain, forged_root);
+    X509 *fl =
+        add_certificate(leaf_key, "device", forged_mid_key, fm, 0, forged_leaf, sizeof forged_leaf);
+    CHECK(r != NULL && m != NULL && l != NULL && fr != NULL && fm != NULL && fl != NULL);
+
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, root), 1);
+    /* the answer's root is another one (same name) */
+    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, forged_chain, root), 0);
+    /* our chain, a certificate from another issuer of the same name */
+    CHECK_EQ_INT(fa_certificate_chains_to(forged_leaf, chain, root), 0);
+    /* a chain that does not end with the root in use */
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, mid_only, root), 0);
+    /* the root in use is the only anchor: a chain ending with it, the root itself forged */
+    snprintf(scratch, sizeof scratch, "%s%s", mid_only, root);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, scratch, forged_root), 0);
+    CHECK_EQ_INT(fa_certificate_chains_to("junk\n", chain, root), -1);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, "junk\n", root), -1);
+    CHECK_EQ_INT(fa_certificate_chains_to(leaf, chain, "junk\n"), -1);
+
+    X509_free(r);
+    X509_free(m);
+    X509_free(l);
+    X509_free(fr);
+    X509_free(fm);
+    X509_free(fl);
+    EVP_PKEY_free(root_key);
+    EVP_PKEY_free(mid_key);
+    EVP_PKEY_free(leaf_key);
+    EVP_PKEY_free(forged_root_key);
+    EVP_PKEY_free(forged_mid_key);
+}
+
 static fl_time utc(const char *iso) {
     fl_time t = -1;
     fl_time_parse(iso, strlen(iso), &t);
@@ -328,5 +423,6 @@ int main(void) {
     RUN(update_key_of_another_kind_is_refused);
     RUN(certificate_validity_is_read_in_utc);
     RUN(key_matches_only_its_certificate);
+    RUN(certificate_chains_only_to_the_root_in_use);
     return CHECK_RESULT;
 }

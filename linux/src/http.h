@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* HTTPS with libcurl: TLS 1.2 or later, peer and host name verified (with ca_file when it is set,
- * otherwise the system authorities), https only, no redirect followed, 15 s to connect and 60 s
- * in all. Nothing about a request (URL, body) is logged; a failure logs only libcurl's reason. */
+/* HTTPS with libcurl: TLS 1.2 or later, peer and host name verified (with ca_file alone when it is
+ * set, never also the system's CA directory; otherwise the system authorities), https only, no
+ * redirect followed, 15 s to connect and 60 s in all. Nothing about a request (URL, body) is
+ * logged; a failure logs only libcurl's reason. */
 #ifndef FIRMLINE_AGENT_HTTP_H
 #define FIRMLINE_AGENT_HTTP_H
 

@@ -3,10 +3,22 @@
  * expiry, at most once a day (fl_renewal_due), checked at start and after each status.
  *
  * Before the request, the new key and the exact request body are saved (renewal-new.key, 0600;
- * renewal-request.json): an answer that does not come (network or TLS error, 429, 5xx, a 200 that
- * cannot be read) leaves both, and the next check sends the same bytes again; the platform then
- * answers with the certificate it already issued for that key. A refusal (any other 4xx, or a 200
- * for another device or for another key) removes both; the next try is a day later.
+ * renewal-request.json). Once a request may have reached the platform, the certificate it issued
+ * can only be obtained again with these exact bytes (the old certificate no longer counts for
+ * another key), so both are removed only:
+ *   - on a final refusal: 400 certificate_renewal_refused or csr_invalid, 409
+ *     certificate_renewed_recently (the next try is a day later);
+ *   - after the swap;
+ *   - on a local failure before anything was sent, or when the saved request cannot be read.
+ * Every other outcome keeps them and the next check sends the same bytes again: a network or TLS
+ * error, 429, 5xx, any other 4xx (a relay or a proxy may answer 403, 404, 408), a 200 that cannot
+ * be read, is for another device or another key, or does not chain to the root in use. While the
+ * clock reads past the certificate's notAfter nothing is sent (said once) but nothing is removed
+ * either: a clock that jumped forward comes back.
+ *
+ * The answer must keep the trust anchor: its last certificate is the root.pem in use (DER-equal)
+ * and the new certificate verifies through the answer's chain against that root alone. The
+ * platform root and the company intermediate never change.
  *
  * The swap after a 200, so that a crash at any step leaves a device that connects:
  *   1. the new certificate, chain, root and device.json are written under pending names

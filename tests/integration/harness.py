@@ -180,6 +180,59 @@ def assert_no_secrets(log: str, secret_values) -> None:
                 raise AssertionError(f"the log contains a secret ({piece[:12]}...):\n{log}")
 
 
+# libcurl's built-in CA directory in the dev image (CURLINFO_CAPATH), also OpenSSL's default.
+SYSTEM_CA_DIR = Path("/etc/ssl/certs")
+
+
+def trust_system_wide(test: unittest.TestCase, ca_cert_path) -> Path:
+    """Adds a CA certificate to the system's CA directory, as `<subject hash>.<n>` (the name
+    OpenSSL looks up), until the end of the test: a certificate it issues is then trusted as one
+    of a public authority would be. Fails when the directory cannot be written (the tests run as
+    root in the dev container); FIRMLINE_NO_SYSTEM_CA=1 skips instead."""
+    if not os.access(SYSTEM_CA_DIR, os.W_OK):
+        if os.environ.get("FIRMLINE_NO_SYSTEM_CA") == "1":
+            test.skipTest(f"{SYSTEM_CA_DIR} is not writable and FIRMLINE_NO_SYSTEM_CA=1")
+        test.fail(f"{SYSTEM_CA_DIR} is not writable: run the tests in the dev container (root)")
+    subject_hash = subprocess.run(
+        ["openssl", "x509", "-hash", "-noout", "-in", str(ca_cert_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    n = 0
+    while (SYSTEM_CA_DIR / f"{subject_hash}.{n}").exists():
+        n += 1
+    path = SYSTEM_CA_DIR / f"{subject_hash}.{n}"
+    shutil.copy(ca_cert_path, path)
+    test.addCleanup(path.unlink, missing_ok=True)
+    return path
+
+
+CLOCK_SHIM_SOURCE = Path(__file__).resolve().parent / "clock_shim.c"
+
+
+def build_clock_shim(directory) -> Path:
+    """Compiles clock_shim.c (the dev image has gcc): preloaded into the agent with LD_PRELOAD, its
+    time() runs FIRMLINE_TEST_CLOCK_OFFSET seconds ahead (or behind). See clock_env()."""
+    out = Path(directory) / "clock_shim.so"
+    subprocess.run(
+        ["gcc", "-shared", "-fPIC", "-O1", "-o", str(out), str(CLOCK_SHIM_SOURCE), "-ldl"],
+        check=True,
+        capture_output=True,
+    )
+    return out
+
+
+def clock_env(shim: Path, offset: datetime.timedelta) -> dict:
+    """The environment of an agent whose wall clock is moved by `offset` (Agent.env)."""
+    return {
+        "LD_PRELOAD": str(shim),
+        "FIRMLINE_TEST_CLOCK_OFFSET": str(int(offset.total_seconds())),
+        # the shim comes before the ASan runtime in the library order: allowed for this test
+        "ASAN_OPTIONS": "detect_leaks=1:verify_asan_link_order=0",
+    }
+
+
 # --------------------------------------------------------------------------------------------
 # PKI
 
@@ -193,16 +246,18 @@ class Pki:
 
     CLOCK_SKEW = datetime.timedelta(minutes=5)
 
-    def __init__(self, directory, tenant_id: Optional[str] = None):
+    def __init__(self, directory, tenant_id: Optional[str] = None, name: str = "Firmline Test"):
+        """`name` starts the CN of both authorities: another name gives another subject (a
+        Pki with the same name has CAs of the same name, as a forged authority would)."""
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.tenant_id = tenant_id or str(uuid.uuid4())
 
         self.root_key = ec.generate_private_key(ec.SECP256R1())
-        self.root = self._ca("Firmline Test Root CA", self.root_key, None, None, 1, None)
+        self.root = self._ca(f"{name} Root CA", self.root_key, None, None, 1, None)
         self.intermediate_key = ec.generate_private_key(ec.SECP256R1())
         self.intermediate = self._ca(
-            "Firmline Test Device CA",
+            f"{name} Device CA",
             self.intermediate_key,
             self.root_key,
             self.root,
@@ -579,7 +634,9 @@ class FakePlatform:
 
     Knobs: family_id; send_family_id=False plays the platform before T178 (no familyId in the
     answer); certificate_validity and certificate_backdate (not_before = now - backdate) for the
-    certificates it issues (certificates() sets both from the days left and the age);
+    certificates it issues (certificates() sets both from the days left and the age); `issuer`
+    (another Pki issues the certificates) and `chain_override` (another chain in the answers) play a
+    platform gone wrong;
     script()/refuse() queue faults per route, drop_next_renewal_response() loses one renewal
     answer. Every request is in `requests`; `devices` holds what it registered. `server_cert`
     (certificate chain and key paths) replaces the HTTPS certificate of the root: relay() makes a
@@ -602,6 +659,9 @@ class FakePlatform:
         self.send_family_id = send_family_id
         self.certificate_validity = datetime.timedelta(days=730)
         self.certificate_backdate = Pki.CLOCK_SKEW
+        # A platform gone wrong: certificates issued by another Pki, and/or another chain sent.
+        self.issuer: Optional[Pki] = None
+        self.chain_override: Optional[str] = None
         self.port = free_port()
         self.requests: list = []
         self.errors: list = []  # tracebacks of the fake's own failures
@@ -670,6 +730,18 @@ class FakePlatform:
             return dataclasses.replace(self._renew(request), drop=True)
 
         self.script(self.RENEWAL, lost)
+
+    def renewals_unavailable(self) -> Callable[[], None]:
+        """After the answers already scripted, every renewal is answered 503 service_unavailable
+        until the returned function is called; then the platform answers normally again."""
+        down = threading.Event()
+        down.set()
+
+        def unavailable(request: Request) -> Optional[Reply]:
+            return problem(503, "service_unavailable") if down.is_set() else None
+
+        self.script(self.RENEWAL, *[unavailable] * 1000)
+        return down.clear
 
     def certificates(
         self, valid_for: datetime.timedelta, age: datetime.timedelta = datetime.timedelta(days=2)
@@ -855,7 +927,7 @@ class FakePlatform:
 
     def _issue(self, device: Device, public_key) -> str:
         now = utc_now()
-        cert = self.pki.issue_device(
+        cert = (self.issuer or self.pki).issue_device(
             public_key,
             device.device_id,
             now - self.certificate_backdate,
@@ -877,7 +949,7 @@ class FakePlatform:
                 "topicRoot": topic_root,
                 "otaOfferTopic": f"{topic_root}/ota/offer",
                 "certificate": device.certificates[-1],
-                "chain": self.pki.chain_pem,
+                "chain": self.chain_override or (self.issuer or self.pki).chain_pem,
             }
         )
         device.response = answer

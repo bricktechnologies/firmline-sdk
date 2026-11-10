@@ -194,9 +194,16 @@ static void send_saved(fa_renewal *r) {
     while (base > 0 && e->https[base - 1] == '/')
         base--;
     int n = snprintf(url, sizeof url, "%.*s%s", (int)base, e->https, RENEWAL_PATH);
-    if (n < 0 || (size_t)n >= sizeof url || fa_store_read(r->dir, REQUEST, &body, &len) != 0) {
-        fa_log("error", "certificate renewal: %s/%s cannot be read; next try in a day", r->dir,
-               REQUEST);
+    if (n < 0 || (size_t)n >= sizeof url) {
+        fa_log("error", "certificate renewal: the address %s is too long", e->https);
+        return; /* kept: the endpoint may change */
+    }
+    if (fa_store_read(r->dir, REQUEST, &body, &len) != 0) {
+        /* The only loss that cannot be avoided: these bytes are gone. */
+        fa_log("error",
+               "certificate renewal: the saved request %s/%s cannot be read: it is dropped, a new "
+               "one is made when due",
+               r->dir, REQUEST);
         free(body);
         drop_pending(r);
         return;
@@ -253,6 +260,13 @@ static bool plain_code(const char *code) {
         if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-' && *p != '.')
             return false;
     return true;
+}
+
+/* The refusals after which the platform will never answer this request with a certificate. */
+static bool final_refusal(int status, const char *code) {
+    return (status == 400 && (strcmp(code, "certificate_renewal_refused") == 0 ||
+                              strcmp(code, "csr_invalid") == 0)) ||
+           (status == 409 && strcmp(code, "certificate_renewed_recently") == 0);
 }
 
 static void refused(fa_renewal *r, fl_time now, const char *code, int status) {
@@ -319,7 +333,8 @@ static void completed(fa_renewal *r, fl_time now) {
 }
 
 static void issued(fa_renewal *r, fl_time now) {
-    char *pem = malloc(FA_HTTP_BODY_MAX), *root = malloc(ROOT_MAX);
+    char *pem = malloc(FA_HTTP_BODY_MAX), *root = malloc(ROOT_MAX), *current_root = NULL;
+    size_t root_len = 0;
     fl_provisioned p;
     const fa_identity *id = fa_service_identity(r->svc);
     if (pem == NULL || root == NULL ||
@@ -329,21 +344,26 @@ static void issued(fa_renewal *r, fl_time now) {
         keep("the answer cannot be read"); /* a 200 garbled on the way: the same answer again */
         goto done;
     }
+    /* Every check below fails without a final answer: the request is kept and sent again, since
+     * the platform may hold a certificate that only these bytes can fetch. */
     if (strcasecmp(p.device_id, id->device_id) != 0) {
         fa_log("error", "certificate renewal: the answer is for device %s, not %s", p.device_id,
                id->device_id);
-        refused(r, now, "another_device", 200);
+        keep("the answer is for another device");
         goto done;
     }
     int match = fa_key_matches_certificate(r->dir, NEW_KEY, p.certificate, strlen(p.certificate));
-    if (match < 0) {
-        keep("the certificate of the answer cannot be read");
+    if (match != 1) {
+        keep(match < 0 ? "the certificate of the answer cannot be read"
+                       : "the certificate of the answer is not for the new key");
         goto done;
     }
-    if (match == 0) {
-        fa_log("error",
-               "certificate renewal: the certificate of the answer is not for the new key");
-        refused(r, now, "certificate_key_mismatch", 200);
+    if (fa_store_read(r->dir, "root.pem", &current_root, &root_len) != 0) {
+        keep("root.pem cannot be read");
+        goto done;
+    }
+    if (fa_certificate_chains_to(p.certificate, p.chain, current_root) != 1) {
+        keep("the certificate of the answer does not chain to the platform root in use");
         goto done;
     }
     if (write_pending(r, &p, root) != 0) {
@@ -368,6 +388,7 @@ static void issued(fa_renewal *r, fl_time now) {
 done:
     free(pem);
     free(root);
+    free(current_root);
 }
 
 void fa_renewal_tick(fa_renewal *r, fl_time now) {
@@ -390,14 +411,16 @@ void fa_renewal_tick(fa_renewal *r, fl_time now) {
         keep(why);
     } else if (status == 200) {
         issued(r, now);
-    } else if (status == 429 || status >= 500) {
-        snprintf(why, sizeof why, "the platform answered HTTP %d", status);
-        keep(why);
     } else {
         char code[64];
         if (fl_problem_code(r->body, r->len, code) != FL_OK || !plain_code(code))
             snprintf(code, sizeof code, "http_%d", status);
-        refused(r, now, code, status);
+        if (final_refusal(status, code)) {
+            refused(r, now, code, status);
+        } else { /* 429, 5xx, a relay's or a proxy's 4xx: the request may still be answered */
+            snprintf(why, sizeof why, "the platform answered HTTP %d (%s)", status, code);
+            keep(why);
+        }
     }
     free(r->body);
     r->body = NULL;
@@ -448,9 +471,7 @@ void fa_renewal_check(fa_renewal *r, fl_time now) {
                    iso);
         }
         r->expired_logged = true;
-        if (key || request)
-            drop_pending(r);
-        return;
+        return; /* a saved request stays: the clock may be wrong and come back */
     }
     if (now < not_before) /* the clock is not set yet (a cold boot without RTC): nothing */
         return;

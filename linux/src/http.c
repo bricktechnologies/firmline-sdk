@@ -51,8 +51,13 @@ static int secure_options(CURL *curl, const char *url, const char *ca_file) {
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L) == CURLE_OK &&
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L) == CURLE_OK &&
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "firmline-agent") == CURLE_OK;
+    /* A CA file is then the only trust: libcurl would otherwise also look in its built-in CA
+     * directory (/etc/ssl/certs on Debian), where any public authority could vouch for a relay's
+     * name. No native CA store either (CURLSSLOPT_NATIVE_CA is not set). */
     if (ok && ca_file != NULL && ca_file[0] != '\0')
-        ok = curl_easy_setopt(curl, CURLOPT_CAINFO, ca_file) == CURLE_OK;
+        ok = curl_easy_setopt(curl, CURLOPT_CAINFO, ca_file) == CURLE_OK &&
+             curl_easy_setopt(curl, CURLOPT_CAPATH, NULL) == CURLE_OK &&
+             curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, 0L) == CURLE_OK;
     return ok ? 0 : -1;
 }
 

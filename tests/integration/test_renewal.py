@@ -17,10 +17,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from harness import (
     FakePlatform,
+    Pki,
     assert_no_secrets,
+    build_clock_shim,
     cert_pem,
+    clock_env,
     key_pem,
-    problem,
     utc_now,
     wait_until,
     write_private,
@@ -180,11 +182,7 @@ class RenewalTest(RenewalBase):
         agent, identity = self.registered()
         # 503 until the restart: the first run may send the saved request again after its first
         # status, and must get 503 again.
-        down = [True]
-        unavailable = problem(503, "service_unavailable")
-        self.platform.script(
-            FakePlatform.RENEWAL, *[lambda request: unavailable if down[0] else None] * 50
-        )
+        back_up = self.platform.renewals_unavailable()
 
         agent.start("run")
         agent.wait_for_log("HTTP 503")
@@ -195,7 +193,7 @@ class RenewalTest(RenewalBase):
         old_key = agent.read_text("device.key")
         before = len(self.renewal_requests())
 
-        down[0] = False
+        back_up()
         agent.start("run")
         agent.wait_for_log("device certificate renewed")
 
@@ -245,6 +243,96 @@ class RenewalTest(RenewalBase):
         self.assertEqual([], self.renewal_requests())
         self.assert_no_pending(agent)
         self.stop_and_check(agent)
+
+
+class PendingRequestTest(RenewalBase):
+    """Once a request may have been answered, its key and bytes are the only way to the
+    certificate the platform issued: they are dropped only on a final refusal or after the swap."""
+
+    def assert_renewed_with_first_answer(self, agent, identity, saved=None):
+        device = self.platform.devices[identity["deviceId"]]
+        requests = self.renewal_requests()
+        self.assertEqual({saved or requests[0].body}, {r.body for r in requests})
+        self.assertEqual(2, len(device.certificates), "only the first request issued one")
+        self.assertEqual(device.certificates[1], agent.read_text("device.pem"))
+        self.assert_key_matches_certificate(agent)
+        self.assert_no_pending(agent)
+
+    def test_lost_answer_then_404_then_answer_installs_first_certificate(self):
+        agent, identity = self.registered(status_interval=1)
+        self.platform.drop_next_renewal_response()
+        self.platform.refuse(FakePlatform.RENEWAL, 404, "not_found")  # a relay or a proxy
+
+        agent.start("run")
+        agent.wait_for_log("device certificate renewed", timeout=60)
+
+        self.assertIn("HTTP 404", agent.running_log)
+        self.assertGreaterEqual(len(self.renewal_requests()), 3)
+        self.assert_renewed_with_first_answer(agent, identity)
+        self.stop_and_check(agent)
+
+    def test_pending_request_survives_clock_past_expiry_and_back(self):
+        agent, identity = self.registered(status_interval=2)
+        self.platform.drop_next_renewal_response()  # issued, the answer lost
+        back_up = self.platform.renewals_unavailable()
+        agent.start("run")
+        agent.wait_for_log("the same request goes again")
+        self.assertEqual(0, agent.stop())
+        saved = agent.path("renewal-request.json").read_bytes()
+        sent = len(self.renewal_requests())
+
+        # The clock jumps past notAfter (59 days left): nothing is sent, nothing is lost.
+        shim = build_clock_shim(self.tmp)
+        agent.env.update(clock_env(shim, 60 * DAY))
+        agent.start("run")
+        agent.wait_for_log("expired on")
+        agent.wait_for_log("status sent", count=2)  # checked again after each (the broker's
+        self.assertEqual(0, agent.stop())  # clock is right: it still accepts the certificate)
+        self.assertEqual(1, agent.log.count("expired on"), "said once")
+        self.assertEqual(sent, len(self.renewal_requests()), "nothing sent while expired")
+        self.assertEqual(saved, agent.path("renewal-request.json").read_bytes())
+        self.assertTrue(agent.path("renewal-new.key").exists())
+
+        # The clock is right again: the same request, the certificate issued the first time.
+        for name in clock_env(shim, DAY):
+            agent.env.pop(name, None)
+        back_up()
+        agent.start("run")
+        agent.wait_for_log("device certificate renewed")
+        self.assert_renewed_with_first_answer(agent, identity, saved)
+        self.stop_and_check(agent)
+
+
+class AnswerTrustTest(RenewalBase):
+    """The platform root and the company intermediate never change: an answer that does not
+    chain to the root in use is not installed (and the request is kept)."""
+
+    def test_answer_not_chaining_to_current_root_is_not_installed(self):
+        other = Pki(self.tmp / "other-pki", tenant_id=self.pki.tenant_id)
+        cases = {
+            "another root": (other, None),
+            "our chain, another issuer": (other, self.pki.chain_pem),
+        }
+        for case, (issuer, chain) in cases.items():
+            with self.subTest(case=case):
+                agent, identity = self.registered(case.replace(" ", "-"), status_interval=1)
+                old = self.identity_files(agent)
+                self.platform.issuer, self.platform.chain_override = issuer, chain
+
+                agent.start("run")
+                mark = "does not chain to the platform root"
+                wait_until(lambda: agent.running_log.count(mark) >= 2, 30, "two answers refused")
+                before = len(self.statuses(identity))
+                wait_until(lambda: len(self.statuses(identity)) > before, 30, "still connected")
+
+                self.platform.issuer, self.platform.chain_override = None, None
+                self.assertEqual(old, self.identity_files(agent))
+                self.assertEqual(cert_pem(self.pki.root), agent.read_text("root.pem"))
+                self.assertEqual(self.pki.chain_pem, agent.read_text("chain.pem"))
+                self.assertTrue(agent.path("renewal-new.key").exists(), "request kept")
+                self.assertTrue(agent.path("renewal-request.json").exists())
+                self.assertNotIn("device certificate renewed", agent.running_log)
+                self.stop_and_check(agent)
 
 
 class RenewalCrashTest(RenewalBase):

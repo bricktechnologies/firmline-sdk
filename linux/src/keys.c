@@ -10,6 +10,7 @@
 #include <openssl/core_names.h>
 #include <openssl/crypto.h>
 #include <openssl/ec.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -188,6 +189,56 @@ int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_befor
                      asn1_seconds(X509_get0_notAfter(cert), not_after) == 0
                  ? 0
                  : -1;
+    X509_free(cert);
+    return rc;
+}
+
+/* Every certificate of a PEM text, in order; NULL when there is none (or no memory). */
+static STACK_OF(X509) * read_certificates(const char *pem) {
+    STACK_OF(X509) *all = sk_X509_new_null();
+    size_t len = strlen(pem);
+    BIO *bio = all != NULL && len <= INT_MAX ? BIO_new_mem_buf(pem, (int)len) : NULL;
+    X509 *cert;
+    while (bio != NULL && (cert = PEM_read_bio_X509(bio, NULL, no_pass_phrase, NULL)) != NULL)
+        if (sk_X509_push(all, cert) <= 0) {
+            X509_free(cert);
+            break;
+        }
+    ERR_clear_error(); /* the end of the text reads as an error */
+    BIO_free(bio);
+    if (all != NULL && sk_X509_num(all) == 0) {
+        sk_X509_free(all);
+        all = NULL;
+    }
+    return all;
+}
+
+int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem) {
+    X509 *cert = read_certificate(cert_pem, strlen(cert_pem));
+    X509 *root = read_certificate(root_pem, strlen(root_pem));
+    STACK_OF(X509) *chain = read_certificates(chain_pem);
+    X509_STORE *store = NULL;
+    X509_STORE_CTX *ctx = NULL;
+    int rc = -1;
+    if (cert == NULL || root == NULL || chain == NULL)
+        goto done;
+    rc = 0;
+    if (X509_cmp(sk_X509_value(chain, sk_X509_num(chain) - 1), root) != 0)
+        goto done; /* the answer brings another root */
+    rc = -1;
+    store = X509_STORE_new();
+    ctx = X509_STORE_CTX_new();
+    if (store == NULL || ctx == NULL || X509_STORE_add_cert(store, root) != 1 ||
+        X509_STORE_CTX_init(ctx, store, cert, chain) != 1)
+        goto done;
+    X509_VERIFY_PARAM_set_flags(X509_STORE_CTX_get0_param(ctx), X509_V_FLAG_NO_CHECK_TIME);
+    rc = X509_verify_cert(ctx) == 1 ? 1 : 0;
+done:
+    ERR_clear_error();
+    X509_STORE_CTX_free(ctx);
+    X509_STORE_free(store);
+    sk_X509_pop_free(chain, X509_free);
+    X509_free(root);
     X509_free(cert);
     return rc;
 }

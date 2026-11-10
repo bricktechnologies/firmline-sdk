@@ -37,4 +37,12 @@ int fa_key_matches_certificate(const char *dir, const char *key_name, const char
 int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_before,
                             fl_time *not_after);
 
+/* Whether a certificate issued by the platform keeps the trust anchor: the last certificate of
+ * chain_pem is DER-equal to the (first) certificate of root_pem, and the first certificate of
+ * cert_pem verifies through the certificates of chain_pem against root_pem's certificate as the
+ * only trusted one (no system authority, no partial chain; the time is not checked: the clock of
+ * a device may be wrong). All three are NUL-terminated PEM texts. 1 when both hold, 0 when not,
+ * -1 when a text holds no certificate or memory runs out. */
+int fa_certificate_chains_to(const char *cert_pem, const char *chain_pem, const char *root_pem);
+
 #endif
