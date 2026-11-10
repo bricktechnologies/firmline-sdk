@@ -220,6 +220,11 @@ int fa_service_publish(fa_service *s, const char *subtopic, const char *payload,
 
 unsigned fa_service_session(const fa_service *s) { return s->session; }
 
+bool fa_service_stopping(const fa_service *s) {
+    (void)s;
+    return stop_requested != 0;
+}
+
 void fa_service_request_status(fa_service *s) { s->status_requested = true; }
 
 void fa_service_request_reconnect(fa_service *s) { s->reconnect_requested = true; }

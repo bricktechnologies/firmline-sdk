@@ -763,6 +763,15 @@ static void install_step(fa_ota *o) {
         finish(o, FL_RESULT_INSTALLED, NULL, o->job.version);
     } else if (code == FA_SCRIPT_LATER) {
         install_later(o);
+    } else if (code < 0 && (o->stopping || fa_service_stopping(o->svc))) {
+        /* The stop signal reached the script too (systemd KillMode=control-group): its death
+         * says nothing of the update, which may already be in place. install.json stays
+         * "running", and the next start decides from the version. */
+        fa_log("warning",
+               "release %s: the install script was ended by a signal while the agent stops: "
+               "settled at the next start",
+               o->job.release);
+        end_job(o);
     } else {
         if (code < 0)
             fa_log("warning", "release %s: the install script was ended by a signal",
@@ -1101,6 +1110,14 @@ fa_ota *fa_ota_open(fa_service *s, fl_time now) {
 
     load_results(o);
     settle_install(o);
+    if (o->reboot_pending && o->cfg->reboot_command[0] != '\0') {
+        /* Same boot, the reboot after exit 10 never came: nothing else would ever restart the
+         * device. reboot_command once more (no result, the script is not run again). */
+        fa_log("info", "release %s: still waiting for the restart: running reboot_command again",
+               o->reboot_release);
+        if (fa_reboot_start(&o->child, o->cfg->reboot_command) == 0)
+            o->state = JOB_REBOOT;
+    }
     rebuild_queue(o, now);
     clean_downloads(o, NULL);
     if (o->queue.count > 0)
