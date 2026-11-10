@@ -5,6 +5,7 @@ broker. Later tasks build on these behaving as the platform does."""
 import base64
 import datetime
 import json
+import socket
 import ssl
 import time
 import unittest
@@ -54,6 +55,32 @@ class HarnessTest(IntegrationTest):
         )
         self.assertEqual(200, status)
         return json.loads(body)
+
+    def connect(self, broker, client_id, certfile, keyfile):
+        """The CONNACK reason of a connection with this client certificate, or None when the TLS
+        handshake or the connection fails."""
+        result = []
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        client.tls_set(ca_certs=str(self.pki.root_path), certfile=certfile, keyfile=keyfile)
+        client.on_connect = lambda c, u, f, reason, p: result.append(reason.value)
+        try:
+            client.connect("localhost", broker.port)
+        except (ssl.SSLError, OSError):
+            return None
+        client.loop_start()
+        deadline = time.monotonic() + 5
+        while not result and time.monotonic() < deadline:
+            time.sleep(0.05)
+        client.disconnect()
+        client.loop_stop()
+        return result[0] if result else None
+
+    def device_files(self, name, key, answer):
+        """The key and the certificate chain (certificate, intermediate) of a device, in files."""
+        key_path = write_private(self.tmp / f"{name}.key", key_pem(key))
+        chain_path = self.tmp / f"{name}-chain.pem"
+        chain_path.write_text(answer["certificate"] + cert_pem(self.pki.intermediate))
+        return str(chain_path), str(key_path)
 
     def test_download_serves_ranges(self):
         url = self.platform.add_download(b"0123456789")
@@ -132,25 +159,9 @@ class HarnessTest(IntegrationTest):
         chain_path = self.tmp / "device-chain.pem"
         chain_path.write_text(answer["certificate"] + cert_pem(self.pki.intermediate))
 
-        def connect(certfile, keyfile):
-            result = []
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=answer["clientId"])
-            client.tls_set(ca_certs=str(self.pki.root_path), certfile=certfile, keyfile=keyfile)
-            client.on_connect = lambda c, u, f, reason, p: result.append(reason.value)
-            try:
-                client.connect("localhost", broker.port)
-            except (ssl.SSLError, OSError):
-                return None
-            client.loop_start()
-            deadline = time.monotonic() + 5
-            while not result and time.monotonic() < deadline:
-                time.sleep(0.05)
-            client.disconnect()
-            client.loop_stop()
-            return result[0] if result else None
-
-        self.assertEqual(0, connect(str(chain_path), str(key_path)))
-        self.assertIsNone(connect(None, None))
+        client_id = answer["clientId"]
+        self.assertEqual(0, self.connect(broker, client_id, str(chain_path), str(key_path)))
+        self.assertIsNone(self.connect(broker, client_id, None, None))
         self.assertIn(f"u'{answer['clientId']}'", broker.log)
 
     def test_broker_acl_limits_device_to_its_topics(self):
@@ -191,6 +202,52 @@ class HarnessTest(IntegrationTest):
         device.wait_for(root + "/ota/offer")
         time.sleep(0.5)  # anything else would have arrived by now
         self.assertEqual([root + "/ota/offer"], [m.topic for m in device.received()])
+
+    def test_dropped_renewal_answer_still_issues_the_certificate(self):
+        self.platform.certificates(datetime.timedelta(days=59))
+        old_key = ec.generate_private_key(ec.SECP256R1())
+        first = self.register(old_key)
+        cert = x509.load_pem_x509_certificate(first["certificate"].encode())
+        left = cert.not_valid_after_utc - datetime.datetime.now(datetime.timezone.utc)
+        self.assertLess(abs(left - datetime.timedelta(days=59)), datetime.timedelta(minutes=1))
+        csr = make_csr(ec.generate_private_key(ec.SECP256R1()))
+        proof = base64.b64encode(old_key.sign(csr.encode(), ec.ECDSA(hashes.SHA256()))).decode()
+        body = {"certificate": first["certificate"], "csr": csr, "proof": proof}
+        self.platform.drop_next_renewal_response()
+
+        with self.assertRaises((ConnectionError, urllib.error.URLError)):
+            self.call("POST", FakePlatform.RENEWAL, body)
+        device = self.platform.devices[first["deviceId"]]
+        self.assertEqual(2, len(device.certificates), "issued although the answer was lost")
+        status, _, again = self.call("POST", FakePlatform.RENEWAL, body)
+        self.assertEqual((200, device.certificates[-1]), (status, json.loads(again)["certificate"]))
+
+    def test_broker_refuses_revoked_device_certificate(self):
+        broker = self.make_broker()
+        revoked_key, kept_key = (ec.generate_private_key(ec.SECP256R1()) for _ in range(2))
+        revoked, kept = self.register(revoked_key), self.register(kept_key, serial="SN-2")
+        broker.revoke(revoked["certificate"])
+        broker.restart()
+
+        files = self.device_files("revoked", revoked_key, revoked)
+        self.assertIsNone(self.connect(broker, revoked["clientId"], *files))
+        files = self.device_files("kept", kept_key, kept)
+        self.assertEqual(0, self.connect(broker, kept["clientId"], *files))
+        broker.client().close()  # the platform's client (issued by the root) still connects
+
+    def test_relay_knows_the_devices_and_has_certificates_of_the_intermediate(self):
+        relay, relay_broker = self.make_relay()
+        key = ec.generate_private_key(ec.SECP256R1())
+        answer = self.register(key)  # on the platform
+
+        context = ssl.create_default_context(cafile=str(self.pki.root_path))
+        with socket.create_connection(("localhost", relay.port), timeout=10) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as tls:
+                der = tls.getpeercert(binary_form=True)
+        self.assertEqual(self.pki.intermediate.subject, x509.load_der_x509_certificate(der).issuer)
+        self.assertIs(self.platform.devices, relay.devices)
+        files = self.device_files("device", key, answer)
+        self.assertEqual(0, self.connect(relay_broker, answer["clientId"], *files))
 
 
 if __name__ == "__main__":

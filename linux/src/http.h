@@ -54,6 +54,12 @@ typedef struct {
 fa_http_download *fa_http_download_start(const char *url, const char *ca_file, uint64_t offset,
                                          fa_http_sink sink, void *ctx);
 
+/* The same in the background for a POST of a JSON body (copied: the caller may free it), as
+ * fa_http_post_json sends it, 60 s in all: the answer goes to the sink (range_start -1). Driven
+ * and freed with the functions below. NULL when libcurl cannot even start it. */
+fa_http_download *fa_http_post_start(const char *url, const char *ca_file, const char *body,
+                                     fa_http_sink sink, void *ctx);
+
 /* Waits up to timeout_ms for the transfer's sockets and for the caller's `fds` (revents filled;
  * POLLIN and POLLOUT only, at most 4). */
 void fa_http_download_wait(fa_http_download *d, struct pollfd *fds, int nfds, int timeout_ms);

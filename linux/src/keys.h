@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* The device key, ECDSA P-256 with OpenSSL 3 (EVP only). A key lives in the data folder as an
  * unencrypted PKCS#8 PEM with mode 0600 and never leaves it; a key of another type or curve is
- * refused. Every function returns 0, or -1 on any failure. */
+ * refused. Every function returns 0, or -1 on any failure, unless it says otherwise. */
 #ifndef FIRMLINE_AGENT_KEYS_H
 #define FIRMLINE_AGENT_KEYS_H
+
+#include "firmline/fl_common.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,5 +26,15 @@ int fa_sign_sha256(const char *dir, const char *key_name, const uint8_t hash[32]
  * -1 (*len = 0) when the file is missing, holds no public key, a key of another type or curve, or
  * the DER does not fit in cap. */
 int fa_update_key_load(const char *path, uint8_t *der, size_t cap, size_t *len);
+
+/* Whether the key dir/key_name is the key of the first certificate of the PEM text cert_pem (len
+ * bytes): 1 when it is, 0 when it is not, -1 when the key or the certificate cannot be read. */
+int fa_key_matches_certificate(const char *dir, const char *key_name, const char *cert_pem,
+                               size_t len);
+
+/* notBefore and notAfter of the first certificate of the PEM text cert_pem (len bytes), as UTC
+ * seconds. 0, or -1 when no certificate can be read. */
+int fa_certificate_validity(const char *cert_pem, size_t len, fl_time *not_before,
+                            fl_time *not_after);
 
 #endif

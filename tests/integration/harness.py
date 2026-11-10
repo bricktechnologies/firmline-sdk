@@ -9,11 +9,13 @@ folder per test; nothing is committed.
 - FakePlatform: HTTPS server on a free port with the device endpoints of the real platform
   (POST /api/v1/provisioning, POST /api/v1/provisioning/renewal, GET /api/v1/ota/downloads/<token>
   with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`,
-  and per download link (cut_after, STATUS_429, STATUS_404, slow). With connect(broker) it
-  signs manifests with the update key, publishes offers (offer, repeat) and collects the
-  results of the devices.
+  and per download link (cut_after, STATUS_429, STATUS_404, slow); certificates() chooses the
+  validity of the certificates it issues, drop_next_renewal_response() loses a renewal answer.
+  With connect(broker) it signs manifests with the update key, publishes offers (offer, repeat)
+  and collects the results of the devices. relay() is a second fake playing a relay.
 - Broker: mosquitto with client certificates required, the certificate CN as the user name, and
-  a topic ACL per registered device as on the platform (rebuilt at every registration).
+  a topic ACL per registered device as on the platform (rebuilt at every registration);
+  revoke() refuses a device certificate from the next start.
 - MqttClient: a paho client with a root-signed certificate, by default the platform's side (it
   may read and write every t/# topic): collects messages, publishes offers.
 - Agent: writes the configuration, runs `firmline-agent`, keeps its stderr as `log` (a running
@@ -22,7 +24,8 @@ folder per test; nothing is committed.
 - assert_no_secrets(log, secrets): none of the secrets, and no PEM block at all, is in the log.
 - wait_until(condition, timeout), count_connections(port, seconds): polling and a TCP listener
   that only counts the connections made to it (a broker that is down, seen from the agent).
-- IntegrationTest: unittest base class with a temporary folder, a Pki and a started FakePlatform.
+- IntegrationTest: unittest base class with a temporary folder, a Pki and a started FakePlatform;
+  make_relay() adds a relay (fake platform and broker with certificates of the intermediate).
 """
 
 import base64
@@ -405,9 +408,10 @@ class Reply:
     headers: dict = dataclasses.field(default_factory=dict)
     # Faults of the transfer: send only the first `send_only` bytes of the body (Content-Length
     # still announces it all), then close the connection; `rate` limits the body to that many
-    # bytes per second.
+    # bytes per second; `drop` closes the connection without answering at all (an answer lost).
     send_only: Optional[int] = None
     rate: Optional[float] = None
+    drop: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -540,6 +544,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.server.platform.errors.append(traceback.format_exc())
             reply = problem(500, "fake_platform_error")
         self.close_connection = True
+        if reply.drop:
+            return  # the request was handled, the answer never leaves
         self.send_response(reply.status)
         for name, value in reply.headers.items():
             self.send_header(name, value)
@@ -573,15 +579,25 @@ class FakePlatform:
 
     Knobs: family_id; send_family_id=False plays the platform before T178 (no familyId in the
     answer); certificate_validity and certificate_backdate (not_before = now - backdate) for the
-    certificates it issues; script()/refuse() queue faults per route. Every request is in
-    `requests`; `devices` holds what it registered."""
+    certificates it issues (certificates() sets both from the days left and the age);
+    script()/refuse() queue faults per route, drop_next_renewal_response() loses one renewal
+    answer. Every request is in `requests`; `devices` holds what it registered. `server_cert`
+    (certificate chain and key paths) replaces the HTTPS certificate of the root: relay() makes a
+    second fake that plays a relay of this one."""
 
     PROVISIONING = "/api/v1/provisioning"
     RENEWAL = "/api/v1/provisioning/renewal"
     DOWNLOADS = "/api/v1/ota/downloads/"
 
-    def __init__(self, pki: Pki, family_id: Optional[str] = None, send_family_id: bool = True):
+    def __init__(
+        self,
+        pki: Pki,
+        family_id: Optional[str] = None,
+        send_family_id: bool = True,
+        server_cert=None,
+    ):
         self.pki = pki
+        self.server_cert = server_cert or (pki.https_cert_path, pki.https_key_path)
         self.family_id = family_id or str(uuid.uuid4())
         self.send_family_id = send_family_id
         self.certificate_validity = datetime.timedelta(days=730)
@@ -608,7 +624,7 @@ class FakePlatform:
     def start(self) -> "FakePlatform":
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(self.pki.https_cert_path, self.pki.https_key_path)
+        context.load_cert_chain(*self.server_cert)
         self._server = _TlsServer(("127.0.0.1", self.port), _Handler, context, self)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -644,6 +660,38 @@ class FakePlatform:
 
     def refuse(self, route: str, status: int, code: str, times: int = 1) -> None:
         self.script(route, *([problem(status, code)] * times))
+
+    def drop_next_renewal_response(self) -> None:
+        """The next renewal is processed as usual (the certificate is issued and becomes the
+        device's last one), but the connection is closed without an answer: the device must send
+        the same request again, and gets the same certificate back."""
+
+        def lost(request: Request) -> Reply:
+            return dataclasses.replace(self._renew(request), drop=True)
+
+        self.script(self.RENEWAL, lost)
+
+    def certificates(
+        self, valid_for: datetime.timedelta, age: datetime.timedelta = datetime.timedelta(days=2)
+    ) -> None:
+        """The certificates issued from now on expire `valid_for` after the moment they are
+        issued (negative: already expired) and were valid since `age` before it (over a day: they
+        may be renewed at once)."""
+        self.certificate_backdate = age
+        self.certificate_validity = age + valid_for
+
+    def default_certificates(self) -> None:
+        """Back to the platform's certificates: valid for 2 years from now."""
+        self.certificate_backdate = Pki.CLOCK_SKEW
+        self.certificate_validity = datetime.timedelta(days=730)
+
+    def relay(self, server_cert) -> "FakePlatform":
+        """A second fake on its own port with the HTTPS certificate `server_cert` (a relay's is
+        signed by the company intermediate) that knows the same devices: renewals and downloads
+        through the relay. Not started."""
+        relay = FakePlatform(self.pki, self.family_id, self.send_family_id, server_cert)
+        relay.devices = self.devices  # the same dict: registrations go to this platform only
+        return relay
 
     def add_download(self, content: bytes, faults=(), slow: Optional[float] = None) -> str:
         """Serves `content` at a new download link and returns the link. `faults` are answered
@@ -967,7 +1015,12 @@ class Broker:
     {topicRoot}/status and {topicRoot}/ota/result and receive only {topicRoot}/ota/offer;
     PLATFORM_USER may read and write t/#; anyone else nothing. Unlike the platform, mosquitto
     grants a SUBSCRIBE to any topic the user may write too (it filters only what it delivers),
-    so a subscription to {topicRoot}/status is not refused here."""
+    so a subscription to {topicRoot}/status is not refused here.
+
+    `server_cert` (chain and key paths) replaces the broker certificate of the root (a relay's is
+    signed by the intermediate). revoke(certificate) puts a client certificate on a revocation
+    list that the broker checks from its next start: after a renewal, only the new certificate
+    of a device connects."""
 
     def __init__(
         self,
@@ -975,6 +1028,7 @@ class Broker:
         directory,
         port: Optional[int] = None,
         platform: Optional[FakePlatform] = None,
+        server_cert=None,
     ):
         self.pki = pki
         self.dir = Path(directory)
@@ -983,6 +1037,9 @@ class Broker:
         self.config_path = self.dir / "mosquitto.conf"
         self.log_path = self.dir / "mosquitto.log"
         self.acl_path = self.dir / "acl"
+        self.crl_path = self.dir / "crl.pem"
+        self.server_cert = server_cert or (pki.broker_cert_path, pki.broker_key_path)
+        self.revoked: list = []  # serial numbers
         self.platform = platform
         self._process = None
         self.write_acl()
@@ -1017,7 +1074,42 @@ class Broker:
             self._process.send_signal(signal.SIGHUP)
             wait_until(lambda: self.log.count("Reloading config") > reloads, 10, "ACL reload")
 
+    def revoke(self, certificate_pem: str) -> None:
+        """Revokes a certificate issued by the intermediate (a device's) from the next start."""
+        self.revoked.append(x509.load_pem_x509_certificate(certificate_pem.encode()).serial_number)
+
+    def _write_crl(self) -> None:
+        """One list per authority: OpenSSL checks the list of the client certificate's issuer
+        (the root for the platform's client, the intermediate for a device) and refuses a client
+        whose issuer has none."""
+        now = utc_now()
+        text = ""
+        for key, cert, serials in [
+            (self.pki.root_key, self.pki.root, []),
+            (self.pki.intermediate_key, self.pki.intermediate, self.revoked),
+        ]:
+            builder = (
+                x509.CertificateRevocationListBuilder()
+                .issuer_name(cert.subject)
+                .last_update(now - Pki.CLOCK_SKEW)
+                .next_update(now + datetime.timedelta(days=1))
+            )
+            for serial in serials:
+                builder = builder.add_revoked_certificate(
+                    x509.RevokedCertificateBuilder()
+                    .serial_number(serial)
+                    .revocation_date(now - Pki.CLOCK_SKEW)
+                    .build()
+                )
+            crl = builder.sign(key, hashes.SHA256())
+            text += crl.public_bytes(serialization.Encoding.PEM).decode()
+        self.crl_path.write_text(text)
+
     def _config(self) -> str:
+        crl = []
+        if self.revoked:
+            self._write_crl()
+            crl = [f"crlfile {self.crl_path}"]
         return "\n".join(
             [
                 "user root",  # inside the test container: do not switch to the mosquitto user
@@ -1029,10 +1121,11 @@ class Broker:
                 "connection_messages true",
                 f"listener {self.port} 127.0.0.1",
                 f"cafile {self.pki.root_path}",
-                f"certfile {self.pki.broker_cert_path}",
-                f"keyfile {self.pki.broker_key_path}",
+                f"certfile {self.server_cert[0]}",
+                f"keyfile {self.server_cert[1]}",
                 "require_certificate true",
                 "use_identity_as_username true",
+                *crl,
                 f"acl_file {self.acl_path}",
                 "",
             ]
@@ -1366,3 +1459,18 @@ class IntegrationTest(unittest.TestCase):
         broker = Broker(self.pki, self.tmp / name, platform=self.platform).start()
         self.addCleanup(broker.stop)
         return broker
+
+    def make_relay(self, name: str = "relay"):
+        """A started relay: a fake platform and a broker of their own, both with certificates for
+        localhost signed by the company intermediate (verified with the root the device received
+        at registration), that know the devices of self.platform (the broker's ACL follows its
+        registrations). Returns (relay platform, relay broker)."""
+        https = self.pki.server_certificate(f"{name}-https", issuer="intermediate")
+        relay = self.platform.relay(https).start()
+        self.addCleanup(relay.stop)
+        self.addCleanup(lambda: self.assertEqual([], relay.errors, "the relay fake failed"))
+        mqtt = self.pki.server_certificate(f"{name}-broker", issuer="intermediate")
+        broker = Broker(self.pki, self.tmp / name, platform=relay, server_cert=mqtt).start()
+        self.addCleanup(broker.stop)
+        self.platform.on_device(lambda device: broker.reload_acl())
+        return relay, broker

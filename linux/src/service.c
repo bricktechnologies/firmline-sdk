@@ -14,6 +14,7 @@
 #include "log.h"
 #include "mqtt.h"
 #include "ota.h"
+#include "renewal.h"
 #include "store.h"
 
 #include <errno.h>
@@ -34,6 +35,7 @@
 #define ANSWER_TIMEOUT_MS 30000 /* for CONNACK and SUBACK */
 #define STABLE_MS 60000         /* a connection up this long starts the attempts again from 0 */
 #define MAX_ATTEMPT 16          /* fl_backoff_seconds is at its cap long before */
+#define SHARED_WAIT_MS 100 /* a download and a renewal at once: each waits on its own sockets */
 
 static const char CERT_BEGIN[] = "-----BEGIN CERTIFICATE-----";
 static const char CERT_END[] = "-----END CERTIFICATE-----";
@@ -43,6 +45,7 @@ typedef enum { LINK_DOWN, LINK_CONNECTING, LINK_CONNECTED, LINK_SUBSCRIBED } lin
 struct fa_service {
     const fa_config *cfg;
     fa_identity id;
+    fa_endpoint endpoint;
     uint8_t update_key[128];
     size_t update_key_len;
     char ca_path[PATH_MAX], cert_path[PATH_MAX], key_path[PATH_MAX];
@@ -59,8 +62,9 @@ struct fa_service {
     uint32_t unreadable;   /* bit i: the version of component i could not be read last time */
     bool nothing_readable; /* the last status had nothing to report (logged once) */
 
-    unsigned session; /* grows at every subscription of the offer topic */
-    fa_ota *ota;      /* the updates */
+    unsigned session;    /* grows at every subscription of the offer topic */
+    fa_ota *ota;         /* the updates */
+    fa_renewal *renewal; /* the certificate renewal */
 };
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -70,25 +74,24 @@ static void on_stop_signal(int sig) {
     stop_requested = 1;
 }
 
-/* ---- Hook points: updates (Task 9); the renewal comes with Task 10 ------------------------ */
+/* ---- Hook points: the updates and the certificate renewal --------------------------------- */
 
 static fl_time wall_clock(void);
 
 void fa_hook_before_connect(fa_service *s, fl_time now) {
-    (void)s;
-    (void)now;
+    fa_renewal_before_connect(s->renewal, now);
 }
 
 void fa_hook_offer(fa_service *s, const char *payload, size_t len) {
     fa_ota_offer(s->ota, payload, len, wall_clock());
 }
 
-void fa_hook_tick(fa_service *s, fl_time now) { fa_ota_tick(s->ota, now); }
-
-void fa_hook_after_status(fa_service *s, fl_time now) {
-    (void)s;
-    (void)now;
+void fa_hook_tick(fa_service *s, fl_time now) {
+    fa_ota_tick(s->ota, now);
+    fa_renewal_tick(s->renewal, now);
 }
+
+void fa_hook_after_status(fa_service *s, fl_time now) { fa_renewal_check(s->renewal, now); }
 
 /* ---- Helpers ------------------------------------------------------------------------------ */
 
@@ -197,11 +200,58 @@ done:
     return rc;
 }
 
+int fa_endpoint_load(const fa_config *cfg, fa_endpoint *out) {
+    memset(out, 0, sizeof *out);
+    char path[PATH_MAX];
+    struct stat st;
+    if (join_path(path, sizeof path, cfg->data_dir, FA_ENDPOINT) != 0)
+        return -1;
+    if (lstat(path, &st) != 0 && errno == ENOENT) { /* direct: the configuration */
+        snprintf(out->https, sizeof out->https, "%s", cfg->platform_url);
+        snprintf(out->https_ca, sizeof out->https_ca, "%s", cfg->ca_file);
+        snprintf(out->broker, sizeof out->broker, "%s", cfg->broker_host);
+        out->broker_port = cfg->broker_port;
+        return 0;
+    }
+    char *text = NULL;
+    size_t len = 0;
+    int64_t port = 0;
+    fl_json j;
+    out->relay = true;
+    int ok = fa_store_read(cfg->data_dir, FA_ENDPOINT, &text, &len) == 0 &&
+             fl_json_parse(&j, text, len) == FL_OK &&
+             fl_json_string(&j, "https", out->https, sizeof out->https) == FL_OK &&
+             fl_json_string(&j, "broker", out->broker, sizeof out->broker) == FL_OK &&
+             fl_json_int(&j, "brokerPort", &port) == FL_OK &&
+             strncmp(out->https, "https://", 8) == 0 && out->https[8] != '\0' &&
+             out->broker[0] != '\0' && port >= 1 && port <= 65535 &&
+             join_path(out->https_ca, sizeof out->https_ca, cfg->data_dir, "root.pem") == 0;
+    free(text);
+    out->broker_port = (int)port;
+    return ok ? 0 : -1;
+}
+
 /* ---- What the hooks can use ------------------------------------------------------------- */
 
 const fa_config *fa_service_config(const fa_service *s) { return s->cfg; }
 
 const fa_identity *fa_service_identity(const fa_service *s) { return &s->id; }
+
+const fa_endpoint *fa_service_endpoint(const fa_service *s) { return &s->endpoint; }
+
+void fa_service_identity_changed(fa_service *s) {
+    fa_identity id;
+    char topic[sizeof s->status_topic];
+    if (fa_identity_load(s->cfg->data_dir, &id) != 0 ||
+        join_path(topic, sizeof topic, id.topic_root, "status") != 0) {
+        fa_log("error", "%s/%s cannot be read: the identity in use stays until a restart",
+               s->cfg->data_dir, IDENTITY);
+        return;
+    }
+    s->id = id; /* in place: what the hooks point to stays valid */
+    memcpy(s->status_topic, topic, sizeof topic);
+    fa_ota_identity_changed(s->ota);
+}
 
 const uint8_t *fa_service_update_key(const fa_service *s, size_t *len) {
     *len = s->update_key_len;
@@ -227,7 +277,10 @@ bool fa_service_stopping(const fa_service *s) {
 
 void fa_service_request_status(fa_service *s) { s->status_requested = true; }
 
-void fa_service_request_reconnect(fa_service *s) { s->reconnect_requested = true; }
+void fa_service_request_reconnect(fa_service *s) {
+    if (s->state != LINK_DOWN) /* down: the next attempt reads the new files anyway */
+        s->reconnect_requested = true;
+}
 
 /* ---- The connection ----------------------------------------------------------------------- */
 
@@ -269,8 +322,8 @@ static void on_connect(void *ctx, int reason) {
     s->state = LINK_CONNECTED;
     s->connected_at = monotonic_ms();
     record_connection(s);
-    fa_log("info", "connected to the broker %s:%d as %s", s->cfg->broker_host, s->cfg->broker_port,
-           s->id.client_id);
+    fa_log("info", "connected to the broker %s:%d as %s", s->endpoint.broker,
+           s->endpoint.broker_port, s->id.client_id);
     if (fa_mqtt_subscribe(s->mqtt, s->id.ota_offer_topic, 1) != 0)
         lose(s, "cannot subscribe to the offer topic");
 }
@@ -301,8 +354,37 @@ static void on_published(void *ctx, int mid, int reason) {
     fa_ota_published(s->ota, mid, reason);
 }
 
+static void log_endpoint(const fa_endpoint *e) {
+    if (e->relay)
+        fa_log("info", "through the relay: broker %s:%d, HTTPS %s (verified with root.pem)",
+               e->broker, e->broker_port, e->https);
+    else
+        fa_log("info", "directly: broker %s:%d, HTTPS %s", e->broker, e->broker_port, e->https);
+}
+
+static bool same_endpoint(const fa_endpoint *a, const fa_endpoint *b) {
+    return a->relay == b->relay && a->broker_port == b->broker_port &&
+           strcmp(a->https, b->https) == 0 && strcmp(a->https_ca, b->https_ca) == 0 &&
+           strcmp(a->broker, b->broker) == 0;
+}
+
+/* endpoint.json again (the command `endpoint` may have changed it): before every attempt. */
+static void reload_endpoint(fa_service *s) {
+    fa_endpoint e;
+    if (fa_endpoint_load(s->cfg, &e) != 0) {
+        fa_log("warning", "%s/%s cannot be read: the addresses in use stay", s->cfg->data_dir,
+               FA_ENDPOINT);
+        return;
+    }
+    if (!same_endpoint(&e, &s->endpoint)) {
+        s->endpoint = e;
+        log_endpoint(&e);
+    }
+}
+
 static void start_attempt(fa_service *s) {
     fa_hook_before_connect(s, wall_clock());
+    reload_endpoint(s);
     s->lost = false;
     s->lost_reason[0] = '\0';
     s->connected_at = 0;
@@ -312,11 +394,12 @@ static void start_attempt(fa_service *s) {
         lose(s, "the device certificate in %s cannot be read", s->cfg->data_dir);
         return;
     }
-    const fa_mqtt_settings settings = {s->cfg->broker_host, s->cfg->broker_port, s->id.client_id,
-                                       s->ca_path,          s->cert_path,        s->key_path};
+    const fa_mqtt_settings settings = {s->endpoint.broker, s->endpoint.broker_port,
+                                       s->id.client_id,    s->ca_path,
+                                       s->cert_path,       s->key_path};
     const fa_mqtt_events events = {on_connect, on_subscribe, on_message, on_published, s};
     char err[FA_MQTT_ERROR_MAX];
-    fa_log("info", "connecting to the broker %s:%d", s->cfg->broker_host, s->cfg->broker_port);
+    fa_log("info", "connecting to the broker %s:%d", s->endpoint.broker, s->endpoint.broker_port);
     s->mqtt = fa_mqtt_connect(&settings, &events, err);
     if (s->mqtt == NULL)
         lose(s, "%s", err);
@@ -337,6 +420,7 @@ static void close_and_wait(fa_service *s) {
     s->state = LINK_DOWN;
     s->connected_at = 0;
     s->lost = false;
+    s->reconnect_requested = false; /* the next connection is a new one anyway */
     if (!stop_requested)
         fa_log("warning", "%s: %s; next attempt in %u s",
                was_up ? "disconnected from the broker" : "cannot connect to the broker",
@@ -407,6 +491,19 @@ static void send_status(fa_service *s) {
 
 /* ---- The loop ----------------------------------------------------------------------------- */
 
+/* Waits up to timeout_ms for `fd` (the broker, -1 for none) and for the work in progress: a
+ * download, a script, a renewal. False (nothing waited) when there is no such work. */
+static bool wait_for_work(fa_service *s, int fd, bool want_write, int timeout_ms) {
+    bool ota = fa_ota_busy(s->ota), renewal = fa_renewal_busy(s->renewal);
+    if (ota && renewal && timeout_ms > SHARED_WAIT_MS)
+        timeout_ms = SHARED_WAIT_MS; /* the renewal's sockets are not in the download's wait */
+    if (ota)
+        fa_ota_wait(s->ota, fd, want_write, timeout_ms);
+    else if (renewal)
+        fa_renewal_wait(s->renewal, fd, want_write, timeout_ms);
+    return ota || renewal;
+}
+
 static void loop_turn(fa_service *s) {
     long long now = monotonic_ms();
     fa_hook_tick(s, wall_clock());
@@ -416,9 +513,8 @@ static void loop_turn(fa_service *s) {
         if (now < s->next_attempt_at) {
             long long left = s->next_attempt_at - now;
             left = left < TICK_MS ? left : TICK_MS;
-            if (fa_ota_busy(s->ota)) /* a download or a script goes on without the broker */
-                fa_ota_wait(s->ota, -1, false, (int)left);
-            else
+            /* a download, a script or a renewal goes on without the broker */
+            if (!wait_for_work(s, -1, false, (int)left))
                 sleep_ms(left);
             return;
         }
@@ -439,19 +535,41 @@ static void loop_turn(fa_service *s) {
         long long timeout = TICK_MS;
         if (s->state == LINK_SUBSCRIBED && s->next_status_at - now < timeout)
             timeout = s->next_status_at - now > 0 ? s->next_status_at - now : 0;
-        if (fa_ota_busy(s->ota)) {
-            /* One wait for the broker, the transfer and the script's output; then libmosquitto
-             * handles what came without waiting again. */
-            fa_ota_wait(s->ota, fa_mqtt_socket(s->mqtt), fa_mqtt_want_write(s->mqtt) != 0,
-                        (int)timeout);
+        /* One wait for the broker, the transfer and the script's output; then libmosquitto
+         * handles what came without waiting again. */
+        if (wait_for_work(s, fa_mqtt_socket(s->mqtt), fa_mqtt_want_write(s->mqtt) != 0,
+                          (int)timeout))
             timeout = 0;
-        }
         char err[FA_MQTT_ERROR_MAX];
         if (fa_mqtt_loop(s->mqtt, (int)timeout, err) != 0)
             lose(s, "%s", err);
     }
     if (s->lost)
         close_and_wait(s);
+}
+
+/* device.key must be the key of device.pem: a renewal never leaves them apart (renewal.h), so a
+ * difference means a damaged folder. 0, or -1 (logged). */
+static int check_pair(const char *dir) {
+    char *pem = NULL;
+    size_t len = 0;
+    int match = fa_store_read(dir, "device.pem", &pem, &len) == 0
+                    ? fa_key_matches_certificate(dir, "device.key", pem, len)
+                    : -1;
+    free(pem);
+    if (match == 1)
+        return 0;
+    if (match == 0)
+        fa_log("error",
+               "run: device.key does not match device.pem in %s and no interrupted renewal "
+               "explains it: register the device again",
+               dir);
+    else
+        fa_log("error",
+               "run: device.key or device.pem in %s cannot be read: register the device "
+               "again",
+               dir);
+    return -1;
 }
 
 static int prepare(fa_service *s, const fa_config *cfg) {
@@ -468,6 +586,8 @@ static int prepare(fa_service *s, const fa_config *cfg) {
             fa_log("error", "run: cannot read %s/%s: %s", dir, IDENTITY, strerror(errno));
         return -1;
     }
+    if (fa_renewal_recover(dir) != 0) /* before anything reads the identity */
+        return -1;
     if (fa_identity_load(dir, &s->id) != 0) {
         fa_log("error", "run: %s cannot be read", path);
         return -1;
@@ -495,6 +615,16 @@ static int prepare(fa_service *s, const fa_config *cfg) {
                dir);
         return -1;
     }
+    if (check_pair(dir) != 0)
+        return -1;
+    if (fa_endpoint_load(cfg, &s->endpoint) != 0) {
+        fa_log("error",
+               "run: %s/%s cannot be read: run firmline-agent endpoint --relay <host> again, or "
+               "endpoint --direct",
+               dir, FA_ENDPOINT);
+        return -1;
+    }
+    log_endpoint(&s->endpoint);
     return 0;
 }
 
@@ -514,7 +644,9 @@ int fa_service_run(const fa_config *cfg) {
         return 1;
     }
     s->ota = fa_ota_open(s, wall_clock());
-    if (s->ota == NULL) {
+    s->renewal = s->ota != NULL ? fa_renewal_open(s) : NULL;
+    if (s->renewal == NULL) {
+        fa_ota_close(s->ota);
         fa_mqtt_lib_cleanup();
         free(s);
         return 1;
@@ -535,6 +667,7 @@ int fa_service_run(const fa_config *cfg) {
     sigaction(SIGPIPE, &ignore, NULL);
 
     fa_log("info", "running as device %s", s->id.device_id);
+    fa_renewal_check(s->renewal, wall_clock()); /* at start; then after each status */
     while (!stop_requested)
         loop_turn(s);
 
@@ -542,6 +675,7 @@ int fa_service_run(const fa_config *cfg) {
         fa_mqtt_close(s->mqtt); /* DISCONNECT with "normal disconnection" when connected */
         fa_log("info", "disconnected from the broker");
     }
+    fa_renewal_close(s->renewal);
     fa_ota_close(s->ota);
     fa_mqtt_lib_cleanup();
     fa_log("info", "stopped");

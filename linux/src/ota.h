@@ -49,6 +49,9 @@ void fa_ota_tick(fa_ota *o, fl_time now);
 /* The PUBACK of a message: the result it carried is marked as delivered. */
 void fa_ota_published(fa_ota *o, int mid, int reason);
 
+/* The identity was read again (a renewal): the family of the offer check follows device.json. */
+void fa_ota_identity_changed(fa_ota *o);
+
 /* True while a transfer, a script or a rehash runs: the loop then waits with fa_ota_wait. */
 bool fa_ota_busy(const fa_ota *o);
 

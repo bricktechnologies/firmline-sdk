@@ -126,7 +126,18 @@ struct fa_http_download {
     bool done;
     CURLcode result;
     char range[32];
+    struct curl_slist *headers; /* of a POST */
 };
+
+/* Frees a transfer that is not (or no longer) in its multi handle. */
+static void transfer_drop(fa_http_download *d) {
+    if (d->easy != NULL)
+        curl_easy_cleanup(d->easy);
+    if (d->multi != NULL)
+        curl_multi_cleanup(d->multi);
+    curl_slist_free_all(d->headers);
+    free(d);
+}
 
 /* "Content-Range: bytes <first>-<last>/<size>" of the answer; a new status line (an interim
  * answer before the real one) forgets it. */
@@ -171,8 +182,9 @@ static size_t on_download_data(char *ptr, size_t size, size_t nmemb, void *userd
     return n;
 }
 
-fa_http_download *fa_http_download_start(const char *url, const char *ca_file, uint64_t offset,
-                                         fa_http_sink sink, void *ctx) {
+/* A transfer with the options every request of the agent has and the sink, or NULL. */
+static fa_http_download *transfer_new(const char *url, const char *ca_file, fa_http_sink sink,
+                                      void *ctx) {
     fa_http_download *d = calloc(1, sizeof *d);
     if (d == NULL)
         return NULL;
@@ -181,28 +193,58 @@ fa_http_download *fa_http_download_start(const char *url, const char *ca_file, u
     d->range_start = -1;
     d->easy = curl_easy_init();
     d->multi = curl_multi_init();
-    int ok = d->easy != NULL && d->multi != NULL && secure_options(d->easy, url, ca_file) == 0 &&
-             curl_easy_setopt(d->easy, CURLOPT_TIMEOUT, 0L) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_LOW_SPEED_LIMIT, 1L) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_LOW_SPEED_TIME, 60L) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_HTTPGET, 1L) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_HEADERFUNCTION, on_download_header) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_HEADERDATA, d) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_WRITEFUNCTION, on_download_data) == CURLE_OK &&
-             curl_easy_setopt(d->easy, CURLOPT_WRITEDATA, d) == CURLE_OK;
+    if (d->easy != NULL && d->multi != NULL && secure_options(d->easy, url, ca_file) == 0 &&
+        curl_easy_setopt(d->easy, CURLOPT_HEADERFUNCTION, on_download_header) == CURLE_OK &&
+        curl_easy_setopt(d->easy, CURLOPT_HEADERDATA, d) == CURLE_OK &&
+        curl_easy_setopt(d->easy, CURLOPT_WRITEFUNCTION, on_download_data) == CURLE_OK &&
+        curl_easy_setopt(d->easy, CURLOPT_WRITEDATA, d) == CURLE_OK)
+        return d;
+    transfer_drop(d);
+    return NULL;
+}
+
+/* Adds the transfer to its multi handle: d, or NULL (everything freed) when ok is false or the
+ * handle cannot be added. */
+static fa_http_download *transfer_start(fa_http_download *d, bool ok) {
+    if (ok && curl_multi_add_handle(d->multi, d->easy) == CURLM_OK)
+        return d;
+    transfer_drop(d);
+    return NULL;
+}
+
+fa_http_download *fa_http_download_start(const char *url, const char *ca_file, uint64_t offset,
+                                         fa_http_sink sink, void *ctx) {
+    fa_http_download *d = transfer_new(url, ca_file, sink, ctx);
+    if (d == NULL)
+        return NULL;
+    bool ok = curl_easy_setopt(d->easy, CURLOPT_TIMEOUT, 0L) == CURLE_OK &&
+              curl_easy_setopt(d->easy, CURLOPT_LOW_SPEED_LIMIT, 1L) == CURLE_OK &&
+              curl_easy_setopt(d->easy, CURLOPT_LOW_SPEED_TIME, 60L) == CURLE_OK &&
+              curl_easy_setopt(d->easy, CURLOPT_HTTPGET, 1L) == CURLE_OK;
     if (ok && offset > 0) {
         snprintf(d->range, sizeof d->range, "%llu-", (unsigned long long)offset);
         ok = curl_easy_setopt(d->easy, CURLOPT_RANGE, d->range) == CURLE_OK;
     }
-    if (!ok || curl_multi_add_handle(d->multi, d->easy) != CURLM_OK) {
-        if (d->easy != NULL)
-            curl_easy_cleanup(d->easy);
-        if (d->multi != NULL)
-            curl_multi_cleanup(d->multi);
-        free(d);
+    return transfer_start(d, ok);
+}
+
+fa_http_download *fa_http_post_start(const char *url, const char *ca_file, const char *body,
+                                     fa_http_sink sink, void *ctx) {
+    fa_http_download *d = transfer_new(url, ca_file, sink, ctx);
+    if (d == NULL)
         return NULL;
+    struct curl_slist *h = curl_slist_append(NULL, "Content-Type: application/json");
+    if (h != NULL) {
+        d->headers = h;
+        h = curl_slist_append(d->headers, "Accept: application/json, application/problem+json");
     }
-    return d;
+    if (h != NULL)
+        d->headers = h;
+    bool ok = h != NULL && curl_easy_setopt(d->easy, CURLOPT_HTTPHEADER, d->headers) == CURLE_OK &&
+              curl_easy_setopt(d->easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(body)) ==
+                  CURLE_OK &&
+              curl_easy_setopt(d->easy, CURLOPT_COPYPOSTFIELDS, body) == CURLE_OK;
+    return transfer_start(d, ok);
 }
 
 void fa_http_download_wait(fa_http_download *d, struct pollfd *fds, int nfds, int timeout_ms) {
@@ -251,7 +293,5 @@ void fa_http_download_free(fa_http_download *d) {
     if (d == NULL)
         return;
     curl_multi_remove_handle(d->multi, d->easy);
-    curl_easy_cleanup(d->easy);
-    curl_multi_cleanup(d->multi);
-    free(d);
+    transfer_drop(d);
 }

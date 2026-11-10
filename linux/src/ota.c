@@ -411,7 +411,10 @@ static void start_request(fa_ota *o, fl_time now) {
         fa_log("info", "release %s: resuming the download at byte %llu of %llu", o->job.release,
                (unsigned long long)o->have, (unsigned long long)o->job.size);
     o->state = JOB_DOWNLOAD;
-    o->http = fa_http_download_start(o->job.url, o->cfg->ca_file, o->have, on_bytes, o);
+    /* The link comes from the offer; it is verified as the endpoint in use says (root.pem
+     * through a relay, ca_file or the system authorities directly). */
+    o->http = fa_http_download_start(o->job.url, fa_service_endpoint(o->svc)->https_ca, o->have,
+                                     on_bytes, o);
     if (o->http == NULL) {
         o->state = JOB_RETRY;
         o->retry_at = fl_download_retry_at(0, o->attempt++, now, o->job.url_expires);
@@ -1075,6 +1078,14 @@ static void rebuild_queue(fa_ota *o, fl_time now) {
         take_offer(o, &offer, NULL, 0, true);
     }
     free(files);
+}
+
+void fa_ota_identity_changed(fa_ota *o) {
+    const fa_identity *id = fa_service_identity(o->svc);
+    const char *family = id->family_id[0] != '\0' ? id->family_id : o->cfg->family;
+    if (family != o->dev.family && family[0] != '\0') /* until now the configuration's, or none */
+        fa_log("info", "the device family is now %s (from the renewal)", family);
+    o->dev.family = family;
 }
 
 fa_ota *fa_ota_open(fa_service *s, fl_time now) {

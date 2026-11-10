@@ -17,6 +17,7 @@ add_library(firmline_agent_lib STATIC
   src/mqtt.c
   src/service.c
   src/ota.c
+  src/renewal.c
   src/install_script.c)
 target_include_directories(firmline_agent_lib PUBLIC src)
 target_include_directories(firmline_agent_lib SYSTEM PRIVATE ${MOSQUITTO_INCLUDE_DIR})
@@ -26,7 +27,8 @@ target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CU
 target_compile_definitions(firmline_agent_lib PUBLIC OPENSSL_API_COMPAT=30000 OPENSSL_NO_DEPRECATED)
 target_compile_options(firmline_agent_lib PRIVATE ${FIRMLINE_WARNINGS})
 
-add_executable(firmline-agent src/main.c src/cmd_register.c src/cmd_run.c)
+add_executable(firmline-agent src/main.c src/cmd_register.c src/cmd_run.c src/cmd_status.c
+                              src/cmd_endpoint.c)
 target_link_libraries(firmline-agent PRIVATE firmline_agent_lib)
 target_compile_options(firmline-agent PRIVATE ${FIRMLINE_WARNINGS})
 
