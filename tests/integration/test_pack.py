@@ -162,6 +162,18 @@ class PackTest(unittest.TestCase):
         self.assert_refused(self.pack(compose), "example/absent:1", "db")
         self.assertNotIn("POST /v1.", self.docker.log()[before:])
 
+    def test_an_image_reference_that_looks_like_an_option_is_only_a_name(self):
+        """`--help` as an image is looked up as an image (and is not there), never taken as an
+        option of docker image inspect."""
+        self.docker.app_image("example/web:1", "stay")
+        compose = self.composition(
+            "services:\n  web:\n    image: example/web:1\n  db:\n    image: \"--help\"\n")
+        result = self.pack(compose)
+        self.assert_refused(result, "--help", "not on this machine")
+        # looked up by the daemon, which answers; not a help text that docker prints
+        self.assertIn("info docker: Error response from daemon", result.stderr)
+        self.assertNotIn("output is over", result.stderr)
+
     def test_images_of_two_architectures_are_refused(self):
         self.docker.app_image("example/web:1", "stay")
         rootfs = self.folder / "rootfs.tar"

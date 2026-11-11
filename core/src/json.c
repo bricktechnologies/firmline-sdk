@@ -368,8 +368,12 @@ static int parse_into(fl_json *j, const char *js, size_t len, jsmntok_t *tok, si
 }
 
 int fl_json_parse(fl_json *j, const char *js, size_t len) {
-    if (j == NULL || js == NULL)
+    if (j == NULL)
         return FL_ERR_ARG;
+    if (js == NULL) {
+        clear(j);
+        return FL_ERR_ARG;
+    }
     return parse_into(j, js, len, j->table, FL_JSON_MAX_TOKENS);
 }
 

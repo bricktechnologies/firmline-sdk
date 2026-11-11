@@ -83,6 +83,15 @@ static void json_refuses_invalid_documents(void) {
     CHECK_EQ_INT(PARSE(j, " {\"a\":1}\n"), FL_OK);
     CHECK_EQ_INT(fl_json_parse(&j, "{\"a\":1}\0x", 9), FL_ERR_FORMAT); /* NUL then bytes */
     CHECK_EQ_INT(fl_json_parse(NULL, "{}", 2), FL_ERR_ARG);
+    /* a NULL text leaves j an empty document, not the one parsed before */
+    {
+        int64_t v = 0;
+        CHECK_EQ_INT(PARSE(j, "{\"a\":1}"), FL_OK);
+        CHECK_EQ_INT(fl_json_parse(&j, NULL, 2), FL_ERR_ARG);
+        CHECK_EQ_INT(j.count, 0);
+        CHECK(j.js == NULL);
+        CHECK_EQ_INT(fl_json_int(&j, "a", &v), FL_ERR_FORMAT);
+    }
 }
 
 static void json_refuses_more_tokens_than_the_table(void) {

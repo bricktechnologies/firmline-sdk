@@ -317,6 +317,150 @@ static void package_write_refuses_what_parse_refuses(void) {
     CHECK_EQ_INT(fa_package_write(&p, NULL, 0), -1);
 }
 
+#define HEX_A "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#define HEX_B "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+#define HEX_C "1111111111111111111111111111111111111111111111111111111111111111"
+
+/* A package of web and db at 2.1.0 with ids that the manifest must replace. */
+static void two_services(fa_package *p) {
+    char err[256];
+    CHECK_EQ_INT(parse(VALID, p, err), 0);
+    strcpy(p->image[0].id, "sha256:" HEX_C);
+    strcpy(p->image[1].id, "sha256:" HEX_C);
+}
+
+static int manifest(const char *text, fa_package *p, char err[256]) {
+    err[0] = '\0';
+    return fa_package_ids_from_manifest(text, strlen(text), p, err);
+}
+
+static void manifest_gives_the_config_digests_of_both_layouts(void) {
+    fa_package p;
+    char err[256];
+    /* the classic layout of docker save: <hex>.json */
+    two_services(&p);
+    CHECK_EQ_INT(
+        manifest("[{\"Config\":\"" HEX_A ".json\",\"RepoTags\":[\"firmline.local/web:2.1.0\"],"
+                 "\"Layers\":[\"" HEX_C "/layer.tar\"]},"
+                 "{\"Config\":\"" HEX_B ".json\",\"RepoTags\":[\"firmline.local/db:2.1.0\"],"
+                 "\"Layers\":[]}]",
+                 &p, err),
+        0);
+    CHECK_EQ_STR(p.image[0].id, "sha256:" HEX_A);
+    CHECK_EQ_STR(p.image[1].id, "sha256:" HEX_B);
+    /* the OCI layout (Docker 25 and later, and the containerd image store): blobs/sha256/<hex>,
+     * with other images and other keys around */
+    two_services(&p);
+    CHECK_EQ_INT(
+        manifest("[{\"Config\":\"blobs/sha256/" HEX_C "\",\"RepoTags\":null,\"Layers\":[]},"
+                 "{\"Config\":\"blobs/sha256/" HEX_B
+                 "\",\"RepoTags\":[\"firmline.local/db:2.1.0\"],"
+                 "\"Layers\":[\"blobs/sha256/" HEX_C "\"],\"LayerSources\":{\"x\":{\"size\":1}}},"
+                 "{\"Config\":\"blobs/sha256/" HEX_A "\",\"RepoTags\":[\"other/x:1\","
+                 "\"firmline.local/web:2.1.0\"],\"Layers\":[]}]\n",
+                 &p, err),
+        0);
+    CHECK_EQ_STR(p.image[0].id, "sha256:" HEX_A);
+    CHECK_EQ_STR(p.image[1].id, "sha256:" HEX_B);
+    /* two services of one image: one entry with both tags */
+    two_services(&p);
+    CHECK_EQ_INT(manifest("[{\"Config\":\"blobs/sha256/" HEX_A "\",\"RepoTags\":["
+                          "\"firmline.local/web:2.1.0\",\"firmline.local/db:2.1.0\"]}]",
+                          &p, err),
+                 0);
+    CHECK_EQ_STR(p.image[0].id, "sha256:" HEX_A);
+    CHECK_EQ_STR(p.image[1].id, "sha256:" HEX_A);
+}
+
+static void manifest_without_a_clear_entry_is_refused(void) {
+    static const char *const invalid[] = {
+        "",
+        "not json",
+        "{\"Config\":\"" HEX_A ".json\"}",
+        "[]",
+        /* db has no entry */
+        "[{\"Config\":\"" HEX_A ".json\",\"RepoTags\":[\"firmline.local/web:2.1.0\"]}]",
+        /* web is in two entries */
+        "[{\"Config\":\"" HEX_A ".json\",\"RepoTags\":[\"firmline.local/web:2.1.0\","
+        "\"firmline.local/db:2.1.0\"]},{\"Config\":\"" HEX_B ".json\",\"RepoTags\":["
+        "\"firmline.local/web:2.1.0\"]}]",
+        /* a Config that is not a digest of either layout */
+        "[{\"Config\":\"" HEX_A "\",\"RepoTags\":[\"firmline.local/web:2.1.0\","
+        "\"firmline.local/db:2.1.0\"]}]",
+        "[{\"Config\":\"blobs/sha512/" HEX_A "\",\"RepoTags\":[\"firmline.local/web:2.1.0\","
+        "\"firmline.local/db:2.1.0\"]}]",
+        "[{\"Config\":\"x/" HEX_A ".json\",\"RepoTags\":[\"firmline.local/web:2.1.0\","
+        "\"firmline.local/db:2.1.0\"]}]",
+        "[{\"Config\":\"" HEX_A "0.json\",\"RepoTags\":[\"firmline.local/web:2.1.0\","
+        "\"firmline.local/db:2.1.0\"]}]",
+        "[{\"Config\":\"blobs/sha256/"
+        "ABCDEF6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+        "\"RepoTags\":[\"firmline.local/web:2.1.0\",\"firmline.local/db:2.1.0\"]}]",
+        "[{\"RepoTags\":[\"firmline.local/web:2.1.0\",\"firmline.local/db:2.1.0\"]}]",
+        "[{\"Config\":1,\"RepoTags\":[\"firmline.local/web:2.1.0\",\"firmline.local/db:2.1.0\"]}]",
+        /* RepoTags not an array of strings */
+        "[{\"Config\":\"" HEX_A ".json\",\"RepoTags\":\"firmline.local/web:2.1.0\"}]",
+        "[{\"Config\":\"" HEX_A ".json\",\"RepoTags\":[1]}]",
+        "[1]",
+    };
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        fa_package p;
+        char err[256];
+        two_services(&p);
+        int rc = manifest(invalid[i], &p, err);
+        if (rc != -1 || err[0] == '\0')
+            fprintf(stderr, "case %zu accepted or without a reason: %s\n", i, invalid[i]);
+        CHECK_EQ_INT(rc, -1);
+        CHECK(err[0] != '\0');
+    }
+}
+
+static void compose_services_are_read_with_their_images(void) {
+    fa_compose_service s[FA_MAX_COMPONENTS];
+    int count = -1;
+    char err[256] = "";
+    static const char json[] =
+        "{\"name\":\"app\",\"services\":{\"web\":{\"image\":\"example/web:1\",\"healthcheck\":{"
+        "\"test\":[\"CMD\",\"true\"]},\"volumes\":[{\"type\":\"volume\",\"source\":\"data\"}]},"
+        "\"db\":{\"build\":{\"context\":\"./db\"},\"image\":\"registry:5000/db@sha256:" HEX_A
+        "\"}},"
+        "\"volumes\":{\"data\":{}}}";
+    CHECK_EQ_INT(fa_compose_services(json, strlen(json), s, &count, err), 0);
+    CHECK_EQ_INT(count, 2);
+    CHECK_EQ_STR(s[0].service, "web");
+    CHECK_EQ_STR(s[0].image, "example/web:1");
+    CHECK_EQ_STR(s[1].service, "db");
+    CHECK_EQ_STR(s[1].image, "registry:5000/db@sha256:" HEX_A);
+
+    static const char *const invalid[][2] = {
+        {"not json", "read"},
+        {"[]", "read"},
+        {"{\"name\":\"x\"}", "services"},
+        {"{\"services\":{}}", "no services"},
+        {"{\"services\":{\"tool\":{\"build\":\".\"}}}", "tool"},
+        {"{\"services\":{\"Web\":{\"image\":\"x\"}}}", "Web"},
+        {"{\"services\":{\"a\":{\"image\":\"\"}}}", "image"},
+        {"{\"services\":{\"a\":{\"image\":\"x\\u0041y\"}}}", "image"},
+        {"{\"services\":{\"a\":{\"image\":1}}}", "image"},
+    };
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        err[0] = '\0';
+        CHECK_EQ_INT(fa_compose_services(invalid[i][0], strlen(invalid[i][0]), s, &count, err), -1);
+        if (strstr(err, invalid[i][1]) == NULL)
+            fprintf(stderr, "case %zu: \"%s\" does not name %s\n", i, err, invalid[i][1]);
+        CHECK(strstr(err, invalid[i][1]) != NULL);
+    }
+    /* 17 services */
+    char many[2048];
+    size_t len = (size_t)snprintf(many, sizeof many, "{\"services\":{");
+    for (int i = 0; i < 17; i++)
+        len += (size_t)snprintf(many + len, sizeof many - len, "%s\"s%d\":{\"image\":\"x\"}",
+                                i ? "," : "", i);
+    snprintf(many + len, sizeof many - len, "}}");
+    CHECK_EQ_INT(fa_compose_services(many, strlen(many), s, &count, err), -1);
+    CHECK(strstr(err, "16") != NULL);
+}
+
 int main(void) {
     RUN(package_reads_a_valid_document);
     RUN(package_write_and_parse_round_trip);
@@ -326,5 +470,8 @@ int main(void) {
     RUN(package_tag_is_the_version_made_a_docker_tag);
     RUN(package_write_escapes_the_version);
     RUN(package_write_refuses_what_parse_refuses);
+    RUN(manifest_gives_the_config_digests_of_both_layouts);
+    RUN(manifest_without_a_clear_entry_is_refused);
+    RUN(compose_services_are_read_with_their_images);
     return CHECK_RESULT;
 }

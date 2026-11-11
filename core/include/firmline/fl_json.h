@@ -37,7 +37,8 @@ typedef struct {
 
 /* FL_ERR_FORMAT: invalid JSON (strict), trailing bytes after the root, root not an object, a root
  * key repeated (compared unescaped; root keys over 127 bytes are refused), nesting over 4 levels
- * (the root object is level 1), more than FL_JSON_MAX_TOKENS tokens. FL_ERR_ARG: NULL argument. */
+ * (the root object is level 1), more than FL_JSON_MAX_TOKENS tokens. FL_ERR_ARG: NULL argument.
+ * After any refusal j (when not NULL) reads as an empty document. */
 int fl_json_parse(fl_json *j, const char *js, size_t len);
 
 /* fl_json_parse with the caller's token table of cap entries in place of j->table, for a

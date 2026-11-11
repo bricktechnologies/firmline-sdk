@@ -49,6 +49,29 @@ int fa_package_write(const fa_package *p, char *out, size_t cap);
  * 1.4.3+build.7 is 1.4.3_build.7. The description keeps the version itself. */
 void fa_package_tag(const char *version, char tag[FA_PACKAGE_TAG_MAX + 1]);
 
+/* The readers of what docker gives `pack`. They walk the JSON with jsmn directly, as Compose's
+ * nests deeper than the core reader allows and docker save's manifest is an array. */
+
+/* A service of `docker compose config --format json` and the image it names. */
+typedef struct {
+    char service[65];
+    char image[256];
+} fa_compose_service;
+
+/* The services of the composition, in its order: 0, or -1 with the reason in err (no services,
+ * more than FA_MAX_COMPONENTS, a name not usable in an image name, no `image:`, an image with an
+ * escape or empty). */
+int fa_compose_services(const char *json, size_t len, fa_compose_service out[FA_MAX_COMPONENTS],
+                        int *count, char err[256]);
+
+/* Sets the id of every image of p from the manifest.json of the `docker save` archive of its
+ * images: the digest of the Config ("<hex>.json" in the classic layout, "blobs/sha256/<hex>" in
+ * the OCI one) of the one entry whose RepoTags hold the image name. This is the ID `docker load`
+ * gives the image on the device, also when this machine's daemon (the containerd image store)
+ * shows another one. 0, or -1 with the reason in err when an image has no entry, is in two, or
+ * the entry's Config is neither. */
+int fa_package_ids_from_manifest(const char *json, size_t len, fa_package *p, char err[256]);
+
 /* The rules above, for `pack`: a version valid as the firmware version, a service name usable in
  * an image name, an image ID. */
 bool fa_package_version_ok(const char *version);

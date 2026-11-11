@@ -7,7 +7,10 @@
  * The package is an uncompressed tar of exactly, in this order:
  *   firmline-package.json  the description (package.h): architecture, version, and per service
  *                          its image firmline.local/<service>:<tag> (the version made a
- *                          Docker tag, fa_package_tag) and the image ID;
+ *                          Docker tag, fa_package_tag) and the image ID, the digest of its
+ *                          configuration as the manifest of `docker save` gives it: the ID
+ *                          `docker load` gives it on the device, whatever image store this
+ *                          machine's daemon uses;
  *   docker-compose.yml     the composition as Compose renders it with an override that gives each
  *                          service that image, `pull_policy: never` and no `build:`. It is not
  *                          normalized and paths are not resolved, so that the device's project
@@ -16,14 +19,9 @@
  * Every service must name its image, present on this machine (pack never pulls), all of one
  * architecture; the new names stay tagged here. The files are made in a temporary folder next to
  * the output, removed on every exit, also on SIGINT, SIGTERM and SIGHUP; the output appears only
- * complete (a rename) and replaces a file of the same name. */
-#define _GNU_SOURCE /* mkdtemp, strdup */
-/* The rendered composition nests deeper than the core JSON reader allows (healthcheck.test is at
- * level 5): it is read with jsmn directly, compiled here as in core/src/json.c. */
-#define JSMN_STRICT
-#define JSMN_STATIC
-#include "jsmn.h"
-
+ * complete (a rename) and replaces a file of the same name. A value from the command line or the
+ * composition never reaches docker, tar or gzip where it could read as an option. */
+#define _GNU_SOURCE /* mkdtemp */
 #include "commands.h"
 
 #include "docker.h"
@@ -42,24 +40,14 @@
 #include <unistd.h>
 
 #define COMPOSE_JSON_MAX (256 * 1024) /* the composition as JSON; larger is refused */
+#define MANIFEST_MAX (256 * 1024)     /* manifest.json of docker save; larger is refused */
 #define INSPECT_MAX 512               /* "<id> <architecture>\n" */
-#define IMAGE_REF_MAX 256             /* the image of a service in the composition */
-#define SHORT_MS (60 * 1000)          /* compose config, image inspect, tag */
+#define SHORT_MS (60 * 1000)          /* compose config, image inspect, tag, manifest */
 #define LONG_MS (30 * 60 * 1000)      /* save, gzip, tar */
 
 typedef struct {
     const char *compose, *version, *output;
 } options;
-
-/* The services as the composition names them, and their images here. */
-typedef struct {
-    int count;
-    struct {
-        char service[65];
-        char source[IMAGE_REF_MAX];
-        char architecture[16];
-    } s[FA_MAX_COMPONENTS];
-} services;
 
 static volatile sig_atomic_t interrupted = 0;
 
@@ -105,137 +93,53 @@ static int parse_options(int argc, char **argv, options *o) {
     return 0;
 }
 
-/* ---- the composition as JSON ----------------------------------------------------------- */
-
-typedef struct {
-    const char *js;
-    jsmntok_t *tok;
-    int count;
-} doc;
-
-/* The index of the token after the value at v. */
-static int skip(const doc *d, int v) {
-    int n = v + 1;
-    while (n < d->count && d->tok[n].start < d->tok[v].end)
-        n++;
-    return n;
-}
-
-static bool token_is(const doc *d, int i, const char *text) {
-    size_t n = strlen(text);
-    return d->tok[i].type == JSMN_STRING && (size_t)(d->tok[i].end - d->tok[i].start) == n &&
-           memcmp(d->js + d->tok[i].start, text, n) == 0;
-}
-
-/* The value of `key` in the object at token o, or -1. */
-static int member(const doc *d, int o, const char *key) {
-    if (d->tok[o].type != JSMN_OBJECT)
-        return -1;
-    int i = o + 1;
-    for (int p = 0; p < d->tok[o].size && i + 1 < d->count; p++) {
-        if (token_is(d, i, key))
-            return i + 1;
-        i = skip(d, i + 1);
-    }
-    return -1;
-}
-
-/* A string token copied as it is (escapes are not decoded: a service name or an image reference
- * has none, and one with a backslash is refused). 0, or -1 when it does not fit or has one. */
-static int copy_token(const doc *d, int i, char *out, size_t cap) {
-    size_t n = (size_t)(d->tok[i].end - d->tok[i].start);
-    if (d->tok[i].type != JSMN_STRING || n >= cap || memchr(d->js + d->tok[i].start, '\\', n))
-        return -1;
-    memcpy(out, d->js + d->tok[i].start, n);
-    out[n] = '\0';
-    return 0;
-}
-
-/* The services of `docker compose config --format json` and the image each names. */
-static int read_services(const char *json, size_t len, services *out) {
-    jsmn_parser parser;
-    jsmn_init(&parser);
-    int n = jsmn_parse(&parser, json, len, NULL, 0);
-    if (n < 1) {
-        fa_log("error", "pack: cannot read what docker compose config gives");
-        return -1;
-    }
-    doc d = {json, calloc((size_t)n, sizeof(jsmntok_t)), n};
-    if (d.tok == NULL) {
-        fa_log("error", "pack: out of memory");
-        return -1;
-    }
-    int rc = -1;
-    jsmn_init(&parser);
-    int list;
-    if (jsmn_parse(&parser, json, len, d.tok, (unsigned int)n) != n ||
-        d.tok[0].type != JSMN_OBJECT || (list = member(&d, 0, "services")) < 0 ||
-        d.tok[list].type != JSMN_OBJECT) {
-        fa_log("error", "pack: cannot read the services from what docker compose config gives");
-    } else if (d.tok[list].size == 0) {
-        fa_log("error", "pack: the composition has no services");
-    } else if (d.tok[list].size > FA_MAX_COMPONENTS) {
-        fa_log("error", "pack: the composition has %d services, a package holds at most %d",
-               d.tok[list].size, FA_MAX_COMPONENTS);
-    } else {
-        rc = 0;
-        out->count = d.tok[list].size;
-        for (int k = 0, i = list + 1; k < out->count && rc == 0; k++, i = skip(&d, i + 1)) {
-            char *service = out->s[k].service;
-            int image = member(&d, i + 1, "image");
-            if (copy_token(&d, i, service, sizeof out->s[k].service) != 0 ||
-                !fa_package_service_ok(service)) {
-                fa_log("error",
-                       "pack: the service name %.*s cannot be part of an image name (lowercase "
-                       "letters and digits joined by . _ __ or -, 64 at most)",
-                       d.tok[i].end - d.tok[i].start > 64 ? 64 : d.tok[i].end - d.tok[i].start,
-                       json + d.tok[i].start);
-                rc = -1;
-            } else if (image < 0) {
-                fa_log("error",
-                       "pack: the service %s has no image: (with only build:, build and tag the "
-                       "image first and name it in image:)",
-                       service);
-                rc = -1;
-            } else if (copy_token(&d, image, out->s[k].source, sizeof out->s[k].source) != 0 ||
-                       out->s[k].source[0] == '\0') {
-                fa_log("error", "pack: the image of the service %s is not a plain image name",
-                       service);
-                rc = -1;
-            }
-        }
-    }
-    free(d.tok);
-    return rc;
+/* "<option>=<value>" into out: a value that starts with '-' stays the option's value. */
+static int with_value(char *out, size_t cap, const char *option, const char *value) {
+    int n = snprintf(out, cap, "%s=%s", option, value);
+    return n >= 0 && (size_t)n < cap ? 0 : -1;
 }
 
 /* ---- the steps --------------------------------------------------------------------------- */
 
-/* The JSON of the composition, NUL-terminated in a buffer the caller frees. */
-static char *compose_json(const char *compose) {
+/* The services of the composition and the image each names. */
+static int read_services(const char *compose, fa_compose_service sv[FA_MAX_COMPONENTS],
+                         int *count) {
+    char file[PATH_MAX + 8], err[256];
+    if (with_value(file, sizeof file, "--file", compose) != 0) {
+        fa_log("error", "pack: the path of --compose is too long");
+        return -1;
+    }
     char *json = malloc(COMPOSE_JSON_MAX);
     if (json == NULL) {
         fa_log("error", "pack: out of memory");
-        return NULL;
+        return -1;
     }
-    const char *argv[] = {"compose",  "-f",   compose,          "config",
-                          "--format", "json", "--no-normalize", "--no-path-resolution",
-                          NULL};
-    if (fa_docker_run(argv, json, COMPOSE_JSON_MAX, SHORT_MS) != 0) {
+    const char *argv[] = {
+        "compose", file, "config", "--format", "json", "--no-normalize", "--no-path-resolution",
+        NULL};
+    int rc = fa_docker_run(argv, json, COMPOSE_JSON_MAX, SHORT_MS);
+    if (rc != 0) {
         if (!interrupted)
             fa_log("error", "pack: docker compose cannot read the composition %s", compose);
         free(json);
-        return NULL;
+        return -1;
     }
-    return json;
+    rc = fa_compose_services(json, strlen(json), sv, count, err);
+    free(json);
+    if (rc != 0)
+        fa_log("error", "pack: %s", err);
+    return rc;
 }
 
-/* The ID and architecture of each source image, into the package. */
-static int inspect_images(const services *sv, fa_package *p, services *arch) {
-    for (int i = 0; i < sv->count; i++) {
-        char out[INSPECT_MAX], id[INSPECT_MAX], architecture[INSPECT_MAX];
-        const char *argv[] = {"image",         "inspect", "--format", "{{.Id}} {{.Architecture}}",
-                              sv->s[i].source, NULL};
+/* Each source image: its ID here (to tag exactly the image inspected) and its architecture; and
+ * the new names into the package. */
+static int inspect_images(const fa_compose_service *sv, int count, fa_package *p,
+                          char source_id[][INSPECT_MAX]) {
+    char first[INSPECT_MAX] = "";
+    for (int i = 0; i < count; i++) {
+        char out[INSPECT_MAX], architecture[INSPECT_MAX], extra;
+        const char *argv[] = {"image", "inspect",   "--format", "{{.Id}} {{.Architecture}}",
+                              "--",    sv[i].image, NULL};
         int rc = fa_docker_run(argv, out, sizeof out, SHORT_MS);
         if (interrupted)
             return -1;
@@ -243,38 +147,37 @@ static int inspect_images(const services *sv, fa_package *p, services *arch) {
             fa_log("error",
                    "pack: the image %s of the service %s is not on this machine (pack does not "
                    "pull: pull or build it first)",
-                   sv->s[i].source, sv->s[i].service);
+                   sv[i].image, sv[i].service);
             return -1;
         }
-        char extra;
-        if (sscanf(out, "%511s %511s %c", id, architecture, &extra) != 2 || !fa_package_id_ok(id) ||
+        if (sscanf(out, "%511s %511s %c", source_id[i], architecture, &extra) != 2 ||
+            strncmp(source_id[i], "sha256:", 7) != 0 ||
             strlen(architecture) >= sizeof p->architecture) {
             fa_log("error", "pack: cannot read the ID and architecture of the image %s",
-                   sv->s[i].source);
+                   sv[i].image);
             return -1;
         }
-        snprintf(p->image[i].service, sizeof p->image[i].service, "%s", sv->s[i].service);
-        char tag[FA_PACKAGE_TAG_MAX + 1], image[256];
-        fa_package_tag(p->version, tag);
-        int len =
-            snprintf(image, sizeof image, FA_PACKAGE_REGISTRY "/%s:%s", sv->s[i].service, tag);
-        if (len < 0 || (size_t)len >= sizeof p->image[i].image) {
-            fa_log("error", "pack: the image name of the service %s is too long", sv->s[i].service);
-            return -1;
-        }
-        memcpy(p->image[i].image, image, (size_t)len + 1);
-        memcpy(p->image[i].id, id, strlen(id) + 1); /* checked: 71 bytes */
-        memcpy(arch->s[i].architecture, architecture, strlen(architecture) + 1);
-        if (i > 0 && strcmp(architecture, arch->s[0].architecture) != 0) {
+        if (i == 0) {
+            memcpy(first, architecture, strlen(architecture) + 1);
+        } else if (strcmp(architecture, first) != 0) {
             fa_log("error",
                    "pack: the images are of two architectures: %s (service %s) and %s (service "
                    "%s); a package is for one",
-                   arch->s[0].architecture, sv->s[0].service, architecture, sv->s[i].service);
+                   first, sv[0].service, architecture, sv[i].service);
             return -1;
         }
+        char tag[FA_PACKAGE_TAG_MAX + 1], image[256];
+        fa_package_tag(p->version, tag);
+        int len = snprintf(image, sizeof image, FA_PACKAGE_REGISTRY "/%s:%s", sv[i].service, tag);
+        if (len < 0 || (size_t)len >= sizeof p->image[i].image) {
+            fa_log("error", "pack: the image name of the service %s is too long", sv[i].service);
+            return -1;
+        }
+        memcpy(p->image[i].service, sv[i].service, strlen(sv[i].service) + 1);
+        memcpy(p->image[i].image, image, (size_t)len + 1);
     }
-    p->image_count = sv->count;
-    snprintf(p->architecture, sizeof p->architecture, "%s", arch->s[0].architecture);
+    p->image_count = count;
+    memcpy(p->architecture, first, strlen(first) + 1);
     return 0;
 }
 
@@ -301,33 +204,37 @@ static int write_override(const char *dir, const fa_package *p) {
                                 "  \"%s\":\n    image: \"%s\"\n    pull_policy: never\n"
                                 "    build: !reset null\n",
                                 p->image[i].service, p->image[i].image);
-    if (len >= sizeof text)
+    if (len >= sizeof text || write_file(dir, "override.yml", text) != 0) {
+        fa_log("error", "pack: cannot write the override of the composition in %s", dir);
         return -1;
-    return write_file(dir, "override.yml", text);
+    }
+    return 0;
 }
 
 static int render_composition(const char *dir, const char *compose) {
-    char override[PATH_MAX], rendered[PATH_MAX];
-    if (snprintf(override, sizeof override, "%s/override.yml", dir) >= (int)sizeof override ||
-        snprintf(rendered, sizeof rendered, "%s/docker-compose.yml", dir) >= (int)sizeof rendered)
+    char file[PATH_MAX + 8], override[PATH_MAX + 8], rendered[PATH_MAX + 16];
+    int ok =
+        with_value(file, sizeof file, "--file", compose) == 0 &&
+        snprintf(override, sizeof override, "--file=%s/override.yml", dir) < (int)sizeof override &&
+        snprintf(rendered, sizeof rendered, "--output=%s/docker-compose.yml", dir) <
+            (int)sizeof rendered;
+    const char *argv[] = {
+        "compose", file, override, "config", "--no-normalize", "--no-path-resolution",
+        rendered,  NULL};
+    if (!ok || fa_docker_run(argv, NULL, 0, SHORT_MS) != 0) {
+        if (!interrupted)
+            fa_log("error",
+                   "pack: docker compose cannot render the composition with the new image names");
         return -1;
-    const char *argv[] = {"compose",
-                          "-f",
-                          compose,
-                          "-f",
-                          override,
-                          "config",
-                          "--no-normalize",
-                          "--no-path-resolution",
-                          "-o",
-                          rendered,
-                          NULL};
-    return fa_docker_run(argv, NULL, 0, SHORT_MS) == 0 ? 0 : -1;
+    }
+    return 0;
 }
 
-static int tag_and_save(const char *dir, const fa_package *p) {
+/* Tags the images with their new names and saves them; the ids of the package come from the
+ * manifest of the archive. */
+static int tag_and_save(const char *dir, fa_package *p, char source_id[][INSPECT_MAX]) {
     for (int i = 0; i < p->image_count; i++) {
-        const char *argv[] = {"tag", p->image[i].id, p->image[i].image, NULL};
+        const char *argv[] = {"tag", "--", source_id[i], p->image[i].image, NULL};
         if (fa_docker_run(argv, NULL, 0, SHORT_MS) != 0) {
             if (!interrupted)
                 fa_log("error", "pack: cannot tag the image of the service %s as %s",
@@ -335,10 +242,12 @@ static int tag_and_save(const char *dir, const fa_package *p) {
             return -1;
         }
     }
-    char archive[PATH_MAX];
-    if (snprintf(archive, sizeof archive, "%s/images.tar", dir) >= (int)sizeof archive)
+    char archive[PATH_MAX], output[PATH_MAX + 16], file[PATH_MAX + 16];
+    if (snprintf(archive, sizeof archive, "%s/images.tar", dir) >= (int)sizeof archive ||
+        with_value(output, sizeof output, "--output", archive) != 0 ||
+        with_value(file, sizeof file, "--file", archive) != 0)
         return -1;
-    const char *save[FA_MAX_COMPONENTS + 4] = {"save", "-o", archive};
+    const char *save[FA_MAX_COMPONENTS + 4] = {"save", output, "--"};
     for (int i = 0; i < p->image_count; i++)
         save[3 + i] = p->image[i].image;
     save[3 + p->image_count] = NULL;
@@ -347,6 +256,24 @@ static int tag_and_save(const char *dir, const fa_package *p) {
             fa_log("error", "pack: docker save of the images failed");
         return -1;
     }
+
+    char *manifest = malloc(MANIFEST_MAX), err[256];
+    if (manifest == NULL) {
+        fa_log("error", "pack: out of memory");
+        return -1;
+    }
+    const char *extract[] = {"tar", "--extract", "--to-stdout", file, "--", "manifest.json", NULL};
+    int rc = fa_command_run(extract, manifest, MANIFEST_MAX, SHORT_MS);
+    if (rc != 0) {
+        if (!interrupted)
+            fa_log("error", "pack: cannot read manifest.json in the archive of docker save");
+    } else if ((rc = fa_package_ids_from_manifest(manifest, strlen(manifest), p, err)) != 0) {
+        fa_log("error", "pack: %s", err);
+    }
+    free(manifest);
+    if (rc != 0)
+        return -1;
+
     const char *gzip[] = {"gzip", "-n", "--", archive, NULL};
     if (fa_command_run(gzip, NULL, 0, LONG_MS) != 0) {
         if (!interrupted)
@@ -357,15 +284,14 @@ static int tag_and_save(const char *dir, const fa_package *p) {
 }
 
 static int write_tar(const char *dir) {
-    char archive[PATH_MAX];
-    if (snprintf(archive, sizeof archive, "%s/package.tar", dir) >= (int)sizeof archive)
+    char archive[PATH_MAX + 16], directory[PATH_MAX + 16];
+    if (snprintf(archive, sizeof archive, "--file=%s/package.tar", dir) >= (int)sizeof archive ||
+        with_value(directory, sizeof directory, "--directory", dir) != 0)
         return -1;
     const char *argv[] = {"tar",
                           "--create",
-                          "--file",
                           archive,
-                          "--directory",
-                          dir,
+                          directory,
                           "--owner=0",
                           "--group=0",
                           "--numeric-owner",
@@ -403,37 +329,25 @@ static void remove_folder(const char *dir) {
 
 /* Everything between the temporary folder and the rename of the package to the output. */
 static int build(const options *o, const char *dir) {
-    static services sv, arch;
+    static fa_compose_service sv[FA_MAX_COMPONENTS];
+    static char source_id[FA_MAX_COMPONENTS][INSPECT_MAX];
     static fa_package p;
     char description[8192], renamed[PATH_MAX];
-    memset(&sv, 0, sizeof sv);
-    memset(&arch, 0, sizeof arch);
+    int count = 0;
     memset(&p, 0, sizeof p);
     p.format = FA_PACKAGE_FORMAT;
     snprintf(p.version, sizeof p.version, "%s", o->version);
 
-    char *json = compose_json(o->compose);
-    if (json == NULL)
-        return -1;
-    int rc = read_services(json, strlen(json), &sv);
-    free(json);
-    if (rc != 0 || inspect_images(&sv, &p, &arch) != 0)
+    if (read_services(o->compose, sv, &count) != 0 ||
+        inspect_images(sv, count, &p, source_id) != 0 || write_override(dir, &p) != 0 ||
+        render_composition(dir, o->compose) != 0 || tag_and_save(dir, &p, source_id) != 0)
         return -1;
     if (fa_package_write(&p, description, sizeof description) < 0 ||
-        write_file(dir, "firmline-package.json", description) != 0 ||
-        write_override(dir, &p) != 0) {
+        write_file(dir, "firmline-package.json", description) != 0) {
         fa_log("error", "pack: cannot write the description in %s", dir);
         return -1;
     }
-    if (render_composition(dir, o->compose) != 0) {
-        if (!interrupted)
-            fa_log("error", "pack: docker compose cannot render the composition with the new image "
-                            "names");
-        return -1;
-    }
-    if (tag_and_save(dir, &p) != 0 || write_tar(dir) != 0)
-        return -1;
-    if (interrupted)
+    if (write_tar(dir) != 0 || interrupted)
         return -1;
     if (snprintf(renamed, sizeof renamed, "%s/package.tar", dir) >= (int)sizeof renamed ||
         rename(renamed, o->output) != 0) {
