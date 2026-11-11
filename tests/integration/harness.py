@@ -9,9 +9,9 @@ folder per test; nothing is committed.
 - FakePlatform: HTTPS server on a free port with the device endpoints of the real platform
   (POST /api/v1/provisioning, POST /api/v1/provisioning/renewal, GET /api/v1/ota/downloads/<token>
   with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`,
-  and per download link (cut_after, STATUS_429, STATUS_404, slow; a link answers 404 after its
-  urlExpires, by the fake's clock); certificates() chooses the
-  validity of the certificates it issues, drop_next_renewal_response() loses a renewal answer.
+  and per download link (cut_after, STATUS_429, STATUS_404, STATUS_503, slow; a link answers 404
+  after its urlExpires, by the fake's clock); certificates() chooses the validity of the
+  certificates it issues, drop_next_renewal_response() loses a renewal answer.
   With connect(broker) it signs manifests with the update key, publishes offers (offer, repeat)
   and collects the results of the devices. relay() is a second fake playing a relay.
 - Broker: mosquitto with client certificates required, the certificate CN as the user name, and
@@ -214,7 +214,8 @@ CLOCK_SHIM_SOURCE = Path(__file__).resolve().parent / "clock_shim.c"
 
 def build_clock_shim(directory) -> Path:
     """Compiles clock_shim.c (the dev image has gcc): preloaded into the agent with LD_PRELOAD, its
-    time() runs FIRMLINE_TEST_CLOCK_OFFSET seconds ahead (or behind). See clock_env()."""
+    time() runs FIRMLINE_TEST_CLOCK_OFFSET seconds ahead (or behind), and its
+    clock_gettime(CLOCK_MONOTONIC) ahead by the seconds of a MonotonicClock file. See clock_env()."""
     out = Path(directory) / "clock_shim.so"
     subprocess.run(
         ["gcc", "-shared", "-fPIC", "-O1", "-o", str(out), str(CLOCK_SHIM_SOURCE), "-ldl"],
@@ -224,14 +225,40 @@ def build_clock_shim(directory) -> Path:
     return out
 
 
-def clock_env(shim: Path, offset: datetime.timedelta) -> dict:
-    """The environment of an agent whose wall clock is moved by `offset` (Agent.env)."""
-    return {
+class MonotonicClock:
+    """The monotonic clock of an agent run with clock_env(..., monotonic=this): forward(s) moves
+    it ahead while the agent runs (the shim reads the file again within 100 ms of real time)."""
+
+    def __init__(self, directory):
+        self.path = Path(directory) / "monotonic-offset"
+        self.offset = 0
+        self.path.write_text("0\n")
+
+    def forward(self, seconds: int) -> None:
+        """Moves the clock `seconds` further ahead and waits until the agent can see it."""
+        self.offset += seconds
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(f"{self.offset}\n")
+        os.replace(tmp, self.path)  # never a half-written number
+        time.sleep(0.3)
+
+
+def clock_env(
+    shim: Path,
+    offset: datetime.timedelta = datetime.timedelta(0),
+    monotonic: Optional["MonotonicClock"] = None,
+) -> dict:
+    """The environment of an agent whose wall clock is moved by `offset` and, with `monotonic`,
+    whose monotonic clock follows that MonotonicClock (Agent.env)."""
+    env = {
         "LD_PRELOAD": str(shim),
         "FIRMLINE_TEST_CLOCK_OFFSET": str(int(offset.total_seconds())),
         # the shim comes before the ASan runtime in the library order: allowed for this test
         "ASAN_OPTIONS": "detect_leaks=1:verify_asan_link_order=0",
     }
+    if monotonic is not None:
+        env["FIRMLINE_TEST_MONOTONIC_OFFSET_FILE"] = str(monotonic.path)
+    return env
 
 
 # --------------------------------------------------------------------------------------------
@@ -484,12 +511,14 @@ def cut_after(at: int) -> Cut:
 # Download faults answered instead of the file, one request each.
 STATUS_429 = "status_429"  # 429 too_many_requests
 STATUS_404 = "status_404"  # 404 ota_download_not_found
+STATUS_503 = "status_503"  # 503 service_unavailable (a server error, retried)
 
 
 @dataclasses.dataclass
 class Download:
     content: bytes
-    faults: collections.deque  # one entry per request (Cut, STATUS_429, STATUS_404), then normal
+    # one entry per request (Cut, STATUS_429, STATUS_404, STATUS_503), then normal
+    faults: collections.deque
     slow: Optional[float] = None  # bytes per second of every answer
     # As on the platform, the link answers 404 ota_download_not_found from this moment (by the
     # platform's clock, not the device's); None: never.
@@ -801,7 +830,8 @@ class FakePlatform:
     ) -> str:
         """Serves `content` at a new download link and returns the link. `faults` are answered
         one per request, in order, before the file is served normally: cut_after(n) closes the
-        connection once the file reached n bytes, STATUS_429 and STATUS_404 answer that error.
+        connection once the file reached n bytes, STATUS_429, STATUS_404 and STATUS_503 answer
+        that error.
         `slow` limits every answer to that many bytes per second. From `expires` on (this
         platform's clock) the link answers 404 ota_download_not_found, as an expired link does."""
         token = secrets.token_urlsafe(32)
@@ -1083,6 +1113,8 @@ class FakePlatform:
             return problem(404, "ota_download_not_found")
         if fault == STATUS_429:
             return problem(429, "too_many_requests")
+        if fault == STATUS_503:
+            return problem(503, "service_unavailable")
         content = download.content
         headers = {"Content-Type": "application/octet-stream", "Accept-Ranges": "bytes"}
         match = re.fullmatch(r"bytes=(\d+)-(\d*)", request.headers.get("range", ""))
