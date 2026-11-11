@@ -27,12 +27,13 @@ target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CU
 target_compile_definitions(firmline_agent_lib PUBLIC OPENSSL_API_COMPAT=30000 OPENSSL_NO_DEPRECATED)
 target_compile_options(firmline_agent_lib PRIVATE ${FIRMLINE_WARNINGS})
 
-# The release version, given by the image build (--build-arg VERSION) and printed by --version.
+# The release version, given by the image build (--build-arg VERSION), printed by --version and sent
+# to the platform in the status (sdk) and the User-Agent (linux/src/version.h).
 set(FIRMLINE_AGENT_VERSION "0.0.0-dev" CACHE STRING "Version printed by firmline-agent --version")
+target_compile_definitions(firmline_agent_lib PUBLIC FIRMLINE_AGENT_VERSION="${FIRMLINE_AGENT_VERSION}")
 add_executable(firmline-agent src/main.c src/cmd_register.c src/cmd_run.c src/cmd_status.c
                               src/cmd_endpoint.c)
 target_link_libraries(firmline-agent PRIVATE firmline_agent_lib)
-target_compile_definitions(firmline-agent PRIVATE FIRMLINE_AGENT_VERSION="${FIRMLINE_AGENT_VERSION}")
 target_compile_options(firmline-agent PRIVATE ${FIRMLINE_WARNINGS})
 
 if(FIRMLINE_BUILD_TESTS)

@@ -41,6 +41,20 @@ class RunTest(IntegrationTest):
         self.assertEqual(0, result.code, result.stderr)
         return agent, agent.read_json("device.json")
 
+    SDK_RULE = re.compile(r"^[A-Za-z0-9._-]{1,32}/\S(.*\S)?$")
+
+    def sdk_name_version(self, agent) -> str:
+        """firmline-agent/<version>, the version being what --version prints (0.0.0-dev in the
+        default build), checked against the platform rule for the sdk field."""
+        result = agent.run("--version")
+        self.assertEqual(0, result.code, result.stderr)
+        match = re.fullmatch(r"firmline-agent (\S+)\n", result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        value = "firmline-agent/" + match.group(1)
+        self.assertRegex(value, self.SDK_RULE)
+        self.assertLessEqual(len(value), 64)
+        return value
+
     def secrets_of(self, agent):
         return [agent.read_text("device.key"), agent.read_text("device.pem")]
 
@@ -71,7 +85,8 @@ class RunTest(IntegrationTest):
         message = platform.wait_for(status_topic)[0]
 
         status = message.json()
-        self.assertEqual({"fw", "components", "ts", "uptime"}, set(status))
+        self.assertEqual({"fw", "components", "sdk", "ts", "uptime"}, set(status))
+        self.assertEqual(self.sdk_name_version(agent), status["sdk"])
         self.assertEqual("2.4.1", status["fw"])
         self.assertEqual({"torizon": "7.2.0-build.13"}, status["components"])
         self.assertRegex(status["ts"], UTC_TIME)
@@ -99,6 +114,14 @@ class RunTest(IntegrationTest):
         self.assertEqual(0, agent.stop())
         wait_until(lambda: f"Client {client_id} disconnected." in self.broker.log, 10, "DISCONNECT")
         assert_no_secrets(agent.log, self.secrets_of(agent))
+
+    def test_every_https_request_carries_the_versioned_user_agent(self):
+        agent, _ = self.registered_agent()
+        expected = self.sdk_name_version(agent)
+        requests = list(self.platform.requests)
+        self.assertTrue(requests, "the registration reached the fake platform")
+        for request in requests:
+            self.assertEqual(expected, request.headers.get("user-agent"), request.path)
 
     def test_status_again_after_interval(self):
         agent, identity = self.registered_agent(status_interval=2)

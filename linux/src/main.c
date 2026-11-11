@@ -2,6 +2,7 @@
 #include "commands.h"
 #include "http.h"
 #include "log.h"
+#include "version.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -39,10 +40,6 @@ static void usage(FILE *out) {
           "  --version print the version\n",
           out);
 }
-
-#ifndef FIRMLINE_AGENT_VERSION
-#define FIRMLINE_AGENT_VERSION "0.0.0-dev"
-#endif
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--version") == 0) {

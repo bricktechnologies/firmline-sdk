@@ -19,6 +19,32 @@ static bool text_ok(const char *s) {
     return n >= 1 && n <= FL_TEXT_MAX;
 }
 
+static bool is_space(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+
+/* The sdk of a status: "name/version", at most FL_TEXT_MAX bytes in all; the name is 1..32 of
+ * [A-Za-z0-9._-], the version is valid as fw and neither starts nor ends with a space. */
+static bool sdk_ok(const char *s) {
+    const char *slash;
+    size_t i, name_len, n;
+    if (!text_ok(s))
+        return false;
+    slash = strchr(s, '/');
+    if (slash == NULL)
+        return false;
+    name_len = (size_t)(slash - s);
+    if (name_len < 1 || name_len > 32)
+        return false;
+    for (i = 0; i < name_len; i++) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-'))
+            return false;
+    }
+    slash++;
+    n = strlen(slash);
+    return n >= 1 && strchr(slash, '/') == NULL && !is_space(slash[0]) && !is_space(slash[n - 1]);
+}
+
 static bool is_hex(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
@@ -59,12 +85,12 @@ static int fail(char *out, size_t cap, int err) {
 }
 
 int fl_status_build(char *out, size_t cap, const char *fw, const fl_component_version *components,
-                    size_t n, fl_time ts, int offset_minutes, int64_t uptime) {
+                    size_t n, const char *sdk, fl_time ts, int offset_minutes, int64_t uptime) {
     fl_jw w;
     char iso[26];
     size_t i, j;
     if (out == NULL || (n > 0 && components == NULL) || n > FL_STATUS_MAX_COMPONENTS ||
-        (fw == NULL && n == 0) || (fw != NULL && !text_ok(fw)))
+        (fw == NULL && n == 0) || (fw != NULL && !text_ok(fw)) || (sdk != NULL && !sdk_ok(sdk)))
         return fail(out, cap, FL_ERR_ARG);
     for (i = 0; i < n; i++) {
         if (!text_ok(components[i].code) || !text_ok(components[i].version))
@@ -85,6 +111,8 @@ int fl_status_build(char *out, size_t cap, const char *fw, const fl_component_ve
             fl_jw_string(&w, components[i].code, components[i].version);
         fl_jw_object_end(&w);
     }
+    if (sdk != NULL)
+        fl_jw_string(&w, "sdk", sdk);
     fl_jw_string(&w, "ts", iso);
     if (uptime >= 0)
         fl_jw_int(&w, "uptime", uptime);

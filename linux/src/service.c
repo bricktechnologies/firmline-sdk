@@ -16,6 +16,7 @@
 #include "ota.h"
 #include "renewal.h"
 #include "store.h"
+#include "version.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -491,7 +492,8 @@ static void send_status(fa_service *s) {
     s->nothing_readable = false;
 
     char payload[FL_STATUS_MAX + 1];
-    int len = fl_status_build(payload, sizeof payload, fw, others, n, now, 0, read_uptime());
+    int len = fl_status_build(payload, sizeof payload, fw, others, n, FA_AGENT_NAME_VERSION, now, 0,
+                              read_uptime());
     if (len < 0) {
         fa_log("error", "the status cannot be built (error %d)", len);
         return;
