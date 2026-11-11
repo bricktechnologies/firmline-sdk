@@ -68,10 +68,11 @@ release is published, build it yourself with `docker build -f linux/Dockerfile .
 install script runs inside the container; updating the host or other containers is the subject of
 the Docker and Torizon support, which is planned and not part of this release.
 
-The image contains no configuration: mount the folder with `agent.conf` and the update key at
-`/etc/firmline` (the default path). `run` exits with code 1 on a device that is not registered,
-so a container started with a restart policy before registration restarts in a loop, and
-`docker exec … register` cannot be used. Register first, with a one-off container on the same
+Use a tag: `:1` follows the latest 1.x release, `:X.Y.Z` (for example `:1.0.0`) pins one
+release. There is no `latest` tag. The image contains no configuration: mount the folder with
+`agent.conf` and the update key at `/etc/firmline` (the default path). `run` exits with code 1
+on a device that is not registered, so a container started with a restart policy before
+registration restarts in a loop, and `docker exec … register` cannot be used. Register first, with a one-off container on the same
 volume (the image's entry point is `firmline-agent`, so the command follows the image name); put
 the token file in a folder of its own, mounted writable, because the agent deletes the file:
 
@@ -80,7 +81,7 @@ docker run --rm \
     -v firmline-data:/var/lib/firmline \
     -v /etc/firmline:/etc/firmline:ro \
     -v /run/firmline-token:/run/firmline-token \
-    ghcr.io/bricktechnologies/firmline-agent \
+    ghcr.io/bricktechnologies/firmline-agent:1 \
     register --token-file /run/firmline-token/token --serial SN-000123
 ```
 
@@ -90,7 +91,7 @@ Then start the long-running container, which runs `run` by default:
 docker run -d --name firmline-agent --restart unless-stopped \
     -v firmline-data:/var/lib/firmline \
     -v /etc/firmline:/etc/firmline:ro \
-    ghcr.io/bricktechnologies/firmline-agent
+    ghcr.io/bricktechnologies/firmline-agent:1
 ```
 
 The exit codes and the standard output of `register` are those of "Registration at the end-of-line
@@ -313,18 +314,29 @@ comes back). `firmline-agent status` shows `certificateNotAfter`.
 A device whose certificate has expired cannot renew it: for example a device kept in a store for
 more than two years, or one that never reached the platform in its last 60 days. The log then
 says `the device certificate expired on <date> and cannot be renewed: register the device again
-with a new token` (or, for an identity with missing files, `the identity in <folder> is
-incomplete`). `register` refuses with `already_registered` while `device.json` exists, so:
+with a new token` (or, for an identity with missing or unreadable files, `the identity in
+<folder> is incomplete`). Not for `cannot write device-chain.pem in <folder>`: there the identity
+is whole and only the disk is in the way (full, for example after a renewal, or read-only); free
+space or fix the permissions and restart the agent. `register` refuses with `already_registered`
+while `device.json` exists, so:
 
 1. Stop the agent: `systemctl stop firmline-agent` (or stop its container).
-2. In the data folder, remove the old identity and everything that belongs to it, and nothing
-   else:
+2. In the data folder (your `data_dir`, by default `/var/lib/firmline`), remove the old identity
+   and everything that belongs to it, and nothing else. The `rm` runs only if the `cd` worked:
 
    ```
-   cd /var/lib/firmline
-   rm -f device.json device.key device.pem chain.pem root.pem device-chain.pem register.key \
-         connection.json renewal.json renewal-* \
-         offer-*.json download-* install.json result-*.json
+   cd /var/lib/firmline && rm -f device.json device.key device.pem chain.pem root.pem \
+       device-chain.pem register.key connection.json renewal.json renewal-* \
+       offer-*.json download-* install.json result-*.json
+   ```
+
+   With the container image, on the volume of the agent (the image has `sh`):
+
+   ```
+   docker run --rm --entrypoint sh -v firmline-data:/var/lib/firmline \
+       ghcr.io/bricktechnologies/firmline-agent:1 -c 'cd /var/lib/firmline && rm -f \
+       device.json device.key device.pem chain.pem root.pem device-chain.pem register.key \
+       connection.json renewal.json renewal-* offer-*.json download-* install.json result-*.json'
    ```
 
    These are the identity that `register` checks and writes, the renewal state of the old
