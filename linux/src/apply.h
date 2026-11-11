@@ -6,7 +6,8 @@
  *  1. the tar holds exactly firmline-package.json, docker-compose.yml and images.tar.gz; the
  *     description is a valid package (package.h) of the release's version and of the daemon's
  *     architecture (`docker version`); the composition, as Compose reads it, has exactly the
- *     services and images of the description;
+ *     services and images of the description; images.tar.gz, extracted into the working folder,
+ *     has in its manifest.json every image of the description, with its name and ID;
  *  2. the agent service: when the package has no <agent_service> and the composition in use
  *     (compose_file) has one, that service is added to the new composition as Compose renders it
  *     (`config <agent_service>`: its definition with the named volumes and networks it uses), so
@@ -16,25 +17,27 @@
  *  3. the new composition, rendered by Compose with -p <project> and the folder of compose_file as
  *     the project folder, is written next to compose_file as <compose_file>.new, and compose_file
  *     is copied to <data_dir>/compose-previous.yml;
- *  4. `docker compose -p <project> -f <compose_file>.new up --detach --remove-orphans
- *     --pull=never`;
+ *  4. the restart counts of the project's containers are noted, then `docker compose -p <project>
+ *     -f <compose_file>.new up --detach --remove-orphans --pull=never`;
  *  5. every 2 s for health_timeout seconds each service has its containers, each `running` and
- *     never restarted; with a healthcheck `unhealthy` fails at once and anything but `healthy` at
- *     the end fails;
- *  6. success: <compose_file>.new replaces compose_file, package.json in the data folder is the
- *     description, and the images of the previous package (its package.json) that the new one
- *     does not use lose their names and, when they have no other name, are removed;
+ *     not restarted since step 4 (a container kept by up keeps its count of before); with a
+ *     healthcheck `unhealthy` fails at once and anything but `healthy` at the end fails;
+ *  6. success: <compose_file>.new replaces compose_file and package.json in the data folder is the
+ *     description;
  *  7. failure: a name of the package that named another image before the load (one tag for two
- *     versions, 1.0+a and 1.0_a) names it again, and after step 4 compose_file (never changed)
- *     is started again the same way.
- * Up to step 3 nothing of the running application is touched. The working files are in
- * <data_dir>/apply.tmp, removed at the end with compose-previous.yml and a .new left by a
- * failure. Values from the package or the composition reach docker and tar only after `--` or as
- * `--option=value`. */
+ *     versions, 1.0+a and 1.0_a) names it again, compose_file is the previous composition (written
+ *     back when step 6 had replaced it), and after step 4 it is started again the same way.
+ * Up to the load in step 2 nothing on the device changes but the working folder. The working
+ * files are in <data_dir>/apply.tmp, removed at the end with compose-previous.yml and a .new left
+ * by a failure. Values from the package or the composition reach docker and tar only after `--`
+ * or as `--option=value`. */
 #ifndef FIRMLINE_AGENT_APPLY_H
 #define FIRMLINE_AGENT_APPLY_H
 
 #include "config.h"
+#include "package.h"
+
+#include <stdbool.h>
 
 typedef enum {
     FA_APPLY_INSTALLED,
@@ -48,10 +51,25 @@ typedef enum {
 #define FA_APPLY_WORK "apply.tmp"
 #define FA_APPLY_PACKAGE "package.json"
 
+/* The package installed before (package.json, when it could be read) and the one installed. */
+typedef struct {
+    fa_package previous, installed;
+    bool have_previous;
+} fa_apply_packages;
+
 /* Installs the package of `release` for comp (install = docker-compose), whose version must be
- * `version` (the release's). On FA_APPLY_INSTALLED, installed is the version of the package; the
- * reason of a failure is logged as one error line. */
+ * `version` (the release's). On FA_APPLY_INSTALLED, packages holds the two packages (the version
+ * installed is packages->installed.version); the reason of a failure is logged as one error line.
+ */
 fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp,
-                                  const char *release, const char *version, char installed[65]);
+                                  const char *release, const char *version,
+                                  fa_apply_packages *packages);
+
+/* After a success, once the outcome is written (a power loss here loses no result): the images of
+ * the previous package that the installed one does not use lose their names of that package
+ * (docker removes an image with its last name), and an image of it left with no name at all (its
+ * name now names an image of the installed package) is removed. Never another image or name; a
+ * removal that fails is logged. */
+void fa_apply_remove_previous_images(const fa_apply_packages *packages);
 
 #endif

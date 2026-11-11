@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 
 from docker_host import docker_host
-from harness import AGENT_BINARY, SANITIZER_MARKERS
+from harness import AGENT_BINARY, SANITIZER_MARKERS, wait_until
 
 PROJECT = "torizon"
 RELEASE = "0b6f1c2e-3d4a-4b5c-8d9e-0f1a2b3c4d5e"
@@ -150,11 +150,12 @@ class ApplyTest(unittest.TestCase):
         (self.data / "install.json").write_text(json.dumps(
             {"release": release, "component": "app", "version": version, "state": "apply"}))
 
-    def apply(self, release: str = RELEASE, timeout: float = 300) -> subprocess.CompletedProcess:
+    def apply(self, release: str = RELEASE, timeout: float = 300,
+              env=None) -> subprocess.CompletedProcess:
         self.write_config()
         result = subprocess.run(
             [AGENT_BINARY, "apply", "--release", release, "--config", str(self.config_path)],
-            env=self.docker.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            env=env or self.docker.env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=timeout,
         )
         for marker in SANITIZER_MARKERS:
@@ -274,8 +275,10 @@ class ApplyTest(unittest.TestCase):
         self.assert_nothing_left()
 
     def test_a_missing_image_is_refused_without_touching_the_application(self):
-        """The description and the composition name web and db; images.tar.gz has only web."""
-        self.docker.app_image("example/old:1", "stay")
+        """The description and the composition name web and db; images.tar.gz has only web. It
+        is refused before docker load: no image is loaded, and a name the package uses keeps
+        the image it names."""
+        old = self.docker.app_image("example/old:1", "stay")
         web = self.docker.app_image("example/web:2", "stay")
         db = self.docker.app_image("example/db:2", "stay")
         two = self.package("2.0.0", {"web": "example/web:2", "db": "example/db:2"}, "two")
@@ -283,6 +286,7 @@ class ApplyTest(unittest.TestCase):
         missing = self.rebuild(two, "missing.tar",
                                {"images.tar.gz": self.members(one)["images.tar.gz"]})
         self.forget(web, db)
+        self.docker.run("tag", old, "firmline.local/web:2.0.0")
         before = self.start_current(OLD)
         self.install(missing, "2.0.0")
 
@@ -291,6 +295,8 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("firmline.local/db:2.0.0", result.stderr)
         self.assert_untouched(before, OLD)
         self.assert_nothing_left()
+        self.assertFalse(self.exists(web))  # not loaded
+        self.assertEqual(old, self.image_id("firmline.local/web:2.0.0"))  # not moved
 
     def test_no_image_is_pulled(self):
         self.docker.app_image("example/old:1", "stay")
@@ -348,6 +354,60 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(f"{PROJECT}_firmline-data", composition["volumes"]["firmline-data"]["name"])
         self.assert_nothing_left()
 
+    def test_a_kept_container_that_restarted_before_apply_passes(self):
+        """The agent's container is kept as it is, with its restart count: only a restart during
+        the check fails it. This one restarted once (its restart policy) before apply."""
+        self.docker.app_image("example/old:1", "stay")
+        self.docker.app_image("example/agent:1", "stay")
+        web = self.docker.app_image("example/web:2", "stay")
+        package = self.package("2.0.0", {"web": "example/web:2"})
+        self.forget(web)
+        current = (
+            "services:\n"
+            "  firmline-agent:\n"
+            "    image: example/agent:1\n"
+            "    restart: on-failure\n"
+            "    command: [\"sh\", \"-c\", \"[ -f /var/lib/firmline/once ] && exec sleep 3600;"
+            " touch /var/lib/firmline/once; exit 1\"]\n"
+            "    volumes:\n"
+            "      - firmline-data:/var/lib/firmline\n"
+            "  app:\n"
+            "    image: example/old:1\n"
+            "volumes:\n"
+            "  firmline-data: {}\n"
+        )
+        agent = self.start_current(current)["firmline-agent"][0]
+        wait_until(
+            lambda: self.docker.run(
+                "inspect", "--format", "{{.RestartCount}} {{.State.Status}}", agent
+            ).stdout.split() == ["1", "running"],
+            timeout=30, what="the agent stand-in restarting once")
+        before = self.containers()
+        self.install(package, "2.0.0")
+
+        result = self.apply()
+        self.assert_outcome(result, "installed", None, "2.0.0")
+        self.assertEqual(before["firmline-agent"], self.containers()["firmline-agent"])
+
+    def test_a_failure_after_the_new_composition_is_in_place_puts_the_previous_back(self):
+        """package.json cannot be written (a folder is in its place) after the new composition
+        has replaced compose_file: compose_file is the previous composition again, and runs."""
+        old = self.docker.app_image("example/old:1", "stay")
+        web = self.docker.app_image("example/web:2", "stay")
+        package = self.package("2.0.0", {"web": "example/web:2"})
+        self.forget(web)
+        self.start_current(OLD)
+        (self.data / "package.json").mkdir()
+        self.install(package, "2.0.0")
+
+        result = self.apply()
+        self.assert_outcome(result, "failed", "install_failed", INITIAL_VERSION)
+        self.assertEqual(OLD, self.compose_file.read_text())
+        running = self.containers()
+        self.assertEqual({"app"}, set(running))
+        self.assertEqual(("running", old), running["app"][1:])
+        self.assert_nothing_left()
+
     def test_only_the_images_of_the_previous_package_are_removed(self):
         """RF 3: after 1.0.0 (web 1, db) comes 2.0.0 (web 2, the same db): web 1 goes, db and
         web 2 stay, and so do the images that were never in a package."""
@@ -364,9 +424,25 @@ class ApplyTest(unittest.TestCase):
         self.assert_outcome(self.apply(), "installed", None, "1.0.0")
         self.assertTrue(self.exists(old))  # the composition before any package: not pruned
         self.install(second, "2.0.0", release=RELEASE_2)
+        # A docker in front of the real one notes apply.json at each image removal: the outcome
+        # is written before the removals, so a power loss during them loses no result.
+        wrapper = self.folder / "bin"
+        wrapper.mkdir()
+        noted = self.folder / "apply-at-removal"
+        (wrapper / "docker").write_text(
+            "#!/bin/sh\n"
+            f'if [ "$1" = image ] && [ "$2" = rm ]; then cat "{self.data}/apply.json" >> "{noted}";'
+            f' echo >> "{noted}"; fi\n'
+            f'exec {shutil.which("docker")} "$@"\n'
+        )
+        (wrapper / "docker").chmod(0o755)
+        env = dict(self.docker.env, PATH=f"{wrapper}:{os.environ['PATH']}")
 
-        result = self.apply(release=RELEASE_2)
+        result = self.apply(release=RELEASE_2, env=env)
         self.assert_outcome(result, "installed", None, "2.0.0", release=RELEASE_2)
+        states = [json.loads(line)["state"] for line in noted.read_text().splitlines() if line]
+        self.assertTrue(states)
+        self.assertEqual({"installed"}, set(states))
         self.assertFalse(self.exists(web1), result.stderr)
         self.assertFalse(self.exists("firmline.local/web:1.0.0"))
         self.assertEqual(db, self.image_id("firmline.local/db:2.0.0"))

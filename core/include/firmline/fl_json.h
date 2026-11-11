@@ -96,6 +96,8 @@ void fl_jw_begin(fl_jw *w, char *out, size_t cap);
 /* Escapes " and \ and control characters (below 0x20) as \uXXXX. */
 void fl_jw_string(fl_jw *w, const char *key, const char *value);
 void fl_jw_int(fl_jw *w, const char *key, int64_t value);
+/* "key":null */
+void fl_jw_null(fl_jw *w, const char *key);
 void fl_jw_object_begin(fl_jw *w, const char *key);
 void fl_jw_object_end(fl_jw *w);
 /* Closes the root object. The length of the text (without the NUL), or the first error:

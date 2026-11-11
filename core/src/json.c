@@ -558,6 +558,11 @@ void fl_jw_string(fl_jw *w, const char *key, const char *value) {
     jw_quoted(w, value);
 }
 
+void fl_jw_null(fl_jw *w, const char *key) {
+    jw_key(w, key);
+    jw_text(w, "null");
+}
+
 void fl_jw_int(fl_jw *w, const char *key, int64_t value) {
     char digits[21];
     int n = 0;

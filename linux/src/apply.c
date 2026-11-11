@@ -28,10 +28,12 @@
 #define MAX_SERVICES 64          /* of the new composition: the package's and the agent's */
 #define OPTION_MAX (PATH_MAX + 32)
 #define AGENT_FILE "agent-service.json"
-/* One line per container: service, state, restarts, health ("none" without a healthcheck). */
+#define MANIFEST_MAX (256 * 1024) /* manifest.json of docker save; larger is refused */
+#define MAX_KEPT 64               /* containers of the project before up */
+/* One line per container: ID, service, state, restarts, health ("none" without a healthcheck). */
 #define CONTAINER_FORMAT                                                                           \
-    "{{index .Config.Labels \"com.docker.compose.service\"}} {{.State.Status}} {{.RestartCount}} " \
-    "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
+    "{{.ID}} {{index .Config.Labels \"com.docker.compose.service\"}} {{.State.Status}} "           \
+    "{{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
 
 static const char *const MEMBERS[] = {"firmline-package.json", "docker-compose.yml",
                                       "images.tar.gz"};
@@ -57,6 +59,14 @@ typedef struct {
     bool loaded;
     char *saved; /* compose_file as it was */
     size_t saved_len;
+    bool replacing; /* finish() has started to put the new composition in place */
+    /* The project's containers before up and their restart counts: a container that up keeps
+     * (the agent's, say) fails the check only if it restarts again. */
+    struct {
+        char id[72];
+        int restarts;
+    } kept[MAX_KEPT];
+    int kept_count;
 } job;
 
 static int fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -366,22 +376,47 @@ static int keep_agent_service(job *j) {
     return rc;
 }
 
-static int load_images(job *j) {
-    char directory[OPTION_MAX], path[PATH_MAX], input[OPTION_MAX];
+/* images.tar.gz into the working folder, and its manifest.json against the description: every
+ * image of the package is there, with its name and ID, before anything is loaded. */
+static int check_archive(job *j) {
+    char directory[OPTION_MAX], path[PATH_MAX], file[OPTION_MAX], err[256];
     struct stat st;
     if (with_value(directory, sizeof directory, "--directory", j->work) != 0 ||
         join(path, sizeof path, j->work, MEMBERS[2]) != 0 ||
-        with_value(input, sizeof input, "--input", path) != 0)
+        with_value(file, sizeof file, "--file", path) != 0)
         return fail("a path is too long");
     const char *extract[] = {"tar", "--extract", j->bin, directory, "--", MEMBERS[2], NULL};
-    if (fa_command_run(extract, NULL, 0, LONG_MS) != 0) {
-        unlink(path);
+    if (fa_command_run(extract, NULL, 0, LONG_MS) != 0)
         return fail("cannot extract images.tar.gz from the package (is there room on the disk?)");
-    }
-    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        unlink(path);
+    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode))
         return fail("images.tar.gz of the package is not a file");
-    }
+    char *manifest = malloc(MANIFEST_MAX);
+    if (manifest == NULL)
+        return fail("out of memory");
+    const char *list[] = {"tar", "--extract", "--to-stdout",   "--gzip",
+                          file,  "--",        "manifest.json", NULL};
+    fa_package found = j->pkg;
+    int rc = fa_command_run(list, manifest, MANIFEST_MAX, LONG_MS);
+    if (rc != 0)
+        fail("cannot read manifest.json in images.tar.gz of the package (a damaged archive?)");
+    else if ((rc = fa_package_ids_from_manifest(manifest, strlen(manifest), &found, err)) != 0)
+        fail("images.tar.gz of the package: %s", err);
+    free(manifest);
+    if (rc != 0)
+        return -1;
+    for (int i = 0; i < j->pkg.image_count; i++)
+        if (strcmp(found.image[i].id, j->pkg.image[i].id) != 0)
+            return fail("images.tar.gz of the package holds %s with the ID %s, not %s as in the "
+                        "description",
+                        j->pkg.image[i].image, found.image[i].id, j->pkg.image[i].id);
+    return 0;
+}
+
+static int load_images(job *j) {
+    char path[PATH_MAX], input[OPTION_MAX];
+    if (join(path, sizeof path, j->work, MEMBERS[2]) != 0 ||
+        with_value(input, sizeof input, "--input", path) != 0)
+        return fail("a path is too long");
     for (int i = 0; i < j->pkg.image_count; i++)
         if (image_id(j->pkg.image[i].image, j->before[i]) != 0)
             j->before[i][0] = '\0';
@@ -477,6 +512,48 @@ static void start_previous(job *j) {
                j->comp->compose_file);
 }
 
+/* The restart counts of the project's containers before up (none at all is no error). */
+static int note_restarts(job *j) {
+    char filter[160], ids[LIST_MAX], out[LIST_MAX];
+    int len = snprintf(filter, sizeof filter, "--filter=label=com.docker.compose.project=%s",
+                       j->comp->project);
+    if (len < 0 || (size_t)len >= sizeof filter)
+        return fail("a name is too long");
+    const char *ls[] = {"container", "ls", "--all", "--quiet", "--no-trunc", filter, NULL};
+    if (fa_docker_run(ls, ids, sizeof ids, SHORT_MS) != 0)
+        return fail("cannot list the containers of the project %s", j->comp->project);
+    const char *inspect[FA_COMMAND_MAX_ARGS] = {"container", "inspect", "--format",
+                                                "{{.ID}} {{.RestartCount}}", "--"};
+    int n = 5;
+    char *cursor = ids, *line;
+    while ((line = next_line(&cursor)) != NULL) {
+        if (n >= FA_COMMAND_MAX_ARGS - 2 || n - 5 >= MAX_KEPT)
+            return fail("the project %s has more than %d containers", j->comp->project, n - 5);
+        inspect[n++] = line;
+    }
+    inspect[n] = NULL;
+    if (n == 5)
+        return 0;
+    if (fa_docker_run(inspect, out, sizeof out, SHORT_MS) != 0)
+        return fail("cannot read the containers of the project %s", j->comp->project);
+    cursor = out;
+    while ((line = next_line(&cursor)) != NULL && j->kept_count < MAX_KEPT) {
+        if (sscanf(line, "%71s %d", j->kept[j->kept_count].id, &j->kept[j->kept_count].restarts) !=
+            2)
+            return fail("cannot read the restart count of a container: %.80s", line);
+        j->kept_count++;
+    }
+    return 0;
+}
+
+/* The restart count of a container before up: 0 for a container up made. */
+static int restarts_before(const job *j, const char *id) {
+    for (int i = 0; i < j->kept_count; i++)
+        if (strcmp(j->kept[i].id, id) == 0)
+            return j->kept[i].restarts;
+    return 0;
+}
+
 typedef enum { HEALTH_OK, HEALTH_WAIT, HEALTH_FAILED } health;
 
 typedef struct {
@@ -517,9 +594,9 @@ static health look(job *j, const char *file, const service_list *sv, char waitin
     health result = HEALTH_OK;
     cursor = out;
     while ((line = next_line(&cursor)) != NULL) {
-        char service[66], state[32], status[32];
+        char id[72], service[66], state[32], status[32];
         int restarts = 0;
-        if (sscanf(line, "%65s %31s %d %31s", service, state, &restarts, status) != 4) {
+        if (sscanf(line, "%71s %65s %31s %d %31s", id, service, state, &restarts, status) != 5) {
             fail("cannot read the state of a container: %.80s", line);
             return HEALTH_FAILED;
         }
@@ -533,8 +610,9 @@ static health look(job *j, const char *file, const service_list *sv, char waitin
             fail("the container of the service %s is %s", service, state);
             return HEALTH_FAILED;
         }
-        if (restarts > 0) {
-            fail("the container of the service %s restarted %d times", service, restarts);
+        int before = restarts_before(j, id);
+        if (restarts > before) {
+            fail("the container of the service %s restarted %d times", service, restarts - before);
             return HEALTH_FAILED;
         }
         if (strcmp(status, "unhealthy") == 0) {
@@ -592,53 +670,12 @@ static fa_apply_outcome health_check(job *j) {
 
 /* ---- step 6: success --------------------------------------------------------------------- */
 
-static bool new_uses_name(const job *j, const char *image) {
-    for (int i = 0; i < j->pkg.image_count; i++)
-        if (strcmp(j->pkg.image[i].image, image) == 0)
-            return true;
-    return false;
-}
-
-static bool new_uses_id(const job *j, const char *id) {
-    for (int i = 0; i < j->pkg.image_count; i++)
-        if (strcmp(j->pkg.image[i].id, id) == 0)
-            return true;
-    return false;
-}
-
-static void remove_image(const char *reference) {
-    const char *argv[] = {"image", "rm", "--", reference, NULL};
-    if (fa_docker_run(argv, NULL, 0, SHORT_MS) != 0)
-        fa_log("warning", "apply: cannot remove the image %s", reference);
-}
-
-/* The images of the previous package that the new one does not use: their names of that package
- * go (docker removes an image with its last name), and an image of it left with no name at all
- * (its name now names an image of the new package) goes too. Never another image or name. */
-static void remove_previous_images(const job *j) {
-    if (!j->have_previous)
-        return;
-    for (int i = 0; i < j->previous.image_count; i++) {
-        const char *image = j->previous.image[i].image, *old = j->previous.image[i].id;
-        char id[128];
-        if (!new_uses_name(j, image) && image_id(image, id) == 0 && strcmp(id, old) == 0)
-            remove_image(image);
-        if (new_uses_id(j, old))
-            continue;
-        const char *argv[] = {"image", "inspect", "--format", "{{len .RepoTags}}", "--", old, NULL};
-        char tags[32];
-        if (fa_docker_run(argv, tags, sizeof tags, SHORT_MS) != 0)
-            continue; /* gone with its last name */
-        trim_end(tags);
-        if (strcmp(tags, "0") == 0)
-            remove_image(old);
-    }
-}
-
-/* The new composition in place of compose_file and the description in package.json; on a
- * failure compose_file is the previous composition again (the caller starts it). */
+/* The new composition in place of compose_file and the description in package.json. A failure
+ * here may come after compose_file was replaced (the rename done, the folder's fsync failed):
+ * the caller writes the previous composition back. */
 static fa_apply_outcome finish(job *j) {
     char description[8192];
+    j->replacing = true;
     if (fa_store_rename(j->dir, j->new_name, j->name) != 0) {
         fail("cannot put %s in place of %s (%s)", j->new_path, j->comp->compose_file,
              strerror(errno));
@@ -650,29 +687,27 @@ static fa_apply_outcome finish(job *j) {
         fa_store_write(j->cfg->data_dir, FA_APPLY_PACKAGE, description, (size_t)n, 0644) != 0) {
         fail("cannot write %s/%s: the previous composition goes back", j->cfg->data_dir,
              FA_APPLY_PACKAGE);
-        if (fa_store_write(j->dir, j->name, j->saved, j->saved_len, 0644) != 0)
-            fa_log("error", "apply: cannot write %s back", j->comp->compose_file);
         return FA_APPLY_INSTALL_FAILED;
     }
-    remove_previous_images(j);
     fa_log("info", "apply: version %s installed", j->pkg.version);
     return FA_APPLY_INSTALLED;
 }
 
 fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp,
-                                  const char *release, const char *version, char installed[65]) {
+                                  const char *release, const char *version,
+                                  fa_apply_packages *packages) {
     job *j = calloc(1, sizeof *j);
     fa_apply_outcome outcome = FA_APPLY_INSTALL_FAILED;
-    installed[0] = '\0';
+    memset(packages, 0, sizeof *packages);
     if (j == NULL) {
         fail("out of memory");
         return outcome;
     }
     bool started = false;
     if (setup(j, cfg, comp, release) == 0 && check_members(j) == 0 &&
-        read_description(j, version) == 0 && check_composition(j) == 0 &&
+        read_description(j, version) == 0 && check_composition(j) == 0 && check_archive(j) == 0 &&
         keep_agent_service(j) == 0 && load_images(j) == 0 && write_new_composition(j) == 0 &&
-        save_previous(j) == 0) {
+        save_previous(j) == 0 && note_restarts(j) == 0) {
         fa_log("info", "apply: starting the composition of version %s", j->pkg.version);
         started = true;
         if (compose_up(j, j->new_path) != 0)
@@ -681,9 +716,14 @@ fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp
             outcome = finish(j);
     }
     if (outcome == FA_APPLY_INSTALLED) {
-        memcpy(installed, j->pkg.version, sizeof j->pkg.version);
+        packages->previous = j->previous;
+        packages->installed = j->pkg;
+        packages->have_previous = j->have_previous;
     } else {
         give_back_names(j);
+        if (j->replacing && fa_store_write(j->dir, j->name, j->saved, j->saved_len, 0644) != 0)
+            fa_log("error", "apply: cannot write the previous composition back to %s",
+                   j->comp->compose_file);
         if (started)
             start_previous(j);
     }
@@ -696,4 +736,47 @@ fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp
     free(j->saved);
     free(j);
     return outcome;
+}
+
+/* ---- after the outcome: the images of the previous package ------------------------------- */
+
+static bool uses_name(const fa_package *p, const char *image) {
+    for (int i = 0; i < p->image_count; i++)
+        if (strcmp(p->image[i].image, image) == 0)
+            return true;
+    return false;
+}
+
+static bool uses_id(const fa_package *p, const char *id) {
+    for (int i = 0; i < p->image_count; i++)
+        if (strcmp(p->image[i].id, id) == 0)
+            return true;
+    return false;
+}
+
+static void remove_image(const char *reference) {
+    const char *argv[] = {"image", "rm", "--", reference, NULL};
+    if (fa_docker_run(argv, NULL, 0, SHORT_MS) != 0)
+        fa_log("warning", "apply: cannot remove the image %s", reference);
+}
+
+void fa_apply_remove_previous_images(const fa_apply_packages *packages) {
+    const fa_package *previous = &packages->previous, *now = &packages->installed;
+    if (!packages->have_previous)
+        return;
+    for (int i = 0; i < previous->image_count; i++) {
+        const char *image = previous->image[i].image, *old = previous->image[i].id;
+        char id[128];
+        if (!uses_name(now, image) && image_id(image, id) == 0 && strcmp(id, old) == 0)
+            remove_image(image);
+        if (uses_id(now, old))
+            continue;
+        const char *argv[] = {"image", "inspect", "--format", "{{len .RepoTags}}", "--", old, NULL};
+        char tags[32];
+        if (fa_docker_run(argv, tags, sizeof tags, SHORT_MS) != 0)
+            continue; /* gone with its last name */
+        trim_end(tags);
+        if (strcmp(tags, "0") == 0)
+            remove_image(old);
+    }
 }

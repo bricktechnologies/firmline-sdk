@@ -73,60 +73,25 @@ static bool release_ok(const char *r) {
     return true;
 }
 
-/* Appends to a NUL-terminated text; after the first overflow nothing more is written. */
-typedef struct {
-    char *out;
-    size_t cap, len;
-    bool ok;
-} text;
-
-static void put(text *t, const char *s, size_t n) {
-    if (!t->ok || n >= t->cap - t->len) {
-        t->ok = false;
-        return;
-    }
-    memcpy(t->out + t->len, s, n);
-    t->len += n;
-    t->out[t->len] = '\0';
-}
-
-/* A JSON string (", \ and control characters escaped), or null for NULL. */
-static void put_value(text *t, const char *s) {
-    if (s == NULL) {
-        put(t, "null", 4);
-        return;
-    }
-    put(t, "\"", 1);
-    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
-        char esc[8];
-        if (*p == '"' || *p == '\\') {
-            esc[0] = '\\';
-            esc[1] = (char)*p;
-            put(t, esc, 2);
-        } else if (*p < 0x20) {
-            snprintf(esc, sizeof esc, "\\u%04x", *p);
-            put(t, esc, 6);
-        } else {
-            put(t, (const char *)p, 1);
-        }
-    }
-    put(t, "\"", 1);
+/* A string member, or null for NULL. */
+static void member(fl_jw *w, const char *key, const char *value) {
+    if (value != NULL)
+        fl_jw_string(w, key, value);
+    else
+        fl_jw_null(w, key);
 }
 
 static int write_state(const fa_config *cfg, const char *release, const char *state,
                        const char *detail, const char *version) {
     char json[1024];
-    text t = {json, sizeof json, 0, true};
-    put(&t, "{\"release\":", 11);
-    put_value(&t, release);
-    put(&t, ",\"state\":", 9);
-    put_value(&t, state);
-    put(&t, ",\"detail\":", 10);
-    put_value(&t, detail);
-    put(&t, ",\"version\":", 11);
-    put_value(&t, version);
-    put(&t, "}", 1);
-    if (!t.ok || fa_store_write(cfg->data_dir, FA_APPLY_STATE, json, t.len, 0644) != 0) {
+    fl_jw w;
+    fl_jw_begin(&w, json, sizeof json);
+    fl_jw_string(&w, "release", release);
+    fl_jw_string(&w, "state", state);
+    member(&w, "detail", detail);
+    member(&w, "version", version);
+    int n = fl_jw_end(&w);
+    if (n < 0 || fa_store_write(cfg->data_dir, FA_APPLY_STATE, json, (size_t)n, 0644) != 0) {
         fa_log("error", "apply: cannot write %s/%s", cfg->data_dir, FA_APPLY_STATE);
         return -1;
     }
@@ -200,15 +165,21 @@ int fa_cmd_apply(int argc, char **argv) {
         if (cfg.component[i].install == FA_INSTALL_DOCKER_COMPOSE)
             comp = &cfg.component[i];
 
-    char current[65], version[65], installed[65];
+    char current[65], version[65];
+    static fa_apply_packages packages;
     bool known = comp != NULL && fa_component_version(&cfg, comp, current) == 0;
     if (write_state(&cfg, release, "running", NULL, known ? current : NULL) != 0)
         return 1;
     fa_apply_outcome outcome = FA_APPLY_INSTALL_FAILED;
     if (read_install_state(&cfg, comp, release, version) == 0)
-        outcome = fa_apply_install(&cfg, comp, release, version, installed);
-    if (outcome == FA_APPLY_INSTALLED)
-        return write_state(&cfg, release, "installed", NULL, installed) == 0 ? 0 : 1;
+        outcome = fa_apply_install(&cfg, comp, release, version, &packages);
+    if (outcome == FA_APPLY_INSTALLED) {
+        /* The outcome first: the images go after it, so a power loss among them loses no
+         * result. */
+        int rc = write_state(&cfg, release, "installed", NULL, packages.installed.version);
+        fa_apply_remove_previous_images(&packages);
+        return rc == 0 ? 0 : 1;
+    }
 
     known = comp != NULL && fa_component_version(&cfg, comp, current) == 0;
     const char *detail =

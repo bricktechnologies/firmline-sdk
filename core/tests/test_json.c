@@ -287,15 +287,20 @@ static void json_writer_writes_and_escapes(void) {
     fl_jw_string(&w, "a", "1");
     fl_jw_object_end(&w);
     fl_jw_int(&w, "z", 0);
+    fl_jw_null(&w, "none");
     len = fl_jw_end(&w);
     CHECK_EQ_STR(out,
                  "{\"fw\":\"1.0\\\"\\\\\\u000a\\u0001\",\"uptime\":42,\"neg\":-9223372036854775808,"
-                 "\"components\":{\"a\":\"1\"},\"z\":0}");
+                 "\"components\":{\"a\":\"1\"},\"z\":0,\"none\":null}");
     CHECK_EQ_INT(len, strlen(out));
 
     fl_jw_begin(&w, out, sizeof out);
     CHECK_EQ_INT(fl_jw_end(&w), 2);
     CHECK_EQ_STR(out, "{}");
+
+    fl_jw_begin(&w, out, sizeof out);
+    fl_jw_null(&w, NULL);
+    CHECK_EQ_INT(fl_jw_end(&w), FL_ERR_ARG);
 }
 
 static void json_writer_escapes_and_never_cuts(void) {
