@@ -42,6 +42,24 @@ scripts/check.sh
 It builds the development image, checks the formatting, builds with the sanitizers, and runs the
 unit and integration tests. The agent image is built from `linux/Dockerfile`.
 
+## Official sources and support
+
+The official sources of the SDK are:
+
+- this repository, https://github.com/bricktechnologies/firmline-sdk, and its releases (each with
+  the CycloneDX SBOMs of the image and of the source);
+- the container image `ghcr.io/bricktechnologies/firmline-agent`, published from this repository by
+  its release workflow (`:X.Y.Z` for one release, `:X` for the latest release of a major version).
+
+Brkt supports these builds only. You may adapt the code under the licence, but a modified copy is
+your responsibility: test it against the platform yourself, and keep it close to the official
+releases so that changes of the device contract reach your devices.
+
+Vulnerabilities are reported privately, as [SECURITY.md](SECURITY.md) says.
+
+«Firmline» is a name of Brkt: the Apache-2.0 licence does not grant permission to use trade names
+or trademarks (section 6), so a modified copy must not be presented as the official Firmline SDK.
+
 ## Licence
 
 Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
