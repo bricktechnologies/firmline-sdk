@@ -11,9 +11,11 @@ typedef enum {
     FA_VERSION_FIXED,
     FA_VERSION_OS_RELEASE,
     FA_VERSION_FILE,
-    FA_VERSION_COMMAND
+    FA_VERSION_COMMAND,
+    FA_VERSION_PACKAGE /* version of the last package installed (data_dir/package.json), else
+                          source_arg */
 } fa_version_source;
-typedef enum { FA_INSTALL_SCRIPT, FA_INSTALL_NONE } fa_install;
+typedef enum { FA_INSTALL_SCRIPT, FA_INSTALL_NONE, FA_INSTALL_DOCKER_COMPOSE } fa_install;
 
 #define FA_MAX_COMPONENTS 16
 
@@ -25,6 +27,11 @@ typedef struct {
     fa_install install;
     char script[256];
     int timeout_s;
+    /* install = docker-compose only */
+    char compose_file[256];
+    char project[65];
+    char agent_service[65];
+    int health_timeout_s;
 } fa_component;
 
 typedef struct {

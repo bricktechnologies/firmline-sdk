@@ -141,11 +141,16 @@ up to 16 components, and exactly one has `main = true`.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `main` | `false` | `true` for the one component whose version is the firmware version (`fw`) of the status. |
-| `version` | required | Where the installed version is read. `fixed:<version>`, `os-release:<KEY>` (the value of `<KEY>`, upper case, in the `os_release` file), `file:<absolute path>` (first line of the file) or `command:<absolute path>` (first line of its output; run without a shell, with a limit of 10 seconds). A version is 1 to 64 characters. |
-| `install` | `none` | `script:<absolute path>` or `none`. |
+| `version` | required | Where the installed version is read. `fixed:<version>`, `os-release:<KEY>` (the value of `<KEY>`, upper case, in the `os_release` file), `file:<absolute path>` (first line of the file), `command:<absolute path>` (first line of its output; run without a shell, with a limit of 10 seconds) or `package:<version>` (for `install = docker-compose`: the version of the last package the agent installed, read from `package.json` in the data folder; `<version>` is the one reported until the first package is installed). A version is 1 to 64 characters. |
+| `install` | `none` | `script:<absolute path>`, `docker-compose` (one component at most) or `none`. |
 | `timeout` | `600` | Seconds the install script may run, 1 to 86400. After that the agent kills it and the result is `failed install_failed`. |
+| `compose_file` | `/var/sota/storage/docker-compose/docker-compose.yml` | Only with `install = docker-compose`: absolute path of the composition the device runs. |
+| `project` | `torizon` | Only with `install = docker-compose`: the Compose project name, 1 to 64 characters of `a-z 0-9 _ -`, starting with a letter or a digit. |
+| `agent_service` | `firmline-agent` | Only with `install = docker-compose`: the service of the composition that runs the agent, same characters as `project`. |
+| `health_timeout` | `120` | Only with `install = docker-compose`: seconds the new composition has to be running after an update, 10 to 3600. |
 
-`install = docker-compose` is refused for now (Docker support is planned).
+`install = docker-compose` is accepted by the configuration; the agent does not install such a component yet
+(offers for it are answered like those for `install = none`).
 
 The version is read every time the agent needs it (for each status, and to settle an update), not
 once at start. A `fixed:` version never changes: use it only for a component the agent does not

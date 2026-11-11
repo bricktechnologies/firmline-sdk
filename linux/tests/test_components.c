@@ -166,6 +166,51 @@ static void version_from_hanging_command_is_killed(void) {
     CHECK((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000 < 5000);
 }
 
+static void version_from_package_file(void) {
+    static fa_config cfg;
+    char out[65];
+    snprintf(cfg.data_dir, sizeof cfg.data_dir, "%s", tmpdir);
+    fa_component c = comp(FA_VERSION_PACKAGE, "1.0.0");
+    char path[256];
+    snprintf(path, sizeof path, "%s/package.json", tmpdir);
+    unlink(path);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0); /* no package yet: the initial version */
+    CHECK_EQ_STR(out, "1.0.0");
+
+    put("package.json",
+        "{\"format\":1,\"architecture\":\"arm64\",\"version\":\"2.1.0\","
+        "\"images\":[{\"service\":\"a\",\"image\":\"firmline.local/"
+        "a:2.1.0\",\"id\":\"sha256:x\"}]}",
+        0644, path);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+    CHECK_EQ_STR(out, "2.1.0");
+
+    const char *invalid[] = {"{\"format\":1,",
+                             "not json",
+                             "{\"format\":1}",
+                             "{\"version\":\"\"}",
+                             "{\"version\":5}",
+                             "{\"version\":\"a\\nb\"}",
+                             "{\"version\":\"01234567890123456789012345678901234567890123456789"
+                             "012345678901234x\"}"};
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
+        put("package.json", invalid[i], 0644, path);
+        CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+        CHECK_EQ_STR(out, "1.0.0");
+    }
+
+    /* a file over the read limit is not parsed */
+    FILE *f = fopen(path, "w");
+    fputs("{\"version\":\"9.9.9\",\"pad\":\"", f);
+    for (int i = 0; i < 70000; i++)
+        fputc('x', f);
+    fputs("\"}", f);
+    fclose(f);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+    CHECK_EQ_STR(out, "1.0.0");
+    unlink(path);
+}
+
 int main(void) {
     snprintf(tmpdir, sizeof tmpdir, "/tmp/fa-comp-XXXXXX");
     if (mkdtemp(tmpdir) == NULL)
@@ -177,5 +222,6 @@ int main(void) {
     RUN(version_from_failing_command_is_unreadable);
     RUN(version_command_starts_with_clean_signal_state);
     RUN(version_from_hanging_command_is_killed);
+    RUN(version_from_package_file);
     return CHECK_RESULT;
 }

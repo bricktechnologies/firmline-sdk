@@ -151,14 +151,103 @@ static void config_refuses_unknown_key_with_line_number(void) {
     CHECK(strstr(err, "line 8") != NULL);
 }
 
-static void config_refuses_docker_compose_for_now(void) {
+static void config_accepts_docker_compose_with_defaults(void) {
     static fa_config cfg;
     char err[256] = "";
     char buf[1024];
     snprintf(buf, sizeof buf, "%sinstall = docker-compose\n", MINIMAL);
+    CHECK_EQ_INT(load_text(buf, &cfg, err), 0);
+    CHECK_EQ_INT(cfg.component[0].install, FA_INSTALL_DOCKER_COMPOSE);
+    CHECK_EQ_STR(cfg.component[0].compose_file,
+                 "/var/sota/storage/docker-compose/docker-compose.yml");
+    CHECK_EQ_STR(cfg.component[0].project, "torizon");
+    CHECK_EQ_STR(cfg.component[0].agent_service, "firmline-agent");
+    CHECK_EQ_INT(cfg.component[0].health_timeout_s, 120);
+    CHECK_EQ_STR(cfg.component[0].script, "");
+}
+
+static void config_reads_docker_compose_keys_in_any_order(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    char buf[1024];
+    snprintf(buf, sizeof buf,
+             "%scompose_file = /opt/app/compose.yml\nproject = my_app-1\n"
+             "install = docker-compose\nagent_service = agent\nhealth_timeout = 10\n"
+             "version = package:1.0.0\n",
+             "[platform]\nurl = https://p\nbroker = b\nupdate_key = /k\n[component os]\n"
+             "main = true\n");
+    CHECK_EQ_INT(load_text(buf, &cfg, err), 0);
+    CHECK_EQ_STR(cfg.component[0].compose_file, "/opt/app/compose.yml");
+    CHECK_EQ_STR(cfg.component[0].project, "my_app-1");
+    CHECK_EQ_STR(cfg.component[0].agent_service, "agent");
+    CHECK_EQ_INT(cfg.component[0].health_timeout_s, 10);
+    CHECK_EQ_INT(cfg.component[0].source, FA_VERSION_PACKAGE);
+    CHECK_EQ_STR(cfg.component[0].source_arg, "1.0.0");
+    snprintf(buf, sizeof buf, "%sinstall = docker-compose\nhealth_timeout = 3600\n", MINIMAL);
+    CHECK_EQ_INT(load_text(buf, &cfg, err), 0);
+    CHECK_EQ_INT(cfg.component[0].health_timeout_s, 3600);
+}
+
+static void config_refuses_a_second_docker_compose_component(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    char buf[1024];
+    snprintf(buf, sizeof buf,
+             "%sinstall = docker-compose\n[component two]\nversion = fixed:1\n"
+             "install = docker-compose\n",
+             MINIMAL);
     CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
-    CHECK(strstr(err, "T179") != NULL);
-    CHECK(strstr(err, "line 8") != NULL);
+    CHECK(strstr(err, "line 11") != NULL);
+    CHECK(strstr(err, "docker-compose") != NULL);
+}
+
+static void config_refuses_bad_docker_compose_values(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    char buf[1024];
+    const char *bad[] = {"compose_file = docker-compose.yml",
+                         "compose_file = /",
+                         "project = Upper",
+                         "project = -lead",
+                         "project =",
+                         "project = has space",
+                         "agent_service = a.b",
+                         "agent_service = _x",
+                         "health_timeout = 9",
+                         "health_timeout = 3601",
+                         "health_timeout = 1x",
+                         "health_timeout ="};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        snprintf(buf, sizeof buf, "%sinstall = docker-compose\n%s\n", MINIMAL, bad[i]);
+        CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
+        CHECK(strstr(err, "line 9") != NULL);
+    }
+    char name[80];
+    memset(name, 'a', 64);
+    name[64] = '\0';
+    snprintf(buf, sizeof buf, "%sinstall = docker-compose\nproject = %s\n", MINIMAL, name);
+    CHECK_EQ_INT(load_text(buf, &cfg, err), 0); /* 64 characters is the limit */
+    snprintf(buf, sizeof buf, "%sinstall = docker-compose\nproject = %sa\n", MINIMAL, name);
+    CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
+}
+
+static void config_refuses_docker_compose_keys_on_other_components(void) {
+    static fa_config cfg;
+    char err[256] = "";
+    char buf[1024];
+    const char *keys[] = {"compose_file = /a/b.yml", "project = p", "agent_service = s",
+                          "health_timeout = 30"};
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        snprintf(buf, sizeof buf, "%sinstall = script:/opt/i.sh\n%s\n", MINIMAL, keys[i]);
+        CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
+        CHECK(strstr(err, "only with install = docker-compose") != NULL);
+        CHECK(strstr(err, "line 9") != NULL);
+        /* no install key at all (none) */
+        snprintf(buf, sizeof buf, "%s%s\n", MINIMAL, keys[i]);
+        CHECK_EQ_INT(load_text(buf, &cfg, err), -1);
+        CHECK(strstr(err, "only with install = docker-compose") != NULL);
+        CHECK(strstr(err, "line 8") != NULL);
+    }
 }
 
 static void config_refuses_malformed_input(void) {
@@ -299,7 +388,7 @@ static void config_platform_value_rules(void) {
 static void config_key_table_is_exposed(void) {
     size_t n = 0;
     const char *const *keys = fa_config_keys(&n);
-    CHECK_EQ_INT(n, 15);
+    CHECK_EQ_INT(n, 19);
     int platform = 0, component = 0;
     for (size_t i = 0; i < n; i++) {
         if (strncmp(keys[i], "platform.", 9) == 0)
@@ -308,7 +397,7 @@ static void config_key_table_is_exposed(void) {
             component++;
     }
     CHECK_EQ_INT(platform, 11);
-    CHECK_EQ_INT(component, 4);
+    CHECK_EQ_INT(component, 8);
 }
 
 /* The example of the guide (examples/debian-script/agent.conf) is a configuration the agent loads.
@@ -334,7 +423,11 @@ int main(void) {
     RUN(config_defaults);
     RUN(config_refuses_two_main_components);
     RUN(config_refuses_unknown_key_with_line_number);
-    RUN(config_refuses_docker_compose_for_now);
+    RUN(config_accepts_docker_compose_with_defaults);
+    RUN(config_reads_docker_compose_keys_in_any_order);
+    RUN(config_refuses_a_second_docker_compose_component);
+    RUN(config_refuses_bad_docker_compose_values);
+    RUN(config_refuses_docker_compose_keys_on_other_components);
     RUN(config_refuses_malformed_input);
     RUN(config_handles_line_endings_and_nul_bytes);
     RUN(config_platform_value_rules);

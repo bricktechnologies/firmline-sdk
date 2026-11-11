@@ -2,6 +2,8 @@
 #define _GNU_SOURCE /* pipe2 */
 #include "components.h"
 
+#include "firmline/fl_json.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -18,7 +20,8 @@
 extern char **environ;
 
 #define COMMAND_TIMEOUT_MS 10000
-#define SOURCE_LIMIT 4096 /* bytes read from a version file or command */
+#define SOURCE_LIMIT 4096        /* bytes read from a version file or command */
+#define PACKAGE_JSON_LIMIT 65536 /* bytes read from <data_dir>/package.json */
 
 int fa_first_line_value(const char *text, size_t len, char out[65]) {
     size_t end = 0;
@@ -45,6 +48,37 @@ static int version_from_file(const char *path, char out[65]) {
     int failed = ferror(f);
     fclose(f);
     return failed ? -1 : fa_first_line_value(buf, n, out);
+}
+
+/* The version of the last installed package: "version" of <data_dir>/package.json, the same
+ * content as the firmline-package.json of the package. A file over the limit, not JSON, without a
+ * version or with one that is not 1 to 64 printable characters is unreadable. */
+static int version_from_package(const fa_config *c, char out[65]) {
+    char path[300];
+    if (snprintf(path, sizeof path, "%s/package.json", c->data_dir) >= (int)sizeof path)
+        return -1;
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return -1;
+    char *buf = malloc(PACKAGE_JSON_LIMIT + 1);
+    if (buf == NULL) {
+        fclose(f);
+        return -1;
+    }
+    size_t n = fread(buf, 1, PACKAGE_JSON_LIMIT + 1, f);
+    int failed = ferror(f);
+    fclose(f);
+    int rc = -1;
+    fl_json j;
+    if (!failed && n <= PACKAGE_JSON_LIMIT && fl_json_parse(&j, buf, n) == FL_OK &&
+        fl_json_string(&j, "version", out, 65) == FL_OK && out[0] != '\0') {
+        rc = 0;
+        for (const char *s = out; *s != '\0'; s++)
+            if ((unsigned char)*s < 0x20 || *s == 0x7f)
+                rc = -1;
+    }
+    free(buf);
+    return rc;
 }
 
 /* KEY=value, KEY="value" or KEY='value' in an os-release file. */
@@ -201,6 +235,10 @@ int fa_component_version_timeout(const fa_config *c, const fa_component *comp, c
         return version_from_file(comp->source_arg, out);
     case FA_VERSION_COMMAND:
         return version_from_command(comp->source_arg, command_timeout_ms, out);
+    case FA_VERSION_PACKAGE:
+        if (version_from_package(c, out) == 0)
+            return 0;
+        return fa_first_line_value(comp->source_arg, strlen(comp->source_arg), out);
     }
     return -1;
 }
