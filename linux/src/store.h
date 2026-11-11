@@ -8,7 +8,8 @@
 #include <sys/types.h>
 
 /* Temp file in the same folder (created O_EXCL, set to exactly `mode` before any byte is written),
- * fsync, rename, fsync of the folder. On failure the temp file is removed: -1. */
+ * fsync, rename, fsync of the folder. On failure the temp file is removed: -1, errno of the step
+ * that failed (unset for an invalid name or a path too long). */
 int fa_store_write(const char *dir, const char *name, const void *data, size_t len, mode_t mode);
 
 /* Reads up to 1 MiB into a NUL-terminated buffer that the caller frees. -1 when missing, larger
