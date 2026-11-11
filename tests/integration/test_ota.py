@@ -565,7 +565,7 @@ class OtaTest(OtaBase):
 
         self.assertEqual({"release": offer.release, "result": "installed", "fw": "1.1.0"}, result)
         self.assertEqual([None, "bytes=700-"], self.ranges(offer), "retried after the cut")
-        self.assertIn("the device clock may be wrong", agent.running_log)
+        self.assertEqual(1, agent.running_log.count("the device clock may be wrong"), "once a job")
         self.assertEqual(data, (folder / "installed.bin").read_bytes())
         self.assert_clean(agent)
         self.finish(agent)

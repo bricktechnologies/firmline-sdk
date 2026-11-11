@@ -98,6 +98,7 @@ struct fa_ota {
     bool from_disk;        /* bytes from a former run are part of the file */
     bool restarted;        /* the one restart from byte 0 (416, wrong range) is used */
     bool progress;         /* the running request brought bytes */
+    bool clock_warned;     /* the warning on urlExpires by the device clock is in the log */
     int attempt;           /* retries since the last progress */
     sink_state sink;
     int sink_errno;   /* of a failed write */
@@ -437,9 +438,10 @@ static void start_request(fa_ota *o, fl_time now) {
         memcpy(o->job.url, latest->url, sizeof o->job.url);
         o->job.url_expires = latest->url_expires;
     }
-    if (now >= o->job.url_expires) {
-        /* Only a warning: the server says whether the link is still valid (a wrong device clock
-         * must not block updates). */
+    if (now >= o->job.url_expires && !o->clock_warned) {
+        /* Only a warning, once per job: the server says whether the link is still valid (a
+         * wrong device clock must not block updates). */
+        o->clock_warned = true;
         char iso[26];
         if (fl_time_format(o->job.url_expires, 0, iso) != FL_OK)
             snprintf(iso, sizeof iso, "?");
@@ -527,6 +529,7 @@ static void begin_download(fa_ota *o, fl_time now) {
     o->on_disk = on_disk;
     o->from_disk = on_disk > 0;
     o->restarted = false;
+    o->clock_warned = false;
     o->attempt = 0;
     if (on_disk > 0) {
         fa_log("info", "release %s: checking the %llu bytes already downloaded", o->job.release,
