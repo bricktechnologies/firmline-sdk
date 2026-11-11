@@ -12,7 +12,7 @@ static const struct {
     int (*run)(int argc, char **argv);
 } COMMANDS[] = {
     {"register", fa_cmd_register}, {"run", fa_cmd_run},   {"status", fa_cmd_status},
-    {"endpoint", fa_cmd_endpoint}, {"pack", fa_cmd_pack},
+    {"endpoint", fa_cmd_endpoint}, {"pack", fa_cmd_pack}, {"apply", fa_cmd_apply},
 };
 
 static void usage(FILE *out) {
@@ -39,6 +39,11 @@ static void usage(FILE *out) {
           "           its images are (never pulled): images renamed\n"
           "           firmline.local/<service>:<version as a tag>, composition and\n"
           "           images in one tar\n"
+          "  apply --release <id> [--config <path>]\n"
+          "           install the downloaded package of a Docker Compose application (run\n"
+          "           starts it in a container of its own): images loaded, the new\n"
+          "           composition started and checked, the previous one back on failure;\n"
+          "           the outcome in apply.json in the data folder\n"
           "\n"
           "  --config  the configuration file (default " FA_DEFAULT_CONFIG ")\n"
           "  --help    show this text\n"

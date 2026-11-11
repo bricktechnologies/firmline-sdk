@@ -20,7 +20,8 @@ add_library(firmline_agent_lib STATIC
   src/renewal.c
   src/install_script.c
   src/docker.c
-  src/package.c)
+  src/package.c
+  src/apply.c)
 target_include_directories(firmline_agent_lib PUBLIC src)
 target_include_directories(firmline_agent_lib SYSTEM PRIVATE ${MOSQUITTO_INCLUDE_DIR})
 target_link_libraries(firmline_agent_lib PUBLIC firmline_core OpenSSL::Crypto CURL::libcurl
@@ -35,7 +36,7 @@ set(FIRMLINE_AGENT_VERSION "0.0.0-dev" CACHE STRING "Version printed by firmline
 include("${PROJECT_SOURCE_DIR}/cmake/agent-version.cmake")
 target_compile_definitions(firmline_agent_lib PUBLIC FIRMLINE_AGENT_VERSION="${FIRMLINE_AGENT_VERSION}")
 add_executable(firmline-agent src/main.c src/cmd_register.c src/cmd_run.c src/cmd_status.c
-                              src/cmd_endpoint.c src/cmd_pack.c)
+                              src/cmd_endpoint.c src/cmd_pack.c src/cmd_apply.c)
 target_link_libraries(firmline-agent PRIVATE firmline_agent_lib)
 target_compile_options(firmline-agent PRIVATE ${FIRMLINE_WARNINGS})
 

@@ -31,4 +31,10 @@ int fa_cmd_endpoint(int argc, char **argv);
  * line on stderr and no output file (a file already there is left as it was). */
 int fa_cmd_pack(int argc, char **argv);
 
+/* apply --release <id> [--config <path>]: installs the package of the release that run left in
+ * the data folder for the docker-compose component (cmd_apply.c, apply.h); the outcome in
+ * apply.json. Exit 0 when installed; 1 when failed (apply.json says why) or on a usage or
+ * configuration error (no apply.json). */
+int fa_cmd_apply(int argc, char **argv);
+
 #endif
