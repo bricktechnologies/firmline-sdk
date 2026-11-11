@@ -41,7 +41,7 @@ class ImageTest(unittest.TestCase):
         self.assertEqual(inspect.returncode, 0, inspect.stderr)
         self.assertEqual(
             inspect.stdout.strip(),
-            '{"/var/lib/firmline":{}} Apache-2.0 ["firmline-agent"] ["run"]',
+            '{"/var/lib/firmline":{}} Apache-2.0 ["firmline-agent"] ["run","--wait-registration"]',
         )
 
 

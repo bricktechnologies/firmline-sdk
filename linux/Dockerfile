@@ -32,4 +32,4 @@ RUN apt-get update \
 COPY --from=build /firmline-agent /usr/bin/firmline-agent
 VOLUME /var/lib/firmline
 ENTRYPOINT ["firmline-agent"]
-CMD ["run"]
+CMD ["run", "--wait-registration"]

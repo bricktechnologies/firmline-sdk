@@ -176,6 +176,41 @@ class RunTest(IntegrationTest):
         self.assertNotIn("New client connected", self.broker.log)
         assert_no_secrets(agent.log, [])
 
+    def test_run_waits_for_the_registration_when_asked(self):
+        agent = self.make_agent(broker=self.broker)
+        platform = self.platform_client()
+        process = agent.start("run", "--wait-registration")
+        agent.wait_for_log("waiting for the registration", 15)
+        time.sleep(25)  # the check is every 10 s: the message is logged once, not at every check
+        self.assertIsNone(process.poll(), "the agent must keep running")
+        self.assertEqual(1, agent.running_log.count("waiting for the registration"))
+        self.assertEqual(1, self.broker.log.count("New client connected"), "only the platform")
+
+        token = self.platform.new_token()
+        result = agent.run("register", "--token", token, "--serial", "SN-wait")
+        self.assertEqual(0, result.code, result.stderr)
+        identity = agent.read_json("device.json")
+        message = platform.wait_for(identity["topicRoot"] + "/status", timeout=15)[0]
+        self.assertEqual("firmline-agent/", message.json()["sdk"][:15])
+        self.assertEqual(0, agent.stop())
+        assert_no_secrets(agent.log, self.secrets_of(agent))
+
+    def test_run_stops_at_once_on_sigterm_while_waiting_for_the_registration(self):
+        agent = self.make_agent(broker=self.broker)
+        agent.start("run", "--wait-registration")
+        agent.wait_for_log("waiting for the registration", 15)
+        started = time.monotonic()
+        self.assertEqual(0, agent.stop(timeout=5))
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_run_with_wait_registration_and_a_registered_device_runs_as_usual(self):
+        agent, identity = self.registered_agent()
+        platform = self.platform_client()
+        agent.start("run", "--wait-registration")
+        platform.wait_for(identity["topicRoot"] + "/status")
+        self.assertNotIn("waiting for the registration", agent.running_log)
+        self.assertEqual(0, agent.stop())
+
     def test_run_with_wrong_update_key_exits_1(self):
         agent, _ = self.registered_agent()
         p384 = ec.generate_private_key(ec.SECP384R1()).public_key()
