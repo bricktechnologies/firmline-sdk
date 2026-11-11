@@ -23,8 +23,10 @@ It does:
 - receive update offers, check each one (signature with your update key, tenant, device family,
   component, version), download the file, check its size and SHA-256 against the signed manifest,
   and run your install script with the verified file;
-- send exactly one result per release (`installed` or `failed` with a detail), stored on the device
-  before it is sent, so that a lost connection or a reboot never loses it;
+- send exactly one result per release, stored on the device before it is sent, so that a lost
+  connection or a reboot never loses it: `installed`, `rejected_signature` (the signature, the key
+  identifier, the size or the SHA-256 do not match) or `failed` (anything else), each refusal with
+  a detail (see "Results");
 - renew the device certificate before it expires.
 
 It does not:
@@ -65,6 +67,34 @@ release is published, build it yourself with `docker build -f linux/Dockerfile .
 `firmline-agent run` and keeps its data in the volume `/var/lib/firmline`. Inside the image an
 install script runs inside the container; updating the host or other containers is the subject of
 the Docker and Torizon support, which is planned and not part of this release.
+
+The image contains no configuration: mount the folder with `agent.conf` and the update key at
+`/etc/firmline` (the default path). `run` exits with code 1 on a device that is not registered,
+so a container started with a restart policy before registration restarts in a loop, and
+`docker exec … register` cannot be used. Register first, with a one-off container on the same
+volume (the image's entry point is `firmline-agent`, so the command follows the image name); put
+the token file in a folder of its own, mounted writable, because the agent deletes the file:
+
+```
+docker run --rm \
+    -v firmline-data:/var/lib/firmline \
+    -v /etc/firmline:/etc/firmline:ro \
+    -v /run/firmline-token:/run/firmline-token \
+    ghcr.io/bricktechnologies/firmline-agent \
+    register --token-file /run/firmline-token/token --serial SN-000123
+```
+
+Then start the long-running container, which runs `run` by default:
+
+```
+docker run -d --name firmline-agent --restart unless-stopped \
+    -v firmline-data:/var/lib/firmline \
+    -v /etc/firmline:/etc/firmline:ro \
+    ghcr.io/bricktechnologies/firmline-agent
+```
+
+The exit codes and the standard output of `register` are those of "Registration at the end-of-line
+test station".
 
 ## Set-up in short
 
@@ -180,16 +210,36 @@ An offer arrives on the device's offer topic. For each offer the agent:
 2. queues it (up to 8 releases, oldest first) and works on one release at a time;
 3. downloads the file from the link in the offer, keeps it as a partial file, hashes it while it
    arrives, and resumes after an interruption or a restart (the bytes already on disk are hashed
-   again). The answer 429 or a server error is retried later, never after the link expires. A
-   network error or an expired link is not a result: the platform offers the release again;
-4. checks size and SHA-256 against the manifest; a wrong file is `failed` with `size_mismatch` or
-   `hash_mismatch` and is never installed;
+   again). The answer 429 is retried after 60 seconds, a server error or a network error after 5
+   to 60 seconds, for up to one hour after the agent received the link (a new offer brings a new
+   link and a new hour; after a restart of the agent the hour counts from the restart). Whether
+   the link is still valid is the server's answer, not the device clock's: the agent always tries
+   the link, so a wrong device clock does not block updates (it only logs a warning that the
+   device clock may be wrong). A network error or an expired link (the platform answers 404) is
+   not a result: the platform offers the release again;
+4. checks size and SHA-256 against the manifest; a wrong file is `rejected_signature` with
+   `size_mismatch` or `hash_mismatch` and is never installed;
 5. runs the install script of the component with the verified file;
 6. sends the result and stores it (the 32 most recent are kept); an offer for a release that
    already has a result gets that result again, nothing else.
 
 If there is not enough free space in the data folder for the file, the result is
 `failed no_space`.
+
+### Results
+
+A release gets one of three results:
+
+| Result | When | Detail |
+| --- | --- | --- |
+| `installed` | The install script succeeded (see "The script contract"). | none; `fw` is the new version |
+| `rejected_signature` | The signature or the key identifier of the manifest is not valid, or the downloaded file differs from the manifest in size or SHA-256. | `signature_invalid`, `kid_mismatch`, `size_mismatch`, `hash_mismatch` |
+| `failed` | Any other refusal or error. | `format_unknown`, `tenant_mismatch`, `family_mismatch`, `family_unknown`, `component_mismatch`, `older_version`, `no_space`, `install_failed`, `boot_failed` |
+
+On the platform the first `rejected_signature` of a release pauses the whole release, for every
+device. A site proxy or cache that alters downloaded files therefore pauses the rollout: let the
+download links through unchanged. `failed` closes the release for that device only: a new release
+is needed for it to try again.
 
 ### The script contract
 
@@ -222,9 +272,12 @@ A script that the agent's own stop ended (the agent got SIGTERM while it ran) is
 next start of the agent reads the version of the component and reports `installed` when it is the
 new one, `failed install_failed` otherwise.
 
-The script must be safe to run again: after a power loss during an install the platform may
-offer the release again. `examples/debian-script/install.sh` copies the file into place with a
-rename, writes the version file last, and exits 0.
+The same holds after a power loss, or a stop of the device, while the script runs: at the next
+start the agent reads the version of the component: the new one is `installed`, any other (or
+none) is `failed install_failed`, and the platform does not offer that release to the device
+again: the device needs a new release. So the script should leave the device in a working state
+when it is interrupted at any point: `examples/debian-script/install.sh` copies the file into
+place with a rename, writes the version file last, and exits 0.
 
 ### Components with `install = none`
 
@@ -255,6 +308,36 @@ complete). The new certificate is presented at the next broker connection.
 If the clock is past the expiry of the certificate, nothing is sent (a clock that jumped forward
 comes back). `firmline-agent status` shows `certificateNotAfter`.
 
+### Registering again
+
+A device whose certificate has expired cannot renew it: for example a device kept in a store for
+more than two years, or one that never reached the platform in its last 60 days. The log then
+says `the device certificate expired on <date> and cannot be renewed: register the device again
+with a new token` (or, for an identity with missing files, `the identity in <folder> is
+incomplete`). `register` refuses with `already_registered` while `device.json` exists, so:
+
+1. Stop the agent: `systemctl stop firmline-agent` (or stop its container).
+2. In the data folder, remove the old identity and everything that belongs to it, and nothing
+   else:
+
+   ```
+   cd /var/lib/firmline
+   rm -f device.json device.key device.pem chain.pem root.pem device-chain.pem register.key \
+         connection.json renewal.json renewal-* \
+         offer-*.json download-* install.json result-*.json
+   ```
+
+   These are the identity that `register` checks and writes, the renewal state of the old
+   certificate (a renewal left half-way would otherwise put the old certificate back), the time
+   of the last connection, and the offers, downloads, install state and results of the old
+   identity (the new device on the platform has releases of its own). `endpoint.json` stays: the
+   relay is a setting of the site, not of the identity; remove it too (or run `firmline-agent
+   endpoint --direct`) if the device moves to another site.
+3. Get a new one-time registration token from the registration page of your account.
+4. Run `register` as in "Registration at the end-of-line test station" (with the container image,
+   as in "Requirements, build and image").
+5. Start the agent again: `systemctl start firmline-agent` (or start the container).
+
 ## Relay
 
 A site can reach the platform through a relay of the company. On the device:
@@ -268,8 +351,13 @@ firmline-agent endpoint --direct
 for the broker); `--direct` removes it, and the addresses of the configuration apply again. Through
 the relay every HTTPS request (renewal, downloads) and the broker connection are verified with the
 root received at registration (`root.pem`), because the relay's certificates are issued by the
-company's intermediate authority; `ca_file` does not apply. The relay name is a host name or an IP
-address.
+company's intermediate authority; `ca_file` does not apply. The relay name given to `--relay` is
+a host name or an IP address, used for the broker and the renewal. Download links, however, are
+written by the relay with its download name (set on the relay as `FIRMLINE_RELAY_DOWNLOAD_NAME`,
+by default the first of its local names), so the device must be able to resolve and reach that
+name too: with `--relay 192.168.1.10` the broker and the renewal work, but a link to
+`https://relay.plant.local/…` fails if the device cannot resolve `relay.plant.local`. The
+simplest set-up is to give `--relay` the relay's download name.
 
 A running agent reads `endpoint.json` before each connection to the broker, so the change takes
 effect at its next connection; restart the service to apply it at once. Registration never goes
@@ -385,8 +473,13 @@ connection to the broker does not use a proxy: for a site that only has a proxy,
 A tag `vX.Y.Z` on `main` publishes the image `ghcr.io/bricktechnologies/firmline-agent` with the
 tags `X.Y.Z` and `X` (a tag with a suffix such as `-rc.1` gets only its own), and attaches the SBOMs
 (CycloneDX JSON) of the image and of the source to the GitHub release. The SBOM of the image
-describes the platform of the runner that builds it (amd64). Nothing is published on a pull
-request or by running the workflow by hand.
+describes the platform of the runner that builds it (amd64). Syft finds the Debian packages and
+the Actions; `scripts/sbom-components.sh` adds to both SBOMs what is compiled in: the agent itself,
+Mbed TLS (version read from `cmake/mbedtls.cmake`, with its CPE) and jsmn (version in
+`core/third_party/jsmn/VERSION`); when you update either, keep those files readable by the script
+(`tests/integration/test_sbom.py` fails otherwise). The workflow first runs `scripts/check.sh`, and
+a tag whose commit is not on `main` publishes nothing. Nothing is published on a pull request or
+by running the workflow by hand (that builds the three architectures after the tests).
 
 On the first tag, the GHCR package is created private: make it public in the package settings once.
 The organisation must also allow `GITHUB_TOKEN` to create packages.
