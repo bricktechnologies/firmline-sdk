@@ -7,7 +7,11 @@
  *   INSTALL  the component's script runs with the verified file;
  *   REBOOT   reboot_command runs after a script that exited 10.
  * A job ends with a result, or without one when the platform has to offer again (a link expired
- * or refused, a check that could not run): never with a file that was not verified. */
+ * or refused, a check that could not run): never with a file that was not verified.
+ * Whether a link has expired is the server's answer (404), never the device clock's: a link is
+ * always tried, and retries are bounded by the monotonic clock, FL_DOWNLOAD_RETRY_WINDOW seconds
+ * from the moment the link arrived (from the start of the agent for an offer read from the data
+ * folder). The wall clock against urlExpires only adds a warning to the log. */
 #define _POSIX_C_SOURCE 200809L
 #include "ota.h"
 
@@ -96,8 +100,14 @@ struct fa_ota {
     bool progress;         /* the running request brought bytes */
     int attempt;           /* retries since the last progress */
     sink_state sink;
-    int sink_errno; /* of a failed write */
-    fl_time retry_at;
+    int sink_errno;   /* of a failed write */
+    fl_time retry_at; /* monotonic seconds */
+    /* When each queued release's current link arrived (monotonic seconds): the retries of a
+     * link end FL_DOWNLOAD_RETRY_WINDOW after it. Keyed by release (lower case), "" = free. */
+    struct {
+        char release[RELEASE_LEN + 1];
+        fl_time received;
+    } links[FL_QUEUE_MAX];
     fa_http_download *http;
     fa_child child;
 };
@@ -309,6 +319,40 @@ static const fl_offer *queued(const fa_ota *o, const char *release) {
     return NULL;
 }
 
+/* ---- Link windows (monotonic time) ---------------------------------------------------------- */
+
+/* Seconds of a clock that never jumps (it restarts with the agent's machine, not with the wall
+ * clock): download retries are measured with it. */
+static fl_time monotonic_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (fl_time)t.tv_sec;
+}
+
+/* A new link for `release` (just queued): its retry window starts now. The release is in the
+ * queue, so of the FL_QUEUE_MAX slots one is its own, free, or of a release no longer queued. */
+static void note_link(fa_ota *o, const char *release) {
+    int slot = -1;
+    for (int i = 0; i < FL_QUEUE_MAX && slot < 0; i++)
+        if (o->links[i].release[0] != '\0' && same_release(o->links[i].release, release))
+            slot = i;
+    for (int i = 0; i < FL_QUEUE_MAX && slot < 0; i++)
+        if (o->links[i].release[0] == '\0' || queued(o, o->links[i].release) == NULL)
+            slot = i;
+    if (slot < 0)
+        return; /* not reached: link_deadline then counts from now */
+    lower_release(release, o->links[slot].release);
+    o->links[slot].received = monotonic_s();
+}
+
+/* The monotonic moment after which the current link of `release` is not retried any more. */
+static fl_time link_deadline(const fa_ota *o, const char *release) {
+    for (int i = 0; i < FL_QUEUE_MAX; i++)
+        if (o->links[i].release[0] != '\0' && same_release(o->links[i].release, release))
+            return o->links[i].received + FL_DOWNLOAD_RETRY_WINDOW;
+    return monotonic_s() + FL_DOWNLOAD_RETRY_WINDOW;
+}
+
 /* Removes the downloads no queued release needs: every .bin (a script that never ended), and
  * the .part files of releases no longer queued (except `keep`). */
 static void clean_downloads(fa_ota *o, const char *keep) {
@@ -394,8 +438,15 @@ static void start_request(fa_ota *o, fl_time now) {
         o->job.url_expires = latest->url_expires;
     }
     if (now >= o->job.url_expires) {
-        give_up(o, "the download link has expired");
-        return;
+        /* Only a warning: the server says whether the link is still valid (a wrong device clock
+         * must not block updates). */
+        char iso[26];
+        if (fl_time_format(o->job.url_expires, 0, iso) != FL_OK)
+            snprintf(iso, sizeof iso, "?");
+        fa_log("warning",
+               "release %s: by the device clock the download link expired at %s (the device "
+               "clock may be wrong): trying it, the server decides",
+               o->job.release, iso);
     }
     if (ftruncate(o->fd, (off_t)o->have) != 0 || lseek(o->fd, (off_t)o->have, SEEK_SET) < 0) {
         give_up(o, "the download cannot be written");
@@ -417,7 +468,8 @@ static void start_request(fa_ota *o, fl_time now) {
                                      on_bytes, o);
     if (o->http == NULL) {
         o->state = JOB_RETRY;
-        o->retry_at = fl_download_retry_at(0, o->attempt++, now, o->job.url_expires);
+        o->retry_at =
+            fl_download_retry_at(0, o->attempt++, monotonic_s(), link_deadline(o, o->job.release));
         if (o->retry_at < 0)
             give_up(o, "the download cannot start");
     }
@@ -711,7 +763,8 @@ static void download_step(fa_ota *o, fl_time now) {
         return;
     }
     int status = out.complete ? out.status : 0;
-    fl_time at = fl_download_retry_at(status, o->attempt, now, o->job.url_expires);
+    fl_time mono = monotonic_s();
+    fl_time at = fl_download_retry_at(status, o->attempt, mono, link_deadline(o, o->job.release));
     char why[160];
     if (status == 0)
         snprintf(why, sizeof why, "download interrupted (%s)", out.reason);
@@ -725,7 +778,7 @@ static void download_step(fa_ota *o, fl_time now) {
     o->retry_at = at;
     o->state = JOB_RETRY;
     fa_log("warning", "release %s: %s; next attempt in %lld s", o->job.release, why,
-           (long long)(at - now));
+           (long long)(at - mono));
 }
 
 /* A script exited 10: the installation completes at the next start. */
@@ -894,6 +947,7 @@ static void take_offer(fa_ota *o, const fl_offer *d, const char *raw, size_t len
         remove_file(o, "offer-", d->release, ".json");
         return;
     }
+    note_link(o, d->release); /* a new link, or one read again at start: retried from now */
     if (active)
         fa_log("info", "release %s: new download link", d->release);
     else if (d->action == FL_OFFER_WAIT && fl_time_format(d->wait_until, 0, iso) == FL_OK)
@@ -1180,7 +1234,7 @@ void fa_ota_tick(fa_ota *o, fl_time now) {
         download_step(o, now);
         break;
     case JOB_RETRY:
-        if (now >= o->retry_at)
+        if (monotonic_s() >= o->retry_at)
             start_request(o, now);
         break;
     case JOB_INSTALL:

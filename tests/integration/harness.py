@@ -9,7 +9,8 @@ folder per test; nothing is committed.
 - FakePlatform: HTTPS server on a free port with the device endpoints of the real platform
   (POST /api/v1/provisioning, POST /api/v1/provisioning/renewal, GET /api/v1/ota/downloads/<token>
   with Range). Every request is recorded; faults are scripted per route with `script`/`refuse`,
-  and per download link (cut_after, STATUS_429, STATUS_404, slow); certificates() chooses the
+  and per download link (cut_after, STATUS_429, STATUS_404, slow; a link answers 404 after its
+  urlExpires, by the fake's clock); certificates() chooses the
   validity of the certificates it issues, drop_next_renewal_response() loses a renewal answer.
   With connect(broker) it signs manifests with the update key, publishes offers (offer, repeat)
   and collects the results of the devices. relay() is a second fake playing a relay.
@@ -490,6 +491,9 @@ class Download:
     content: bytes
     faults: collections.deque  # one entry per request (Cut, STATUS_429, STATUS_404), then normal
     slow: Optional[float] = None  # bytes per second of every answer
+    # As on the platform, the link answers 404 ota_download_not_found from this moment (by the
+    # platform's clock, not the device's); None: never.
+    expires: Optional[datetime.datetime] = None
 
 
 @dataclasses.dataclass
@@ -788,14 +792,21 @@ class FakePlatform:
         relay.devices = self.devices  # the same dict: registrations go to this platform only
         return relay
 
-    def add_download(self, content: bytes, faults=(), slow: Optional[float] = None) -> str:
+    def add_download(
+        self,
+        content: bytes,
+        faults=(),
+        slow: Optional[float] = None,
+        expires: Optional[datetime.datetime] = None,
+    ) -> str:
         """Serves `content` at a new download link and returns the link. `faults` are answered
         one per request, in order, before the file is served normally: cut_after(n) closes the
         connection once the file reached n bytes, STATUS_429 and STATUS_404 answer that error.
-        `slow` limits every answer to that many bytes per second."""
+        `slow` limits every answer to that many bytes per second. From `expires` on (this
+        platform's clock) the link answers 404 ota_download_not_found, as an expired link does."""
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._downloads[token] = Download(content, collections.deque(faults), slow)
+            self._downloads[token] = Download(content, collections.deque(faults), slow, expires)
         return f"{self.url}{self.DOWNLOADS}{token}"
 
     # -- OTA offers (the broker side needs connect())
@@ -879,8 +890,10 @@ class FakePlatform:
         slow: Optional[float] = None,
         publish: bool = True,
     ) -> Offer:
-        """The same signed manifest again with a new link, as the platform repeats an offer."""
-        url = self.add_download(offer.content, faults, slow)
+        """The same signed manifest again with a new link, as the platform repeats an offer. The
+        link answers 404 from `url_expires` on (default: in an hour, the platform's maximum)."""
+        expires = url_expires or utc_now() + datetime.timedelta(hours=1)
+        url = self.add_download(offer.content, faults, slow, expires)
         payload = json.dumps(
             {
                 "manifest": base64.b64encode(offer.manifest).decode(),
@@ -888,7 +901,7 @@ class FakePlatform:
                 "kid": hashlib.sha256(public_key_der(self.pki.update_key.public_key())).hexdigest(),
                 "sig": base64.b64encode(offer.signature).decode(),
                 "url": url,
-                "urlExpires": self.iso(url_expires or utc_now() + datetime.timedelta(hours=1)),
+                "urlExpires": self.iso(expires),
             },
             separators=(",", ":"),
         ).encode()
@@ -1065,7 +1078,8 @@ class FakePlatform:
         with self._lock:
             download = self._downloads.get(token)
             fault = download.faults.popleft() if download and download.faults else None
-        if download is None or fault == STATUS_404:
+        expired = download is not None and download.expires is not None and utc_now() >= download.expires
+        if download is None or expired or fault == STATUS_404:
             return problem(404, "ota_download_not_found")
         if fault == STATUS_429:
             return problem(429, "too_many_requests")

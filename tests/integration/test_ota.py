@@ -16,6 +16,8 @@ from harness import (
     STATUS_429,
     IntegrationTest,
     assert_no_secrets,
+    build_clock_shim,
+    clock_env,
     cut_after,
     utc_now,
     wait_until,
@@ -67,8 +69,9 @@ class OtaBase(IntegrationTest):
         }
         return keys, folder
 
-    def start_agent(self, components=None, data_dir=None, **settings):
-        """A registered agent running `run`, subscribed to its offers; its device id."""
+    def start_agent(self, components=None, data_dir=None, run_env=None, **settings):
+        """A registered agent running `run`, subscribed to its offers; its device id. `run_env`
+        is added to the environment of `run` only (after the registration)."""
         agent = self.make_agent(broker=self.broker, components=components, **settings)
         if data_dir is not None:
             agent.settings["data_dir"] = str(data_dir)
@@ -77,6 +80,7 @@ class OtaBase(IntegrationTest):
         result = agent.run("register", "--token", token, "--serial", f"SN-{uuid.uuid4().hex[:8]}")
         self.assertEqual(0, result.code, result.stderr)
         device_id = agent.read_json("device.json")["deviceId"]
+        agent.env.update(run_env or {})
         self.run_agent(agent)
         return agent, device_id
 
@@ -532,9 +536,11 @@ class OtaTest(OtaBase):
             payload(2000),
             url_expires=utc_now() - datetime.timedelta(minutes=1),
         )
-        agent.wait_for_log(f"release {offer.release}: the download link has expired")
+        # Whether the link is still valid is the server's answer (404), not the device clock's.
+        agent.wait_for_log(f"release {offer.release}: download refused (HTTP 404)")
         time.sleep(1)
-        self.assertEqual([], self.ranges(offer), "an expired link is never requested")
+        self.assertIn("the device clock may be wrong", agent.running_log)
+        self.assertEqual([None], self.ranges(offer), "asked once: a 404 is not retried")
         self.assertEqual([], self.platform.results(device), "an expired link is not a result")
 
         again = self.repeat(offer)
@@ -542,6 +548,26 @@ class OtaTest(OtaBase):
         self.assertEqual({"release": offer.release, "result": "installed", "fw": "1.1.0"}, result)
         self.assertEqual([None], self.ranges(again))
         self.assertEqual(1, len(self.result_messages(device)))
+        self.finish(agent)
+
+    def test_device_clock_two_hours_ahead_still_downloads_and_installs(self):
+        # An RTC in local time read as UTC (+2 h) and no NTP: by the device clock every link
+        # (valid for an hour by the platform's) has already expired. The server decides.
+        app, folder = self.component("app")
+        shim = build_clock_shim(self.tmp)
+        agent, device = self.start_agent(
+            {"app": app}, run_env=clock_env(shim, datetime.timedelta(hours=2))
+        )
+        data = payload(2000)
+
+        offer = self.offer(device, "app", "1.1.0", data, faults=(cut_after(700),))
+        result = self.platform.wait_results(device)[0]
+
+        self.assertEqual({"release": offer.release, "result": "installed", "fw": "1.1.0"}, result)
+        self.assertEqual([None, "bytes=700-"], self.ranges(offer), "retried after the cut")
+        self.assertIn("the device clock may be wrong", agent.running_log)
+        self.assertEqual(data, (folder / "installed.bin").read_bytes())
+        self.assert_clean(agent)
         self.finish(agent)
 
     def test_repeated_offer_after_result_resends_result(self):

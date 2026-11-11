@@ -4,7 +4,7 @@
 #define DAY_SECONDS ((fl_time)86400)
 #define RENEWAL_WINDOW ((fl_time)60 * 86400)
 
-fl_time fl_download_retry_at(int http_status, int attempt, fl_time now, fl_time url_expires) {
+fl_time fl_download_retry_at(int http_status, int attempt, fl_time now, fl_time deadline) {
     fl_time delay;
     fl_time retry;
     if (http_status == 429) {
@@ -20,7 +20,7 @@ fl_time fl_download_retry_at(int http_status, int attempt, fl_time now, fl_time 
     if (now > INT64_MAX - delay)
         return -1;
     retry = now + delay;
-    return retry >= url_expires ? -1 : retry;
+    return retry >= deadline ? -1 : retry;
 }
 
 bool fl_renewal_due(fl_time not_before, fl_time not_after, fl_time now, fl_time last_attempt) {
