@@ -11,10 +11,8 @@ static const struct {
     const char *name;
     int (*run)(int argc, char **argv);
 } COMMANDS[] = {
-    {"register", fa_cmd_register},
-    {"run", fa_cmd_run},
-    {"status", fa_cmd_status},
-    {"endpoint", fa_cmd_endpoint},
+    {"register", fa_cmd_register}, {"run", fa_cmd_run},   {"status", fa_cmd_status},
+    {"endpoint", fa_cmd_endpoint}, {"pack", fa_cmd_pack},
 };
 
 static void usage(FILE *out) {
@@ -36,6 +34,10 @@ static void usage(FILE *out) {
           "           [--config <path>]\n"
           "           use a relay on this site (HTTPS 443 and broker 8883 by default, verified\n"
           "           with the root received at registration), or the configuration again\n"
+          "  pack --compose <file> --version <version> --output <file.tar>\n"
+          "           build the package of a Docker Compose application for a release, where\n"
+          "           its images are (never pulled): images renamed\n"
+          "           firmline.local/<service>:<version>, composition and images in one tar\n"
           "\n"
           "  --config  the configuration file (default " FA_DEFAULT_CONFIG ")\n"
           "  --help    show this text\n"

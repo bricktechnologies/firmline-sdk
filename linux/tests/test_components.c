@@ -177,34 +177,59 @@ static void version_from_package_file(void) {
     CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0); /* no package yet: the initial version */
     CHECK_EQ_STR(out, "1.0.0");
 
-    put("package.json",
+    static const char valid[] =
         "{\"format\":1,\"architecture\":\"arm64\",\"version\":\"2.1.0\","
-        "\"images\":[{\"service\":\"a\",\"image\":\"firmline.local/"
-        "a:2.1.0\",\"id\":\"sha256:x\"}]}",
-        0644, path);
+        "\"images\":[{\"service\":\"a\",\"image\":\"firmline.local/a:2.1.0\",\"id\":\"sha256:"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}";
+    put("package.json", valid, 0644, path);
     CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
     CHECK_EQ_STR(out, "2.1.0");
 
-    const char *invalid[] = {"{\"format\":1,",
-                             "not json",
-                             "{\"format\":1}",
-                             "{\"version\":\"\"}",
-                             "{\"version\":5}",
-                             "{\"version\":\"a\\nb\"}",
-                             "{\"version\":\"01234567890123456789012345678901234567890123456789"
-                             "012345678901234x\"}"};
+    /* a package of 16 images, more tokens than the core reader holds on its own */
+    static char sixteen[4096];
+    size_t len = (size_t)snprintf(sixteen, sizeof sixteen,
+                                  "{\"format\":1,\"architecture\":\"arm64\",\"version\":\"3.0\","
+                                  "\"images\":[");
+    for (int i = 0; i < 16; i++)
+        len += (size_t)snprintf(sixteen + len, sizeof sixteen - len,
+                                "%s{\"service\":\"s%d\",\"image\":\"firmline.local/s%d:3.0\","
+                                "\"id\":\"sha256:0123456789abcdef0123456789abcdef0123456789abcd"
+                                "ef0123456789abcdef\"}",
+                                i ? "," : "", i, i);
+    snprintf(sixteen + len, sizeof sixteen - len, "]}");
+    put("package.json", sixteen, 0644, path);
+    CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
+    CHECK_EQ_STR(out, "3.0");
+
+    const char *invalid[] = {
+        "{\"format\":1,",
+        "not json",
+        "{\"format\":1}",
+        "{\"version\":\"\"}",
+        "{\"version\":5}",
+        "{\"version\":\"a\nb\"}",
+        "{\"version\":\"01234567890123456789012345678901234567890123456789"
+        "012345678901234x\"}",
+        /* only the top-level version counts, and only from a whole valid package */
+        "{\"format\":1,\"architecture\":\"arm64\",\"images\":[{\"version\":\"2.1.0\"}]}",
+        "{\"format\":1,\"architecture\":\"arm64\",\"version\":\"2.1\\u0000\",\"images\":[{"
+        "\"service\":\"a\",\"image\":\"firmline.local/a:2.1\",\"id\":\"sha256:"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}",
+        "{\"version\":\"2.1.0\"}",
+        "{\"format\":1,\"architecture\":\"arm64\",\"version\":\"2.1.0\",\"images\":[{"
+        "\"service\":\"a\",\"image\":\"firmline.local/a:2.1.0\",\"id\":\"sha256:x\"}]}",
+    };
     for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
         put("package.json", invalid[i], 0644, path);
         CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
         CHECK_EQ_STR(out, "1.0.0");
     }
 
-    /* a file over the read limit is not parsed */
+    /* a file over the read limit is not parsed, even when it is a valid package */
     FILE *f = fopen(path, "w");
-    fputs("{\"version\":\"9.9.9\",\"pad\":\"", f);
+    fputs(valid, f);
     for (int i = 0; i < 70000; i++)
-        fputc('x', f);
-    fputs("\"}", f);
+        fputc(' ', f);
     fclose(f);
     CHECK_EQ_INT(fa_component_version(&cfg, &c, out), 0);
     CHECK_EQ_STR(out, "1.0.0");

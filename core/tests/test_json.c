@@ -329,6 +329,93 @@ static void json_writer_output_is_read_back(void) {
     CHECK_EQ_INT(n, -3);
 }
 
+/* A document of 1 + pairs * 2 tokens: {"k0":0,"k1":1,...}. */
+static size_t many_pairs(char *text, size_t cap, int pairs) {
+    size_t n = 0;
+    text[n++] = '{';
+    for (int i = 0; i < pairs; i++)
+        n += (size_t)snprintf(text + n, cap - n, "%s\"k%d\":%d", i ? "," : "", i, i);
+    text[n++] = '}';
+    return n;
+}
+
+static void json_parses_more_tokens_with_a_table_of_the_caller(void) {
+    static char text[2048];
+    jsmntok_t tok[128];
+    fl_json j;
+    int64_t v = 0;
+    char s[8];
+    size_t n = many_pairs(text, sizeof text, 60); /* 121 tokens: over FL_JSON_MAX_TOKENS */
+    CHECK_EQ_INT(fl_json_parse(&j, text, n), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, text, n, tok, 128), FL_OK);
+    CHECK_EQ_INT(j.count, 121);
+    CHECK(j.tok == tok);
+    CHECK_EQ_INT(fl_json_int(&j, "k59", &v), FL_OK);
+    CHECK_EQ_INT(v, 59);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, text, n, tok, 121), FL_OK);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, text, n, tok, 120), FL_ERR_FORMAT);
+    /* after a refusal the document reads as empty, never through the caller's table */
+    CHECK_EQ_INT(j.count, 0);
+    CHECK_EQ_INT(fl_json_int(&j, "k0", &v), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_string(&j, "k0", s, sizeof s), FL_ERR_FORMAT);
+    /* the same rules as fl_json_parse */
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, "{\"a\":1,\"a\":2}", 13, tok, 128), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, "[1]", 3, tok, 128), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, "{\"a\":[[[[1]]]]}", 15, tok, 128), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_parse_tokens(NULL, "{}", 2, tok, 128), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, NULL, 2, tok, 128), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, "{}", 2, NULL, 128), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_json_parse_tokens(&j, "{}", 2, tok, 0), FL_ERR_ARG);
+    /* fl_json_parse uses the table of j again */
+    CHECK_EQ_INT(fl_json_parse(&j, "{\"x\":\"y\"}", 9), FL_OK);
+    CHECK(j.tok != tok);
+    CHECK_EQ_INT(fl_json_string(&j, "x", s, sizeof s), FL_OK);
+    CHECK_EQ_STR(s, "y");
+}
+
+static void json_reads_an_array_of_objects(void) {
+    static const char text[] =
+        "{\"n\":1,\"list\":[{\"a\":\"x\",\"b\":{\"c\":1}},{\"b\":2,\"a\":\"y\u00e8\"},"
+        "{\"a\":3},\"s\"],\"empty\":[],\"o\":{\"a\":\"z\"}}";
+    fl_json j;
+    int first = -1, count = -1, i;
+    char s[8];
+    CHECK_EQ_INT(PARSE(j, text), FL_OK);
+    CHECK_EQ_INT(fl_json_array(&j, "list", &first, &count), FL_OK);
+    CHECK_EQ_INT(count, 4);
+    i = first;
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "a", s, sizeof s), FL_OK);
+    CHECK_EQ_STR(s, "x");
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "b", s, sizeof s), FL_ERR_FORMAT); /* an object */
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "c", s, sizeof s), FL_ERR_FORMAT); /* not a member */
+    i = fl_json_next(&j, i);
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "a", s, sizeof s), FL_OK);
+    CHECK_EQ_STR(s, "y\xc3\xa8");
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "a", s, 3), FL_ERR_SPACE);
+    i = fl_json_next(&j, i);
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "a", s, sizeof s), FL_ERR_FORMAT); /* a number */
+    i = fl_json_next(&j, i);
+    CHECK_EQ_INT(j.tok[i].type, JSMN_STRING);
+    CHECK_EQ_INT(fl_json_member_string(&j, i, "a", s, sizeof s), FL_ERR_FORMAT); /* not an object */
+    /* after the array: the key "empty" of the root */
+    i = fl_json_next(&j, i);
+    CHECK_EQ_INT(j.js[j.tok[i].start], 'e');
+    CHECK_EQ_INT(fl_json_array(&j, "empty", &first, &count), FL_OK);
+    CHECK_EQ_INT(count, 0);
+    CHECK_EQ_INT(fl_json_array(&j, "o", &first, &count), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_array(&j, "n", &first, &count), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_array(&j, "absent", &first, &count), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_array(NULL, "list", &first, &count), FL_ERR_ARG);
+    /* the root is an object too; indexes outside the table are refused */
+    CHECK_EQ_INT(fl_json_member_string(&j, 0, "a", s, sizeof s), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_member_string(&j, -1, "a", s, sizeof s), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_member_string(&j, j.count, "a", s, sizeof s), FL_ERR_FORMAT);
+    CHECK_EQ_INT(fl_json_member_string(&j, 0, NULL, s, sizeof s), FL_ERR_ARG);
+    CHECK_EQ_INT(PARSE(j, "{\"a\":\"q\"}"), FL_OK);
+    CHECK_EQ_INT(fl_json_member_string(&j, 0, "a", s, sizeof s), FL_OK);
+    CHECK_EQ_STR(s, "q");
+}
+
 int main(void) {
     RUN(json_reads_the_manifest_of_the_vector);
     RUN(json_refuses_repeated_root_key);
@@ -346,5 +433,7 @@ int main(void) {
     RUN(json_writer_writes_and_escapes);
     RUN(json_writer_escapes_and_never_cuts);
     RUN(json_writer_output_is_read_back);
+    RUN(json_parses_more_tokens_with_a_table_of_the_caller);
+    RUN(json_reads_an_array_of_objects);
     return CHECK_RESULT;
 }

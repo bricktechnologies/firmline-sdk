@@ -154,16 +154,21 @@ static int after_value(const fl_json *j, int v) {
     return n;
 }
 
-/* Token index of the root value of key, or -1. */
-static int find_value(const fl_json *j, const char *key) {
-    int i = 1;
-    for (int p = 0; p < j->tok[0].size && i + 1 < j->count; p++) {
+/* Token index of the value of key in the object at token index `object`, or -1. */
+static int find_member(const fl_json *j, int object, const char *key) {
+    int i = object + 1;
+    if (object < 0 || object >= j->count || j->tok[object].type != JSMN_OBJECT)
+        return -1;
+    for (int p = 0; p < j->tok[object].size && i + 1 < j->count; p++) {
         if (key_matches(j, i, key))
             return i + 1;
         i = after_value(j, i + 1);
     }
     return -1;
 }
+
+/* Token index of the root value of key, or -1. */
+static int find_value(const fl_json *j, const char *key) { return find_member(j, 0, key); }
 
 static int check_depth(const fl_json *j) {
     int ends[MAX_DEPTH];
@@ -330,19 +335,23 @@ static int check_structure(const fl_json *j) {
     return FL_OK;
 }
 
-int fl_json_parse(fl_json *j, const char *js, size_t len) {
+/* An empty document: no token, the zeroed table of j, so that every reader finds nothing. */
+static void clear(fl_json *j) {
+    memset(j, 0, sizeof *j);
+    j->tok = j->table;
+}
+
+static int parse_into(fl_json *j, const char *js, size_t len, jsmntok_t *tok, size_t cap) {
     jsmn_parser parser;
     int n;
-    if (j == NULL || js == NULL)
-        return FL_ERR_ARG;
-    memset(j, 0, sizeof *j);
+    clear(j);
     if (len == 0 || len > (size_t)INT_MAX)
         return FL_ERR_FORMAT;
     jsmn_init(&parser);
-    n = jsmn_parse(&parser, js, len, j->tok, FL_JSON_MAX_TOKENS);
-    if (n < 1 || j->tok[0].type != JSMN_OBJECT)
+    n = jsmn_parse(&parser, js, len, tok, (unsigned int)cap);
+    if (n < 1 || tok[0].type != JSMN_OBJECT)
         return FL_ERR_FORMAT;
-    for (size_t i = (size_t)j->tok[0].end; i < len; i++) {
+    for (size_t i = (size_t)tok[0].end; i < len; i++) {
         char c = js[i];
         if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
             return FL_ERR_FORMAT; /* a second value, a NUL, or other trailing bytes */
@@ -350,19 +359,36 @@ int fl_json_parse(fl_json *j, const char *js, size_t len) {
     j->js = js;
     j->len = len;
     j->count = n;
+    j->tok = tok;
     if (check_depth(j) != FL_OK || check_structure(j) != FL_OK || check_root_keys(j) != FL_OK) {
-        memset(j, 0, sizeof *j);
+        clear(j);
         return FL_ERR_FORMAT;
     }
     return FL_OK;
 }
 
-int fl_json_string(const fl_json *j, const char *key, char *out, size_t cap) {
+int fl_json_parse(fl_json *j, const char *js, size_t len) {
+    if (j == NULL || js == NULL)
+        return FL_ERR_ARG;
+    return parse_into(j, js, len, j->table, FL_JSON_MAX_TOKENS);
+}
+
+int fl_json_parse_tokens(fl_json *j, const char *js, size_t len, jsmntok_t *tok, size_t cap) {
+    if (j == NULL)
+        return FL_ERR_ARG;
+    if (js == NULL || tok == NULL || cap == 0 || cap > (size_t)INT_MAX) {
+        clear(j);
+        return FL_ERR_ARG;
+    }
+    return parse_into(j, js, len, tok, cap);
+}
+
+int fl_json_member_string(const fl_json *j, int object, const char *key, char *out, size_t cap) {
     size_t len;
     int v, rc;
     if (j == NULL || key == NULL || out == NULL || cap == 0)
         return FL_ERR_ARG;
-    v = find_value(j, key);
+    v = find_member(j, object, key);
     if (v < 0 || j->tok[v].type != JSMN_STRING)
         return FL_ERR_FORMAT;
     rc = unescape_token(j, v, out, cap - 1, &len);
@@ -370,6 +396,10 @@ int fl_json_string(const fl_json *j, const char *key, char *out, size_t cap) {
         return rc;
     out[len] = '\0';
     return FL_OK;
+}
+
+int fl_json_string(const fl_json *j, const char *key, char *out, size_t cap) {
+    return fl_json_member_string(j, 0, key, out, cap);
 }
 
 int fl_json_int(const fl_json *j, const char *key, int64_t *out) {
@@ -435,6 +465,18 @@ int fl_json_object(const fl_json *j, const char *key, int *first, int *pairs) {
         return FL_ERR_FORMAT;
     *first = v + 1;
     *pairs = j->tok[v].size;
+    return FL_OK;
+}
+
+int fl_json_array(const fl_json *j, const char *key, int *first, int *count) {
+    int v;
+    if (j == NULL || key == NULL || first == NULL || count == NULL)
+        return FL_ERR_ARG;
+    v = find_value(j, key);
+    if (v < 0 || j->tok[v].type != JSMN_ARRAY)
+        return FL_ERR_FORMAT;
+    *first = v + 1;
+    *count = j->tok[v].size;
     return FL_OK;
 }
 

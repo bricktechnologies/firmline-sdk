@@ -2,7 +2,7 @@
 #define _GNU_SOURCE /* pipe2 */
 #include "components.h"
 
-#include "firmline/fl_json.h"
+#include "package.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -51,8 +51,8 @@ static int version_from_file(const char *path, char out[65]) {
 }
 
 /* The version of the last installed package: "version" of <data_dir>/package.json, the same
- * content as the firmline-package.json of the package. A file over the limit, not JSON, without a
- * version or with one that is not 1 to 64 printable characters is unreadable. */
+ * content as the firmline-package.json of the package. A file over the limit, or one that is not
+ * a whole valid package description (fa_package_parse), is unreadable. */
 static int version_from_package(const fa_config *c, char out[65]) {
     char path[300];
     if (snprintf(path, sizeof path, "%s/package.json", c->data_dir) >= (int)sizeof path)
@@ -69,13 +69,11 @@ static int version_from_package(const fa_config *c, char out[65]) {
     int failed = ferror(f);
     fclose(f);
     int rc = -1;
-    fl_json j;
-    if (!failed && n <= PACKAGE_JSON_LIMIT && fl_json_parse(&j, buf, n) == FL_OK &&
-        fl_json_string(&j, "version", out, 65) == FL_OK && out[0] != '\0') {
+    fa_package package;
+    char err[256];
+    if (!failed && n <= PACKAGE_JSON_LIMIT && fa_package_parse(buf, n, &package, err) == 0) {
+        memcpy(out, package.version, sizeof package.version);
         rc = 0;
-        for (const char *s = out; *s != '\0'; s++)
-            if ((unsigned char)*s < 0x20 || *s == 0x7f)
-                rc = -1;
     }
     free(buf);
     return rc;
