@@ -71,12 +71,16 @@ int fa_store_write(const char *dir, const char *name, const void *data, size_t l
     /* The umask can only have narrowed the mode at creation. Set it exactly now, before any byte
      * is written: the file is still empty and private to the agent, never wider than asked. */
     if (fchmod(fd, mode) != 0 || write_all(fd, data, len) != 0 || fsync(fd) != 0) {
+        int saved = errno; /* the cause, not the cleanup's */
         close(fd);
         unlink(tmp);
+        errno = saved;
         return -1;
     }
     if (close(fd) != 0 || rename(tmp, path) != 0) {
+        int saved = errno;
         unlink(tmp);
+        errno = saved;
         return -1;
     }
     return sync_dir(dir);

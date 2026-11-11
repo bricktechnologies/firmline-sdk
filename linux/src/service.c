@@ -167,7 +167,7 @@ int fa_identity_load(const char *dir, fa_identity *out) {
 int fa_device_chain_update(const char *dir) {
     char *cert = NULL, *chain = NULL, *current = NULL, *wanted = NULL;
     size_t cert_len = 0, chain_len = 0, current_len = 0;
-    int rc = -1;
+    int rc = FA_CHAIN_UNREADABLE, saved_errno = 0;
     if (fa_store_read(dir, "device.pem", &cert, &cert_len) != 0 ||
         fa_store_read(dir, "chain.pem", &chain, &chain_len) != 0)
         goto done;
@@ -179,8 +179,11 @@ int fa_device_chain_update(const char *dir) {
     bool newline = cert_len > 0 && cert[cert_len - 1] != '\n';
     size_t total = cert_len + newline + first + 1;
     wanted = malloc(total + 1);
-    if (wanted == NULL)
+    if (wanted == NULL) { /* not the identity's fault */
+        rc = FA_CHAIN_UNWRITABLE;
+        saved_errno = ENOMEM;
         goto done;
+    }
     memcpy(wanted, cert, cert_len);
     if (newline)
         wanted[cert_len] = '\n';
@@ -190,13 +193,19 @@ int fa_device_chain_update(const char *dir) {
     if (fa_store_read(dir, FA_DEVICE_CHAIN, &current, &current_len) == 0 && current_len == total &&
         memcmp(current, wanted, total) == 0)
         rc = 0;
-    else
-        rc = fa_store_write(dir, FA_DEVICE_CHAIN, wanted, total, 0644);
+    else if (fa_store_write(dir, FA_DEVICE_CHAIN, wanted, total, 0644) == 0)
+        rc = 0;
+    else {
+        rc = FA_CHAIN_UNWRITABLE;
+        saved_errno = errno;
+    }
 done:
     free(cert);
     free(chain);
     free(current);
     free(wanted);
+    if (rc == FA_CHAIN_UNWRITABLE)
+        errno = saved_errno;
     return rc;
 }
 
@@ -390,7 +399,13 @@ static void start_attempt(fa_service *s) {
     s->connected_at = 0;
     s->attempt_at = monotonic_ms();
     s->state = LINK_CONNECTING;
-    if (fa_device_chain_update(s->cfg->data_dir) != 0) {
+    int chain = fa_device_chain_update(s->cfg->data_dir);
+    if (chain == FA_CHAIN_UNWRITABLE) {
+        lose(s, "cannot write %s in %s (%s): free space or fix permissions", FA_DEVICE_CHAIN,
+             s->cfg->data_dir, strerror(errno));
+        return;
+    }
+    if (chain != 0) {
         lose(s, "the device certificate in %s cannot be read", s->cfg->data_dir);
         return;
     }
@@ -603,17 +618,26 @@ static int prepare(fa_service *s, const fa_config *cfg) {
     int stale = fa_store_remove_stale(dir);
     if (stale > 0)
         fa_log("info", "removed %d temporary file(s) left by an interrupted write", stale);
+    int chain = 0;
     if (join_path(s->ca_path, sizeof s->ca_path, dir, "root.pem") != 0 ||
         join_path(s->cert_path, sizeof s->cert_path, dir, FA_DEVICE_CHAIN) != 0 ||
         join_path(s->key_path, sizeof s->key_path, dir, "device.key") != 0 ||
         join_path(s->status_topic, sizeof s->status_topic, s->id.topic_root, "status") != 0 ||
         access(s->ca_path, R_OK) != 0 || access(s->key_path, R_OK) != 0 ||
-        fa_device_chain_update(dir) != 0) {
+        (chain = fa_device_chain_update(dir)) == FA_CHAIN_UNREADABLE) {
         fa_log("error",
                "run: the identity in %s is incomplete (root.pem, device.key, device.pem, "
                "chain.pem): register the device again (see \"Registering again\" in the "
                "integration guide)",
                dir);
+        return -1;
+    }
+    if (chain == FA_CHAIN_UNWRITABLE) {
+        /* The identity is whole: only the disk is in the way (full after a renewal, read-only).
+         * Registering again would throw a valid identity away. */
+        fa_log("error",
+               "run: cannot write %s in %s (%s): free space or fix permissions, then restart",
+               FA_DEVICE_CHAIN, dir, strerror(errno));
         return -1;
     }
     if (check_pair(dir) != 0)

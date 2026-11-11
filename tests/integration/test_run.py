@@ -171,6 +171,37 @@ class RunTest(IntegrationTest):
         self.assertNotIn("New client connected", self.broker.log)
         assert_no_secrets(agent.log, self.secrets_of(agent))
 
+    def test_device_chain_that_cannot_be_written_is_not_a_reason_to_register_again(self):
+        # device-chain.pem is rewritten from device.pem whenever it differs (after a renewal). A
+        # full or read-only data partition must not send the operator to "Registering again",
+        # which would throw a valid identity away. The tests run as root, so a folder in the
+        # place of the file stands for the write that fails (the rename onto it is refused).
+        agent, _ = self.registered_agent()
+        secrets = self.secrets_of(agent)
+        blocker = agent.path("device-chain.pem")
+        blocker.unlink(missing_ok=True)
+        blocker.mkdir()
+        (blocker / "keep").write_text("x\n")
+
+        result = agent.run("run", timeout=30)
+        self.assertEqual(1, result.code)
+        self.assertIn(f"cannot write device-chain.pem in {agent.data_dir}", result.stderr)
+        self.assertIn("free space or fix permissions, then restart", result.stderr)
+        self.assertNotIn("Registering again", result.stderr)
+        self.assertNotIn("register the device again", result.stderr)
+        self.assertNotIn("incomplete", result.stderr)
+
+        # A missing identity file is still a case for registering again.
+        (blocker / "keep").unlink()
+        blocker.rmdir()
+        agent.path("device.pem").unlink()
+        result = agent.run("run", timeout=30)
+        self.assertEqual(1, result.code)
+        self.assertIn("is incomplete", result.stderr)
+        self.assertIn('(see "Registering again" in the integration guide)', result.stderr)
+        self.assertNotIn("New client connected", self.broker.log)
+        assert_no_secrets(agent.log, secrets)
+
     def test_no_status_while_no_version_is_readable(self):
         version_file = self.tmp / "app-version"
         components = {"app": {"main": "true", "version": f"file:{version_file}"}}

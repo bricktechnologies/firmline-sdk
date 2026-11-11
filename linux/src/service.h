@@ -53,7 +53,12 @@ int fa_endpoint_load(const fa_config *cfg, fa_endpoint *out);
 
 /* Writes dir/device-chain.pem as device.pem followed by the first certificate of chain.pem (the
  * intermediate), when it is missing or different. Runs before every connection, so a renewed
- * device.pem is presented at the next one. 0, or -1. */
+ * device.pem is presented at the next one. 0; FA_CHAIN_UNREADABLE when device.pem or chain.pem
+ * cannot be read or holds no certificate (the identity is incomplete); FA_CHAIN_UNWRITABLE when
+ * only the write of device-chain.pem failed (a full or read-only disk: the identity is fine),
+ * with errno set. */
+#define FA_CHAIN_UNREADABLE (-1)
+#define FA_CHAIN_UNWRITABLE (-2)
 int fa_device_chain_update(const char *dir);
 
 /* Runs the service until SIGTERM or SIGINT: 0 then. 1 when it cannot start (not registered,
