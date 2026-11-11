@@ -14,7 +14,9 @@ from pathlib import Path
 
 from harness import (
     STATUS_429,
+    STATUS_503,
     IntegrationTest,
+    MonotonicClock,
     assert_no_secrets,
     build_clock_shim,
     clock_env,
@@ -566,6 +568,59 @@ class OtaTest(OtaBase):
         self.assertEqual({"release": offer.release, "result": "installed", "fw": "1.1.0"}, result)
         self.assertEqual([None, "bytes=700-"], self.ranges(offer), "retried after the cut")
         self.assertEqual(1, agent.running_log.count("the device clock may be wrong"), "once a job")
+        self.assertEqual(data, (folder / "installed.bin").read_bytes())
+        self.assert_clean(agent)
+        self.finish(agent)
+
+    def agent_with_monotonic_clock(self):
+        """A registered agent whose CLOCK_MONOTONIC the test moves (MonotonicClock)."""
+        app, folder = self.component("app")
+        clock = MonotonicClock(self.tmp)
+        env = clock_env(build_clock_shim(self.tmp), monotonic=clock)
+        agent, device = self.start_agent({"app": app}, run_env=env)
+        return agent, device, clock, folder
+
+    def test_retries_stop_one_hour_after_the_link_arrived(self):
+        agent, device, clock, _ = self.agent_with_monotonic_clock()
+        offer = self.offer(device, "app", "1.1.0", payload(2000), faults=(STATUS_503,) * 50)
+        refused = f"release {offer.release}: download refused (HTTP 503)"
+        agent.wait_for_log(f"{refused}; next attempt in", count=2)
+
+        # An hour later by the monotonic clock (the wall clock has not moved): the retry that
+        # was due runs at once, is refused again, and its next one would be past the window.
+        clock.forward(3600)
+        agent.wait_for_log(f"{refused}: no result, waiting for a new offer")
+        requests = len(self.ranges(offer))
+        time.sleep(2)
+
+        self.assertEqual(3, requests, "two refusals, then the one at the end of the window")
+        self.assertEqual(requests, len(self.ranges(offer)), "no request after giving up")
+        self.assertEqual([], self.platform.results(device), "giving up is not a result")
+        self.assertFalse(agent.path(f"offer-{offer.release}.json").exists())
+        self.finish(agent)
+
+    def test_new_link_restarts_the_retry_window(self):
+        agent, device, clock, folder = self.agent_with_monotonic_clock()
+        data = payload(2000)
+        offer = self.offer(device, "app", "1.1.0", data, faults=(STATUS_503,) * 50)
+        refused = f"release {offer.release}: download refused (HTTP 503)"
+        agent.wait_for_log(f"{refused}; next attempt in")
+
+        # 50 minutes after the first link: the due retry runs on it and is refused again.
+        clock.forward(3000)
+        agent.wait_for_log(f"{refused}; next attempt in", count=2)
+        # The platform offers again: a new link, refused once by the server, then served.
+        again = self.repeat(offer, faults=(STATUS_503,))
+        agent.wait_for_log(f"release {offer.release}: new download link")
+        # Past the hour of the first link, inside the hour of the new one: the new link's refusal
+        # is retried (with the first link's window the agent would give up here).
+        clock.forward(700)
+        result = self.platform.wait_results(device, timeout=60)[0]
+
+        self.assertEqual({"release": offer.release, "result": "installed", "fw": "1.1.0"}, result)
+        self.assertEqual(2, len(self.ranges(offer)), "the first link is not asked again")
+        self.assertEqual([None, None], self.ranges(again), "refused once, then downloaded")
+        self.assertNotIn("no result, waiting for a new offer", agent.running_log)
         self.assertEqual(data, (folder / "installed.bin").read_bytes())
         self.assert_clean(agent)
         self.finish(agent)
