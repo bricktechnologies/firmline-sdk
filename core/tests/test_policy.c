@@ -20,12 +20,26 @@ static void retry_after_429_is_one_minute(void) {
     CHECK_EQ_INT(fl_download_retry_at(0, -1, NOW, NOW + 3600), NOW + 5);
 }
 
-static void retry_stops_at_url_expiry(void) {
+static void retry_stops_at_the_deadline(void) {
     CHECK_EQ_INT(fl_download_retry_at(429, 0, NOW, NOW + 60), -1);       /* equal: stop */
     CHECK_EQ_INT(fl_download_retry_at(429, 0, NOW, NOW + 61), NOW + 60); /* just before */
     CHECK_EQ_INT(fl_download_retry_at(0, 2, NOW, NOW + 20), -1);
     CHECK_EQ_INT(fl_download_retry_at(0, 2, NOW, NOW + 21), NOW + 20);
-    CHECK_EQ_INT(fl_download_retry_at(503, 0, NOW, NOW - 1), -1); /* already expired */
+    CHECK_EQ_INT(fl_download_retry_at(503, 0, NOW, NOW - 1), -1); /* already past */
+}
+
+/* The agent passes monotonic seconds (since boot, so small numbers) and a deadline one window after
+ * the link arrived: retries go on for FL_DOWNLOAD_RETRY_WINDOW seconds, whatever urlExpires and the
+ * wall clock say. */
+static void retries_last_one_window_from_the_link(void) {
+    fl_time received = 12, deadline = received + FL_DOWNLOAD_RETRY_WINDOW;
+    CHECK_EQ_INT(FL_DOWNLOAD_RETRY_WINDOW, 3600);
+    CHECK_EQ_INT(fl_download_retry_at(0, 0, received, deadline), received + 5);
+    CHECK_EQ_INT(fl_download_retry_at(429, 0, deadline - 61, deadline), deadline - 1);
+    CHECK_EQ_INT(fl_download_retry_at(429, 0, deadline - 60, deadline), -1);
+    CHECK_EQ_INT(fl_download_retry_at(503, 7, deadline - 61, deadline), deadline - 1);
+    CHECK_EQ_INT(fl_download_retry_at(503, 7, deadline - 30, deadline), -1);
+    CHECK_EQ_INT(fl_download_retry_at(0, 0, deadline + 1, deadline), -1); /* window over */
 }
 
 static void retry_on_404_stops_without_result(void) {
@@ -92,7 +106,8 @@ static void backoff_never_allows_15_connections_a_minute(void) {
 
 int main(void) {
     RUN(retry_after_429_is_one_minute);
-    RUN(retry_stops_at_url_expiry);
+    RUN(retry_stops_at_the_deadline);
+    RUN(retries_last_one_window_from_the_link);
     RUN(retry_on_404_stops_without_result);
     RUN(renewal_due_from_60_days_before_expiry);
     RUN(renewal_not_twice_in_a_day);

@@ -12,12 +12,20 @@
 extern "C" {
 #endif
 
+/* How long a device keeps retrying a download link: 3600 s from the moment it received the link
+ * (the platform's longest link life). */
+#define FL_DOWNLOAD_RETRY_WINDOW 3600
+
 /* When to retry a download that ended with `http_status` (0 = network error), after `attempt`
- * earlier retries (0 for the first), at time `now`, for a link valid until `url_expires`.
+ * earlier retries (0 for the first), at time `now`, retrying until `deadline`.
  * 429: now + 60 s. 0 or 5xx: now + min(5 * 2^attempt, 60) s. Any other status: -1. A retry time
- * at or after url_expires: -1. -1 means "stop without a result": a network error or an expired
- * link is not a result for the platform. */
-fl_time fl_download_retry_at(int http_status, int attempt, fl_time now, fl_time url_expires);
+ * at or after `deadline`: -1. -1 means "stop without a result": a network error or an expired
+ * link is not a result for the platform.
+ * `now`, `deadline` and the result are in the caller's time base. Whether a link has expired is
+ * the server's answer (a 404), never the device clock's: pass a clock that does not jump (the
+ * Linux agent: monotonic seconds) and deadline = the moment the link was received +
+ * FL_DOWNLOAD_RETRY_WINDOW, not the offer's urlExpires. */
+fl_time fl_download_retry_at(int http_status, int attempt, fl_time now, fl_time deadline);
 
 /* True when the device certificate should be renewed: not_before <= now < not_after,
  * now >= not_after - 60 days, and the last attempt (0 = never) is at least a day ago. A clock not
