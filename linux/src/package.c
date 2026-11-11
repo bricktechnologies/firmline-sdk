@@ -26,18 +26,31 @@ static int fail(char err[256], const char *fmt, ...) {
 
 static bool is_lower_alnum(char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }
 
+static bool tag_char(char c) {
+    return (c >= 'A' && c <= 'Z') || is_lower_alnum(c) || c == '_' || c == '.' || c == '-';
+}
+
+/* As the platform takes a firmware version: 1 to 64 bytes, no control character, no white space
+ * at either end (the platform trims it, and the version must stay the same text). */
 bool fa_package_version_ok(const char *v) {
     if (v == NULL)
         return false;
     size_t n = strlen(v);
-    if (n < 1 || n > 64 || v[0] == '.' || v[0] == '-')
+    if (n < 1 || n > 64 || v[0] == ' ' || v[n - 1] == ' ')
         return false;
-    for (size_t i = 0; i < n; i++) {
-        char c = v[i];
-        if (!((c >= 'A' && c <= 'Z') || is_lower_alnum(c) || c == '_' || c == '.' || c == '-'))
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)v[i] < 0x20 || v[i] == 0x7f)
             return false;
-    }
     return true;
+}
+
+void fa_package_tag(const char *version, char tag[FA_PACKAGE_TAG_MAX + 1]) {
+    size_t n = 0;
+    if (version[0] == '.' || version[0] == '-')
+        tag[n++] = '_';
+    for (const char *c = version; *c != '\0' && n < FA_PACKAGE_TAG_MAX; c++)
+        tag[n++] = tag_char(*c) ? *c : '_';
+    tag[n] = '\0';
 }
 
 /* A path component of an image name (the Docker reference grammar): [a-z0-9]+ groups joined by
@@ -95,19 +108,21 @@ static int check(const fa_package *p, char err[256]) {
         !architecture_ok(p->architecture))
         return fail(err, "architecture is not 1 to 15 of a-z 0-9");
     if (memchr(p->version, '\0', sizeof p->version) == NULL || !fa_package_version_ok(p->version))
-        return fail(err, "version is not 1 to 64 of A-Z a-z 0-9 _ . - (not starting with . or -)");
+        return fail(err, "version is not 1 to 64 bytes without a control character or a space at "
+                         "either end");
     if (p->image_count < 1 || p->image_count > FA_MAX_COMPONENTS)
         return fail(err, "images: 1 to %d, not %d", FA_MAX_COMPONENTS, p->image_count);
     for (int i = 0; i < p->image_count; i++) {
         const char *service = p->image[i].service;
-        char expected[sizeof p->image[i].image];
+        char expected[256], tag[FA_PACKAGE_TAG_MAX + 1];
         if (memchr(service, '\0', sizeof p->image[i].service) == NULL ||
             !fa_package_service_ok(service))
             return fail(err, "image %d: the service is not a name usable in an image name", i + 1);
         for (int k = 0; k < i; k++)
             if (strcmp(p->image[k].service, service) == 0)
                 return fail(err, "image %d: the service %s is there twice", i + 1, service);
-        snprintf(expected, sizeof expected, FA_PACKAGE_REGISTRY "/%s:%s", service, p->version);
+        fa_package_tag(p->version, tag);
+        snprintf(expected, sizeof expected, FA_PACKAGE_REGISTRY "/%s:%s", service, tag);
         if (memchr(p->image[i].image, '\0', sizeof p->image[i].image) == NULL ||
             strcmp(p->image[i].image, expected) != 0)
             return fail(err, "image %d: the image is not %s", i + 1, expected);
@@ -196,10 +211,19 @@ int fa_package_write(const fa_package *p, char *out, size_t cap) {
     char err[256];
     if (p == NULL || out == NULL || cap == 0 || check(p, err) != 0)
         return -1;
-    /* Every value passed the checks: none holds a character JSON must escape. */
+    /* Every value passed the checks: only the version can hold a character JSON must escape, and
+     * no control character, so " and \ are all there is to escape. */
+    char version[2 * sizeof p->version];
+    size_t n = 0;
+    for (const char *c = p->version; *c != '\0'; c++) {
+        if (*c == '"' || *c == '\\')
+            version[n++] = '\\';
+        version[n++] = *c;
+    }
+    version[n] = '\0';
     text t = {out, cap, 0, true};
     put(&t, "{\"format\":%d,\"architecture\":\"%s\",\"version\":\"%s\",\"images\":[", p->format,
-        p->architecture, p->version);
+        p->architecture, version);
     for (int i = 0; i < p->image_count; i++)
         put(&t, "%s{\"service\":\"%s\",\"image\":\"%s\",\"id\":\"%s\"}", i > 0 ? "," : "",
             p->image[i].service, p->image[i].image, p->image[i].id);

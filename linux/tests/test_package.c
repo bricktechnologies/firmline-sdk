@@ -160,8 +160,11 @@ static void package_refuses_what_the_format_does_not_allow(void) {
         DOC("1", "arm64", "1.0", IMG("a", "firmline.local/a:1.1", ID_A)),
         DOC("1", "arm64", "1.0", IMG("a", "docker.io/a:1.0", ID_A)),
         DOC("1", "arm64", "1.0", IMG("a", "firmline.local/a", ID_A)),
-        /* the version is the tag */
+        /* the version is valid as fw; the image carries its tag, not the version itself */
         DOC("1", "arm64", "", IMG("a", "firmline.local/a:", ID_A)),
+        DOC("1", "arm64", "1\\u0001", IMG("a", "firmline.local/a:1_", ID_A)),
+        DOC("1", "arm64", "1\\n", IMG("a", "firmline.local/a:1_", ID_A)),
+        DOC("1", "arm64", "1\\u007f", IMG("a", "firmline.local/a:1_", ID_A)),
         DOC("1", "arm64", "1.0+b", IMG("a", "firmline.local/a:1.0+b", ID_A)),
         DOC("1", "arm64", ".1", IMG("a", "firmline.local/a:.1", ID_A)),
         DOC("1", "arm64", "-1", IMG("a", "firmline.local/a:-1", ID_A)),
@@ -215,15 +218,73 @@ static void package_accepts_the_edges_of_the_rules(void) {
                        "\"id\":\"" ID_A "\"} ] }\n",
                        &p, err),
                  0);
+    /* a version that is not a Docker tag: the images carry the tag made from it */
+    CHECK_EQ_INT(
+        parse("{\"format\":1,\"architecture\":\"arm64\",\"version\":\"1.4.3+build.7\","
+              "\"images\":[{\"service\":\"a\",\"image\":\"firmline.local/a:1.4.3_build.7\","
+              "\"id\":\"" ID_A "\"}]}",
+              &p, err),
+        0);
+    CHECK_EQ_STR(p.version, "1.4.3+build.7");
+    CHECK_EQ_INT(parse("{\"format\":1,\"architecture\":\"arm64\",\"version\":\"-1 \\u00fc\","
+                       "\"images\":[{\"service\":\"a\",\"image\":\"firmline.local/a:_-1___\","
+                       "\"id\":\"" ID_A "\"}]}",
+                       &p, err),
+                 0);
+    CHECK_EQ_STR(p.version, "-1 \xc3\xbc");
     /* 64 bytes of version and of service */
     CHECK(
         fa_package_version_ok("0123456789012345678901234567890123456789012345678901234567890123"));
     CHECK(
         fa_package_service_ok("a012345678901234567890123456789012345678901234567890123456789012"));
+    CHECK(!fa_package_version_ok(
+        "01234567890123456789012345678901234567890123456789012345678901234"));
+    CHECK(!fa_package_version_ok(""));
+    CHECK(!fa_package_version_ok("1\t0"));
+    CHECK(fa_package_version_ok("1.0 beta"));
+    CHECK(!fa_package_version_ok(" 1.0"));
+    CHECK(!fa_package_version_ok("1.0 "));
     CHECK(!fa_package_version_ok(NULL));
     CHECK(!fa_package_service_ok(NULL));
     CHECK(!fa_package_id_ok(NULL));
     CHECK(fa_package_id_ok(ID_B));
+}
+
+static void package_tag_is_the_version_made_a_docker_tag(void) {
+    static const char *const cases[][2] = {
+        {"1.2.0", "1.2.0"},
+        {"1.4.3+build.7", "1.4.3_build.7"},
+        {"_a-B.9", "_a-B.9"},
+        {".1", "_.1"},
+        {"-1", "_-1"},
+        {"1 0/x:y", "1_0_x_y"},
+        {"\xc3\xbc", "__"},
+        {"0123456789012345678901234567890123456789012345678901234567890123",
+         "0123456789012345678901234567890123456789012345678901234567890123"},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char tag[FA_PACKAGE_TAG_MAX + 1];
+        fa_package_tag(cases[i][0], tag);
+        CHECK_EQ_STR(tag, cases[i][1]);
+    }
+}
+
+static void package_write_escapes_the_version(void) {
+    fa_package p, q;
+    char out[8192], err[256];
+    memset(&p, 0, sizeof p);
+    p.format = 1;
+    strcpy(p.architecture, "arm64");
+    strcpy(p.version, "1.0 \"rc\"\\x");
+    p.image_count = 1;
+    strcpy(p.image[0].service, "web");
+    strcpy(p.image[0].image, "firmline.local/web:1.0__rc__x");
+    strcpy(p.image[0].id, ID_A);
+    int len = fa_package_write(&p, out, sizeof out);
+    CHECK(len > 0);
+    CHECK(strstr(out, "\"version\":\"1.0 \\\"rc\\\"\\\\x\"") != NULL);
+    CHECK_EQ_INT(fa_package_parse(out, (size_t)len, &q, err), 0);
+    CHECK_EQ_MEM(&q, &p, sizeof p);
 }
 
 static void package_write_refuses_what_parse_refuses(void) {
@@ -262,6 +323,8 @@ int main(void) {
     RUN(package_of_sixteen_images_is_read_and_seventeen_refused);
     RUN(package_refuses_what_the_format_does_not_allow);
     RUN(package_accepts_the_edges_of_the_rules);
+    RUN(package_tag_is_the_version_made_a_docker_tag);
+    RUN(package_write_escapes_the_version);
     RUN(package_write_refuses_what_parse_refuses);
     return CHECK_RESULT;
 }

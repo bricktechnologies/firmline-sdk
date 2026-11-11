@@ -6,7 +6,8 @@
  *
  * The package is an uncompressed tar of exactly, in this order:
  *   firmline-package.json  the description (package.h): architecture, version, and per service
- *                          its image firmline.local/<service>:<version> and the image ID;
+ *                          its image firmline.local/<service>:<tag> (the version made a
+ *                          Docker tag, fa_package_tag) and the image ID;
  *   docker-compose.yml     the composition as Compose renders it with an override that gives each
  *                          service that image, `pull_policy: never` and no `build:`. It is not
  *                          normalized and paths are not resolved, so that the device's project
@@ -253,8 +254,15 @@ static int inspect_images(const services *sv, fa_package *p, services *arch) {
             return -1;
         }
         snprintf(p->image[i].service, sizeof p->image[i].service, "%s", sv->s[i].service);
-        snprintf(p->image[i].image, sizeof p->image[i].image, FA_PACKAGE_REGISTRY "/%s:%s",
-                 sv->s[i].service, p->version);
+        char tag[FA_PACKAGE_TAG_MAX + 1], image[256];
+        fa_package_tag(p->version, tag);
+        int len =
+            snprintf(image, sizeof image, FA_PACKAGE_REGISTRY "/%s:%s", sv->s[i].service, tag);
+        if (len < 0 || (size_t)len >= sizeof p->image[i].image) {
+            fa_log("error", "pack: the image name of the service %s is too long", sv->s[i].service);
+            return -1;
+        }
+        memcpy(p->image[i].image, image, (size_t)len + 1);
         memcpy(p->image[i].id, id, strlen(id) + 1); /* checked: 71 bytes */
         memcpy(arch->s[i].architecture, architecture, strlen(architecture) + 1);
         if (i > 0 && strcmp(architecture, arch->s[0].architecture) != 0) {
@@ -444,8 +452,8 @@ int fa_cmd_pack(int argc, char **argv) {
         return 1;
     }
     if (!fa_package_version_ok(o.version)) {
-        fa_log("error", "pack: the version is the tag of the images and the firmware version: 1 "
-                        "to 64 of A-Z a-z 0-9 _ . - (not starting with . or -)");
+        fa_log("error", "pack: the version is the firmware version of the release: 1 to 64 bytes "
+                        "without a control character or a space at either end");
         return 1;
     }
     struct stat st;

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """firmline-agent pack --compose <file> --version <v> --output <file.tar>: the package of a Docker
 Compose application, built with the images of the local daemon (never pulled). The tar holds
-exactly firmline-package.json, docker-compose.yml (every image renamed firmline.local/<service>:<v>
-with pull_policy: never) and images.tar.gz (docker save, gzip -n). Any refusal is exit 1 with one
-error line, no output file and no temporary folder left."""
+exactly firmline-package.json, docker-compose.yml (every image renamed
+firmline.local/<service>:<tag>, <tag> being <v> made a Docker tag, with pull_policy: never) and
+images.tar.gz (docker save, gzip -n). Any refusal is exit 1 with one error line, no output file
+and no temporary folder left."""
 
 import gzip
 import json
@@ -173,12 +174,41 @@ class PackTest(unittest.TestCase):
             "services:\n  web:\n    image: example/web:1\n  arm:\n    image: example/arm:1\n")
         self.assert_refused(self.pack(compose), "arm64", "architecture")
 
-    def test_a_version_invalid_as_fw_or_as_a_tag_is_refused(self):
+    def test_a_version_invalid_as_fw_is_refused(self):
         compose = self.composition(TWO_SERVICES)
         self.two_images()
-        for version in ("1" * 65, "1.0 beta", "1.0+build", ".1", "-1", "1/0", "ü"):
+        for version in ("1" * 65, "1.0\tbeta", "1.0\x7f", " 1.0", "1.0 "):
             with self.subTest(version=version):
                 self.assert_refused(self.pack(compose, version=version), "version")
+
+    def test_a_version_that_is_not_a_docker_tag_gets_a_local_tag(self):
+        """The platform's own example version: the images are tagged with the version made a
+        Docker tag (every other character `_`), the description keeps the version itself."""
+        version, tag = "1.4.3+build.7", "1.4.3_build.7"
+        web, db = self.two_images()
+        result = self.pack(self.composition(TWO_SERVICES), version=version)
+        self.assertEqual(0, result.returncode, result.stderr)
+        unpacked = self.folder / "unpacked"
+        with tarfile.open(self.output) as tar:
+            self.assertEqual(MEMBERS, tar.getnames())
+            tar.extractall(unpacked, filter="data")
+        description = json.loads((unpacked / "firmline-package.json").read_text())
+        self.assertEqual(version, description["version"])
+        self.assertEqual(
+            [{"service": "db", "image": f"firmline.local/db:{tag}", "id": db},
+             {"service": "web", "image": f"firmline.local/web:{tag}", "id": web}],
+            sorted(description["images"], key=lambda i: i["service"]),
+        )
+        rendered = self.docker.run(
+            "compose", "-f", str(unpacked / "docker-compose.yml"), "config", "--format", "json",
+        ).stdout
+        services = json.loads(rendered)["services"]
+        for name in ("web", "db"):
+            self.assertEqual(f"firmline.local/{name}:{tag}", services[name]["image"])
+        self.docker.run("rmi", "-f", web, db)
+        self.docker.run("load", "-i", str(unpacked / "images.tar.gz"), timeout=300)
+        self.assertEqual(web, self.image_id(f"firmline.local/web:{tag}"))
+        self.assertEqual(db, self.image_id(f"firmline.local/db:{tag}"))
 
     def test_more_than_sixteen_services_are_refused(self):
         self.docker.app_image("example/web:1", "stay")
@@ -196,7 +226,7 @@ class PackTest(unittest.TestCase):
 
     def test_a_refusal_leaves_an_existing_output_alone(self):
         self.output.write_text("the previous package")
-        result = self.pack(self.composition(TWO_SERVICES), version="1.0 beta")
+        result = self.pack(self.composition(TWO_SERVICES), version="1" * 65)
         self.assertEqual(1, result.returncode)
         self.assertEqual("the previous package", self.output.read_text())
         self.assertEqual(["app.tar"], os.listdir(self.out))
