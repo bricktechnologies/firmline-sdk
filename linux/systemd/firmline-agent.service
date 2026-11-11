@@ -1,0 +1,32 @@
+# Firmline agent. Install as /etc/systemd/system/firmline-agent.service, copy the binary to the
+# path of ExecStart, put the configuration in /etc/firmline/agent.conf, register the device once
+# (see docs/integration.md), then: systemctl enable --now firmline-agent
+[Unit]
+Description=Firmline agent
+Documentation=https://github.com/bricktechnologies/firmline-sdk/blob/main/docs/integration.md
+After=network-online.target
+Wants=network-online.target
+# Not started on a device that was never registered: `firmline-agent register` makes this file last.
+ConditionPathExists=/var/lib/firmline/device.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/firmline-agent run
+# The agent installs updates, so it runs as root (see "Security notes" in the guide).
+User=root
+# A crash is retried after 5 seconds. Do not make it shorter: the broker bans a device that
+# disconnects more than 15 times a minute.
+Restart=always
+RestartSec=5
+# On a stop only the agent gets SIGTERM; a running install script must not receive it together
+# with the agent. The agent deals with the script itself: it waits up to 5 seconds for a script
+# that is ending, then stops it (SIGTERM, and SIGKILL after 5 more seconds), so a stop during an
+# install can take about 11 seconds. systemd kills what is left at the end of the stop.
+KillMode=mixed
+TimeoutStopSec=30
+# For a proxy (HTTPS requests only), for example:
+# Environment=https_proxy=http://proxy.example:3128
+# Environment=no_proxy=localhost,127.0.0.1
+
+[Install]
+WantedBy=multi-user.target
