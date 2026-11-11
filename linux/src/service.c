@@ -611,7 +611,8 @@ static int prepare(fa_service *s, const fa_config *cfg) {
         fa_device_chain_update(dir) != 0) {
         fa_log("error",
                "run: the identity in %s is incomplete (root.pem, device.key, device.pem, "
-               "chain.pem): register the device again",
+               "chain.pem): register the device again (see \"Registering again\" in the "
+               "integration guide)",
                dir);
         return -1;
     }

@@ -10,6 +10,7 @@ import os
 import stat
 import unittest
 import uuid
+from pathlib import Path
 
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
@@ -242,6 +243,10 @@ class RenewalTest(RenewalBase):
         wait_until(lambda: agent.running_log.count(failed) >= 2, 30, "two connection attempts")
 
         self.assertEqual(1, agent.running_log.count("register the device again with a new token"))
+        # The line names the procedure of the guide, and the guide has it.
+        self.assertIn('(see "Registering again" in the integration guide)', agent.running_log)
+        guide = (Path(__file__).resolve().parents[2] / "docs" / "integration.md").read_text()
+        self.assertIn("\n### Registering again\n", guide)
         self.assertEqual([], self.renewal_requests())
         self.assert_no_pending(agent)
         self.stop_and_check(agent)

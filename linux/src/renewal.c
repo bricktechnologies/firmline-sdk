@@ -454,7 +454,8 @@ void fa_renewal_check(fa_renewal *r, fl_time now) {
             format_time(not_after, iso);
             fa_log("error",
                    "the device certificate expired on %s and cannot be renewed: register the "
-                   "device again with a new token",
+                   "device again with a new token (see \"Registering again\" in the integration "
+                   "guide)",
                    iso);
         }
         r->expired_logged = true;
