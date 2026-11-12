@@ -49,7 +49,7 @@ class DockerHostTest(unittest.TestCase):
         self.assertNotEqual(first, self.docker.app_image("app:2", "stay"))
 
     def test_an_application_that_dies_exits_1_after_its_seconds(self):
-        image = self.docker.app_image("app:die", "die:1")
+        image = self.docker.app_image("app:die", "die:5")
         self.docker.run("run", "-d", "--name", "app-die", image)
         self.assertEqual("running", self.state("app-die"))
         self.assertEqual("1", self.docker.run("wait", "app-die", timeout=30).stdout.strip())
