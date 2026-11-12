@@ -510,6 +510,11 @@ version `1.4.3+build.7` gives `firmline.local/web:1.4.3_build.7`; the package ke
 given. The package has no signature of its own: its size and SHA-256 are in the manifest that
 your update key signs. The size limit of a firmware file is 256 MB.
 
+Disk space on the module: plan for about twice the size of the package, plus the uncompressed
+size of the new image layers. During `apply` the downloaded package, `images.tar.gz` extracted
+from it into the data folder (about the same size), and the layers that `docker load` unpacks
+into Docker's storage are on the disk at the same time.
+
 What `pack` needs and does:
 
 - Docker (the CLI and Docker Compose 2.24 or newer, because `pack` uses `!reset`), `tar` and
@@ -525,6 +530,10 @@ What `pack` needs and does:
   package, as the build machine reads them. **A secret in `.env` ends up in the firmware file**,
   which the platform stores and the device downloads. Keep secrets out of the composition: the
   device must have them some other way.
+- The files that the composition refers to are not in the package: the sources of bind mounts,
+  `env_file`, and `configs:` or `secrets:` with `file:`. They must already be on the module (in
+  your Torizon image, say). A relative path is resolved from the folder of `compose_file` on the
+  module, not from the folder of the composition on the build machine.
 - The images stay tagged under their local names on the build machine.
 - The image IDs of the package are the configuration digests of the manifest of `docker save`.
   The device compares them with the IDs that Docker shows after `docker load`, so the device must
@@ -568,7 +577,10 @@ second package would replace all of it. The configuration refuses a second one.
    install. Every service of the new composition must have containers, all `running`, none that
    has restarted since the start of step 4 (a container that `up` kept is counted from its count
    before). A container with a healthcheck must not be `unhealthy` at any look, and must be
-   `healthy` at the end (`starting` at the end fails).
+   `healthy` at the end (`starting` at the end fails). A one-shot service (one that exits 0, with
+   `restart: "no"`, or that others wait for with `condition: service_completed_successfully`)
+   fails the health check: its container is not `running`. Keep such a task out of the package's
+   composition.
 6. On success, `<compose_file>.new` replaces `compose_file` and `package.json` is written: the
    version is now the one of the package. `apply` writes its outcome in `apply.json`, and then
    removes the images of the previous package that the new one does not use. Only those:
@@ -602,8 +614,8 @@ Cases:
   it is `failed install_failed`, and the previous composition goes back to `compose_file` if the
   new one had replaced it. In both cases the agent then brings up the composition of
   `compose_file` (in a `firmline-apply` container: `docker compose up --detach --remove-orphans
-  --pull=never`), so that the module runs what the file says, and `<compose_file>.new` and
-  `compose-previous.yml` are removed.
+  --pull=never`), so that the module runs what the file says, and `<compose_file>.new`,
+  `compose-previous.yml` and `apply.tmp/` are removed.
 - **The label of the containers.** The containers that the update created keep the Compose label
   `com.docker.compose.project.config_files` with the path `<compose_file>.new`, a file that no
   longer exists after a success. Run Compose on the module with `-f <compose_file>`.
@@ -641,11 +653,13 @@ never copy it to a second device.
 | `apply.json` | Torizon: the outcome of `apply`, written only by `apply`: the release, the state (`running`, `installed` or `failed`), the detail (`install_failed` or `health_check_failed` for `failed`) and the version. The agent reads it every second while `apply` runs, and at start. |
 | `package.json` | Torizon: the description (`firmline-package.json`) of the last package installed. It is where the version source `package:` reads, and what tells `apply` which images the next package replaces. |
 | `compose-previous.yml` | Torizon: a copy of the composition in use, made by `apply` before it starts the new one and removed when `apply` ends. |
-| `apply.tmp/` | Torizon: the working folder of `apply` (the composition and the images of the package, until they are loaded). Removed when `apply` ends, and by the next `apply` if one was cut short. |
+| `apply.tmp/` | Torizon: the working folder of `apply` (the composition and the images of the package, until they are loaded). Removed when `apply` ends, and by the agent when it settles an `apply` that was cut short. |
 | `result-<release>.json` | The result of a release as it is (or was) sent, and whether the broker confirmed it. The 32 most recent are kept. |
 
 The release in a file name is the release identifier in lower case. Free disk space for the data
-folder: the largest file you ship plus 1 MiB.
+folder: the largest file you ship plus 1 MiB. On Torizon plan for about twice the size of the
+package, plus the uncompressed size of its new image layers in Docker's storage (see "The
+package").
 
 ## Logs
 
@@ -679,9 +693,12 @@ connection to the broker does not use a proxy: for a site that only has a proxy,
   image, its composition and `/etc/firmline` like the rest of your system image.
 - The broker and the platform are verified on every connection (TLS 1.2 or later). There is no
   option to switch verification off.
-- `FIRMLINE_BOOT_ID_FILE` is an environment variable used by the automated tests to play a reboot
-  without rebooting. Never set it in production: it changes how the agent decides that a reboot
-  happened.
+- `FIRMLINE_BOOT_ID_FILE`, `FIRMLINE_MOUNTINFO_FILE` and `FIRMLINE_APPLY_WAIT_S` are environment
+  variables used only by the automated tests: to play a reboot without rebooting, to give the
+  agent another file in place of `/proc/self/mountinfo` (from which it finds its own container on
+  Torizon), and to shorten the 30 minutes it waits for an earlier `firmline-apply` container.
+  Never set them in production: they change how the agent decides that a reboot happened, which
+  container is its own, and how long it waits.
 
 ## The systemd unit
 
@@ -731,6 +748,8 @@ disk space are those of the board.
    does not complain (`docker exec firmline-agent firmline-agent …`).
 3. `docker info --format '{{.DriverStatus}}'` and `docker version --format '{{.Server.Arch}}'`: the
    storage is Docker's classic image store, and the architecture is the one of your package.
+   Check the image store again on every new major version of Torizon OS: Docker 29 uses
+   containerd's image store by default on a fresh installation.
 4. Register with the token (see "Registration on Torizon"): `deviceId` and exit 0; within about
    10 seconds the log shows the connection and `status sent`, and the platform shows the module
    with its last contact, the version of Torizon OS and the application version (`1.0.0` or
@@ -747,18 +766,25 @@ disk space are those of the board.
    `install_failed`, and the application keeps running.
 8. A package that updates the agent itself (it has the agent service): the agent container is
    recreated and the result arrives once, from the new agent.
-9. Cut the power during `apply` (while the health check runs, and while the images load) and
-   during the download: after the boot the module runs the composition of `compose_file`, the
-   result of an apply that was cut is `failed` `install_failed` (or `installed` if the new
-   version was already in place), the download resumes, and no release gets two results.
-10. Fill the disk (a package larger than the free space) and see `failed` `no_space` or
+9. Then a package without the agent service: the result is `installed`, the agent service is
+   kept, and the agent still restarts: `docker restart firmline-agent`, and `docker compose -p
+   torizon -f /var/sota/storage/docker-compose/docker-compose.yml up --detach --force-recreate
+   --pull=never` works.
+10. Cut the power during `apply` (while the health check runs, and while the images load) and
+    during the download: after the boot the module runs the composition of `compose_file`, the
+    result of an apply that was cut is `failed` `install_failed` (or `installed` if the new
+    version was already in place), the download resumes, and no release gets two results. After
+    a boot that followed a cut, `systemctl status docker-compose` and `docker ps`: the agent
+    brings the composition up while Torizon's `docker-compose.service` runs its own `up`, and
+    both must have ended with every container running.
+11. Fill the disk (a package larger than the free space) and see `failed` `no_space` or
     `install_failed`, with the application still running.
-11. `docker stop firmline-agent` while a release is downloaded or applied stops the agent within
+12. `docker stop firmline-agent` while a release is downloaded or applied stops the agent within
     `stop_grace_period`, and the next start follows the release to its result.
-12. Check the log of the agent for the token, a link or a key: there must be none. Check that
+13. Check the log of the agent for the token, a link or a key: there must be none. Check that
     your composition and `.env` of the build machine hold no secret that `pack` would copy into
     the package (see "The package").
-13. Reboot the module: Torizon starts the composition of `compose_file`, the agent connects, and
+14. Reboot the module: Torizon starts the composition of `compose_file`, the agent connects, and
     the platform shows the version of the last package installed.
 
 ## Releases of the SDK (for maintainers)
