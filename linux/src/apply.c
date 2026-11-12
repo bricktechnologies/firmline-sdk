@@ -693,6 +693,37 @@ static fa_apply_outcome finish(job *j) {
     return FA_APPLY_INSTALLED;
 }
 
+/* The images that compose_file, now the composition installed, names, each with its image ID,
+ * into packages; have_in_use stays false when Compose cannot list them (then no image of the
+ * previous package is removed). */
+static void note_images_in_use(job *j, fa_apply_packages *packages) {
+    char file[OPTION_MAX], text[LIST_MAX];
+    const char *argv[] = {"compose", j->project, file, "config", "--images", NULL};
+    if (with_value(file, sizeof file, "--file", j->comp->compose_file) != 0 ||
+        fa_docker_run(argv, text, sizeof text, SHORT_MS) != 0) {
+        fa_log("warning", "apply: docker compose cannot list the images of %s: no image is removed",
+               j->comp->compose_file);
+        return;
+    }
+    char *cursor = text, *line;
+    while ((line = next_line(&cursor)) != NULL) {
+        if (packages->in_use_count == FA_APPLY_IN_USE_MAX ||
+            strlen(line) >= sizeof packages->in_use[0].image) {
+            fa_log("warning",
+                   "apply: %s names more than %d images or a name too long: no image "
+                   "is removed",
+                   j->comp->compose_file, FA_APPLY_IN_USE_MAX);
+            packages->in_use_count = 0;
+            return;
+        }
+        int k = packages->in_use_count++;
+        memcpy(packages->in_use[k].image, line, strlen(line) + 1);
+        if (image_id(line, packages->in_use[k].id) != 0)
+            packages->in_use[k].id[0] = '\0';
+    }
+    packages->have_in_use = true;
+}
+
 fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp,
                                   const char *release, const char *version,
                                   fa_apply_packages *packages) {
@@ -719,6 +750,8 @@ fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp
         packages->previous = j->previous;
         packages->installed = j->pkg;
         packages->have_previous = j->have_previous;
+        if (j->have_previous)
+            note_images_in_use(j, packages);
     } else {
         give_back_names(j);
         if (j->replacing && fa_store_write(j->dir, j->name, j->saved, j->saved_len, 0644) != 0)
@@ -754,6 +787,15 @@ static bool uses_id(const fa_package *p, const char *id) {
     return false;
 }
 
+/* Whether a service of the composition installed uses the name, or the image ID. */
+static bool in_use(const fa_apply_packages *p, const char *image, const char *id) {
+    for (int i = 0; i < p->in_use_count; i++)
+        if ((image != NULL && strcmp(p->in_use[i].image, image) == 0) ||
+            (id != NULL && strcmp(p->in_use[i].id, id) == 0))
+            return true;
+    return false;
+}
+
 static void remove_image(const char *reference) {
     const char *argv[] = {"image", "rm", "--", reference, NULL};
     if (fa_docker_run(argv, NULL, 0, SHORT_MS) != 0)
@@ -762,14 +804,15 @@ static void remove_image(const char *reference) {
 
 void fa_apply_remove_previous_images(const fa_apply_packages *packages) {
     const fa_package *previous = &packages->previous, *now = &packages->installed;
-    if (!packages->have_previous)
+    if (!packages->have_previous || !packages->have_in_use)
         return;
     for (int i = 0; i < previous->image_count; i++) {
         const char *image = previous->image[i].image, *old = previous->image[i].id;
         char id[128];
-        if (!uses_name(now, image) && image_id(image, id) == 0 && strcmp(id, old) == 0)
+        if (!uses_name(now, image) && !in_use(packages, image, NULL) && image_id(image, id) == 0 &&
+            strcmp(id, old) == 0)
             remove_image(image);
-        if (uses_id(now, old))
+        if (uses_id(now, old) || in_use(packages, NULL, old))
             continue;
         const char *argv[] = {"image", "inspect", "--format", "{{len .RepoTags}}", "--", old, NULL};
         char tags[32];

@@ -51,16 +51,27 @@ typedef enum {
 #define FA_APPLY_WORK "apply.tmp"
 #define FA_APPLY_PACKAGE "package.json"
 
-/* The package installed before (package.json, when it could be read) and the one installed. */
+/* The images of the services of a composition: the package's, and an agent service kept. */
+#define FA_APPLY_IN_USE_MAX (FA_MAX_COMPONENTS + 16)
+
+/* The package installed before (package.json, when it could be read) and the one installed, and
+ * the images that the composition installed names (have_in_use false when Compose could not list
+ * them): each name and its image ID ("" when the name names no image). These include the image of
+ * an agent service kept from the composition in use, which may be one of the previous package. */
 typedef struct {
     fa_package previous, installed;
-    bool have_previous;
+    bool have_previous, have_in_use;
+    int in_use_count;
+    struct {
+        char image[256];
+        char id[128];
+    } in_use[FA_APPLY_IN_USE_MAX];
 } fa_apply_packages;
 
 /* Installs the package of `release` for comp (install = docker-compose), whose version must be
  * `version` (the release's). On FA_APPLY_INSTALLED, packages holds the two packages (the version
- * installed is packages->installed.version); the reason of a failure is logged as one error line.
- */
+ * installed is packages->installed.version) and the images in use; the reason of a failure is
+ * logged as one error line. */
 fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp,
                                   const char *release, const char *version,
                                   fa_apply_packages *packages);
@@ -68,7 +79,9 @@ fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp
 /* After a success, once the outcome is written (a power loss here loses no result): the images of
  * the previous package that the installed one does not use lose their names of that package
  * (docker removes an image with its last name), and an image of it left with no name at all (its
- * name now names an image of the installed package) is removed. Never another image or name; a
+ * name now names an image of the installed package) is removed. Never another image or name, and
+ * never a name or image ID that a service of the composition installed uses (the agent service
+ * kept runs an image of the previous package); without the images in use, nothing is removed. A
  * removal that fails is logged. */
 void fa_apply_remove_previous_images(const fa_apply_packages *packages);
 

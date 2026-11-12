@@ -452,6 +452,35 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual({"web": web2, "db": db},
                          {s: image for s, (_, _, image) in self.containers().items()})
 
+    def test_the_image_of_a_kept_agent_service_is_never_removed(self):
+        """1.0.0 has the agent service, 2.0.0 has none: the agent service kept from the
+        composition in use runs firmline.local/firmline-agent:1.0.0, an image of the previous
+        package. Its name stays, also when the image has a second name (the first package packed
+        from the TorizonCore Builder composition: its ghcr.io name on the same ID), so that the
+        composition installed can be brought up again (pull_policy never)."""
+        self.docker.app_image("example/old:1", "stay")
+        agent = self.docker.app_image("example/agent:1", "stay")  # kept: the second name
+        web1 = self.docker.app_image("example/web:1", "stay")
+        web2 = self.docker.app_image("example/web:2", "stay")
+        first = self.package("1.0.0", {"firmline-agent": "example/agent:1", "web": "example/web:1"})
+        second = self.package("2.0.0", {"web": "example/web:2"})
+        self.forget(web1, web2)
+        self.start_current(OLD)
+        self.install(first, "1.0.0")
+        self.assert_outcome(self.apply(), "installed", None, "1.0.0")
+        self.install(second, "2.0.0", release=RELEASE_2)
+
+        result = self.apply(release=RELEASE_2)
+        self.assert_outcome(result, "installed", None, "2.0.0", release=RELEASE_2)
+        self.assertEqual("firmline.local/firmline-agent:1.0.0",
+                         self.composition()["services"]["firmline-agent"]["image"])
+        self.assertEqual(agent, self.image_id("firmline.local/firmline-agent:1.0.0"), result.stderr)
+        self.assertFalse(self.exists(web1))  # the rest of the previous package goes as before
+        self.docker.run("compose", "-p", PROJECT, "-f", str(self.compose_file), "up", "--detach",
+                        "--force-recreate", "--pull=never", timeout=120)
+        self.assertEqual({"firmline-agent": ("running", agent), "web": ("running", web2)},
+                         {s: (st, i) for s, (_, st, i) in self.containers().items()})
+
     def test_a_failure_gives_back_a_name_the_package_took(self):
         """1.0+a and 1.0_a have the same tag: when 1.0_a fails, firmline.local/web:1.0_a names
         the image of 1.0+a again, and that is the image that runs."""
