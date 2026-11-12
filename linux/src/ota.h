@@ -30,8 +30,9 @@
  * <the agent's configuration>` in the container firmline-apply, started with the agent's image
  * and --volumes-from its container (only an agent in a container installs one: otherwise the
  * offer is failed install_failed before the download). The agent waits for an earlier
- * firmline-apply that still runs and removes one that has ended. Its outcome in apply.json is the
- * result; the container gone without one (or docker silent for 5 minutes) is failed
+ * firmline-apply that still runs (up to 30 minutes, then the release is failed install_failed
+ * and that container left as it is) and removes one that has ended. Its outcome in apply.json is
+ * the result; the container gone without one (or docker silent for 5 minutes) is failed
  * install_failed, or installed when package.json already has the version, and the composition of
  * compose_file is brought up again (docker compose up --detach --remove-orphans --pull=never, in
  * a firmline-apply container too).

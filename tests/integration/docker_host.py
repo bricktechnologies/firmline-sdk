@@ -482,6 +482,8 @@ class TorizonDevice:
         self.update_key = Path(update_key)
         self.health_timeout = health_timeout
         self.agent_environment: Dict[str, str] = {}  # of the agent's service, set before start()
+        self.agent_volumes: list = []  # more volumes of the agent's service, set before start()
+        self.extra_config = ""  # more sections of agent.conf, set before start()
         self.exec_log = ""  # stderr of the commands run in the agent's container
         # container ID -> (kind, number, [(process, path, file)]): one file per follow
         self._logs: Dict[str, tuple] = {}
@@ -504,6 +506,7 @@ class TorizonDevice:
                 f"{self.os_release}:/etc/os-release:ro",
             ],
         }
+        service["volumes"] += self.agent_volumes
         if self.agent_environment:
             service["environment"] = dict(self.agent_environment)
         return service
@@ -540,6 +543,7 @@ class TorizonDevice:
             "install = docker-compose\n"
             f"compose_file = {self.compose_file}\n"
             f"health_timeout = {self.health_timeout}\n"
+            f"{self.extra_config}"
         )
 
     def start(self, services: Dict[str, str], agent_image: str) -> None:

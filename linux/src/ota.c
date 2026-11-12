@@ -60,8 +60,9 @@
 #define APPLY_CONTAINER "firmline-apply"
 #define APPLY_POLL_MS 1000         /* how often the container and apply.json are looked at */
 #define APPLY_UNANSWERED_MS 300000 /* docker silent that long: the apply container has ended */
-#define DOCKER_QUICK_MS 30000      /* docker ps, inspect, rm */
-#define DOCKER_RUN_MS 120000       /* docker run --detach */
+#define APPLY_WAIT_S 1800 /* for an earlier firmline-apply container to end before apply starts */
+#define DOCKER_QUICK_MS 30000 /* docker ps, inspect, rm */
+#define DOCKER_RUN_MS 120000  /* docker run --detach */
 
 typedef struct {
     char release[RELEASE_LEN + 1]; /* lower case */
@@ -134,7 +135,8 @@ struct fa_ota {
     fa_child child;
     /* JOB_APPLY */
     bool apply_started; /* apply was started (or is followed from install.json at start) */
-    bool apply_waiting; /* the wait for an earlier firmline-apply container is in the log */
+    long long
+        apply_waiting_since_ms;      /* monotonic: waiting for an earlier firmline-apply; 0 = not */
     long long apply_silent_since_ms; /* monotonic: docker has not answered since; 0 = it has */
     long long apply_next_ms;         /* monotonic: the next look */
     char own_id[65];                 /* the agent's container, "" = not known */
@@ -903,19 +905,30 @@ static void apply_cut(fa_ota *o) {
     bring_up(o);
 }
 
+/* How long an earlier firmline-apply container is waited for before apply starts: APPLY_WAIT_S,
+ * or the seconds (1 to APPLY_WAIT_S) of the environment variable FIRMLINE_APPLY_WAIT_S: for the
+ * integration tests only, which cannot wait 30 minutes. */
+static int apply_wait_s(void) {
+    const char *text = getenv("FIRMLINE_APPLY_WAIT_S");
+    char *end = NULL;
+    long s = text != NULL && text[0] != '\0' ? strtol(text, &end, 10) : 0;
+    return end != NULL && *end == '\0' && s >= 1 && s <= APPLY_WAIT_S ? (int)s : APPLY_WAIT_S;
+}
+
 /* The job follows the apply of o->job from now on (o->apply_started: already started). */
 static void begin_apply(fa_ota *o, bool started) {
     o->state = JOB_APPLY;
     o->apply_started = started;
-    o->apply_waiting = false;
+    o->apply_waiting_since_ms = 0;
     o->apply_silent_since_ms = 0;
     o->apply_next_ms = 0;
 }
 
 /* APPLY: once a second. Before apply runs, an earlier firmline-apply container that still runs
  * (an apply removing old images after its outcome, a composition being brought up) is waited
- * for, never removed. Then the outcome in apply.json, or the container's end without one. Nothing
- * is decided while the agent stops: the next start follows it again. */
+ * for, never removed, up to 30 minutes: then the release fails install_failed. Then the outcome in
+ * apply.json, or the container's end without one. Nothing is decided while the agent stops: the
+ * next start follows it again. */
 static void apply_step(fa_ota *o) {
     long long now = monotonic_ms();
     if (now < o->apply_next_ms || o->stopping || fa_service_stopping(o->svc))
@@ -936,10 +949,24 @@ static void apply_step(fa_ota *o) {
     o->apply_silent_since_ms = 0;
     if (!o->apply_started) {
         if (presence == APPLY_ALIVE) {
-            if (!o->apply_waiting)
+            if (o->apply_waiting_since_ms == 0) {
                 fa_log("info", "release %s: an earlier %s container still runs: waiting for it",
                        o->job.release, APPLY_CONTAINER);
-            o->apply_waiting = true;
+                o->apply_waiting_since_ms = now;
+            }
+            int limit = apply_wait_s();
+            if (now - o->apply_waiting_since_ms < (long long)limit * 1000)
+                return;
+            /* Paused, restarted by a policy, hung, or someone else's: nothing of this release
+             * has touched the device yet, so it fails here and the queue goes on; the container
+             * is left as it is. */
+            if (limit % 60 == 0)
+                fa_log("warning", "release %s: an earlier %s container still runs after %d min",
+                       o->job.release, APPLY_CONTAINER, limit / 60);
+            else
+                fa_log("warning", "release %s: an earlier %s container still runs after %d s",
+                       o->job.release, APPLY_CONTAINER, limit);
+            finish(o, FL_RESULT_FAILED, "install_failed", current_version(o));
             return;
         }
         /* A stop before this point leaves no install.json: at the next start the stored offer

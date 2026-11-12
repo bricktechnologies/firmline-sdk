@@ -11,6 +11,8 @@ The device is a TorizonDevice in the test daemon (docker_host.py), with the fake
 broker of harness.py; the packages are made with `pack`."""
 
 import json
+import os
+import shutil
 import subprocess
 import time
 import unittest
@@ -328,6 +330,46 @@ class TorizonTest(IntegrationTest):
         self.wait_running({"firmline-agent": self.agent_1, "web": web}, "the new composition")
         self.assertEqual(new, self.device.compose_file.read_text())
         self.assertNotIn("compose-previous.yml", self.device.data_files())
+
+    def test_an_earlier_apply_container_that_never_ends_fails_the_release(self):
+        """A firmline-apply container that never ends (paused, restarted, someone else's): the
+        wait before apply starts is bounded (FIRMLINE_APPLY_WAIT_S plays its 30 minutes), then
+        the release is failed install_failed with nothing touched, the container stays, and the
+        queue goes on with the release of another component."""
+        self.docker.app_image("example/web:2", "stay")
+        package = self.pack("2.0.0", self.device.composition({"web": "example/web:2"}))
+        busybox = shutil.which("busybox")
+        self.device.agent_volumes = [f"{busybox}:/usr/local/bin/busybox:ro"]
+        self.device.agent_environment = {"FIRMLINE_APPLY_WAIT_S": "15"}
+        self.device.extra_config = (
+            "\n[component tool]\nmain = false\nversion = fixed:1.0.0\n"
+            "install = script:/etc/firmline/install-tool.sh\n")
+        busy = self.docker.run("run", "-d", "--name", "firmline-apply", self.old).stdout.strip()
+        device_id = self.start_device()
+        script = self.device.etc / "install-tool.sh"
+        script.write_text("#!/usr/local/bin/busybox sh\nexit 0\n")
+        os.chmod(script, 0o755)
+
+        app = self.offer(device_id, "2.0.0", package)
+        self.device.wait_for_log(f"release {app.release}: an earlier firmline-apply container "
+                                 "still runs: waiting for it")
+        tool = self.platform.offer(device_id, "tool", "1.1.0", b"tool 1.1.0")
+
+        self.assertEqual([
+            {"release": app.release, "result": "failed", "fw": "1.0.0",
+             "detail": "install_failed"},
+            {"release": tool.release, "result": "installed", "fw": "1.1.0"},
+        ], self.results(device_id, 2))
+        time.sleep(5)
+        self.assertEqual(2, len(self.platform.results(device_id)))
+        self.assertIn(f"release {app.release}: an earlier firmline-apply container still runs "
+                      "after 15 s", self.device.logs())
+        self.assertEqual(
+            "running", self.docker.run("inspect", "--format", "{{.State.Status}}", busy).stdout.strip())
+        self.assertEqual([], [n for n in self.device.data_files()
+                              if n.startswith(("install", "download-", "offer-"))])
+        self.assertEqual({"firmline-agent": self.agent_1, "app": self.old}, self.running())
+        self.assertEqual([], self.device.apply_logs()[1:])  # no apply of the release ran
 
     def test_an_earlier_apply_container_is_waited_for_then_removed(self):
         """A firmline-apply container that still runs (an apply pruning images after its
