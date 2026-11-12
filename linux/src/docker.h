@@ -28,4 +28,15 @@ int fa_docker_run(const char *const argv[], char *out, size_t cap, int timeout_m
  * and every later one is refused, all with -1. */
 void fa_command_cancel(void);
 
+/* The ID (64 lowercase hex digits) of the Docker container the agent runs in, from
+ * /proc/self/mountinfo: the bind on /etc/hostname of <data root>/containers/<ID>/hostname, which
+ * Docker makes for every container (HOSTNAME is not used: a composition may set it). 0, or -1
+ * outside a container (or in one that Docker did not make), with id unchanged. The file can be
+ * changed with the environment variable FIRMLINE_MOUNTINFO_FILE: for the integration tests only,
+ * which play an agent outside a container inside the test container. */
+int fa_docker_own_container(char id[65]);
+
+/* The same from the text of a mountinfo file (len bytes, no NUL needed). */
+int fa_docker_container_of_mountinfo(const char *text, size_t len, char id[65]);
+
 #endif

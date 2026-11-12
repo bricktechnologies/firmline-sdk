@@ -20,22 +20,27 @@ Images are made with `docker import`, never from a base image: the applications 
 A base image of each kind is imported once (`firmline-test/app-base`, `firmline-test/agent-base`)
 and every tag is a commit on it with a `/version` file holding the tag, so two tags are two image
 IDs. The images it built are kept by reset(); everything else goes.
+
+TorizonDevice plays a device with Torizon OS in that daemon: the agent image as a service of the
+composition `torizon`.
 """
 
 import atexit
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from typing import Dict, Optional
 
-from harness import AGENT_BINARY
+from harness import AGENT_BINARY, wait_until
 
 DATA_ROOT = Path("/var/lib/docker")
 # The discard port: nothing listens there, so every connection through the proxy is refused.
@@ -191,9 +196,18 @@ class DockerHost:
         """Between tests: removes every container, network and volume (so everything of the
         Compose project `torizon`) and every image the host did not build; a built image keeps
         only its own name."""
-        ids = self.run("ps", "-aq").stdout.split()
-        if ids:
-            self.run("rm", "-f", "-v", *ids)
+        # A container started with --rm may be removing itself already ("removal ... already in
+        # progress"): looked at again until none is left.
+        deadline = time.monotonic() + 60
+        while True:
+            ids = self.run("ps", "-aq").stdout.split()
+            if not ids:
+                break
+            removal = self.run("rm", "-f", "-v", *ids, check=False)
+            if removal.returncode != 0 and time.monotonic() >= deadline:
+                raise AssertionError(f"reset cannot remove the containers:\n{removal.stderr}")
+            if removal.returncode != 0:
+                time.sleep(0.5)
         self.run("network", "prune", "-f")
         self.run("volume", "prune", "-af")
         # An image with child images cannot go before them: a later pass removes it.
@@ -427,3 +441,288 @@ def docker_host() -> DockerHost:
             raise RuntimeError(f"FIRMLINE_REQUIRE_DOCKER=1 and no Docker daemon: {_failure}")
         raise unittest.SkipTest(f"no Docker daemon: {_failure}")
     return _host
+
+
+class TorizonDevice:
+    """A device with Torizon OS, played in the test daemon: the agent image as the service
+    `firmline-agent` of the composition `torizon`, started as Torizon starts it at every boot
+    (`docker compose -p torizon -f <compose_file> up -d`).
+
+    The agent has network `host` (it reaches the fake platform and broker on 127.0.0.1), the
+    daemon's socket as /var/run/docker.sock, the named volume `firmline-data` as its data folder,
+    `compose_dir` (it plays /var/sota/storage/docker-compose: mounted at its own path, as on the
+    device, where the two paths are the same), a read-only /etc/firmline (agent.conf, a fake
+    serial-number, the root certificate and the update key) and a fake /etc/os-release.
+    Components: `torizon` (main, os-release, install none) and `app` (package:<initial version>,
+    install docker-compose, a health check of health_timeout seconds).
+
+    The log of every agent container and of every `firmline-apply` container is collected while
+    the device runs (agent_logs, apply_logs): apply runs with --rm and an update may recreate the
+    agent's container, and their logs would go with them."""
+
+    PROJECT = "torizon"
+    AGENT_SERVICE = "firmline-agent"
+    APPLY = "firmline-apply"
+    FOLLOWS = 20  # follows of one container at most (a listing older than its end starts one)
+    DATA = "/var/lib/firmline"
+    INITIAL_VERSION = "1.0.0"
+    OS_VERSION = "7.2.0-build.13"
+
+    def __init__(self, docker: DockerHost, folder: Path, platform_url: str, broker_port: int,
+                 root_ca: Path, update_key: Path, health_timeout: int = 10):
+        self.docker = docker
+        self.folder = Path(folder)
+        self.compose_dir = self.folder / "docker-compose"
+        self.compose_file = self.compose_dir / "docker-compose.yml"
+        self.etc = self.folder / "etc-firmline"
+        self.os_release = self.folder / "os-release"
+        self.platform_url = platform_url
+        self.broker_port = broker_port
+        self.root_ca = Path(root_ca)
+        self.update_key = Path(update_key)
+        self.health_timeout = health_timeout
+        self.agent_environment: Dict[str, str] = {}  # of the agent's service, set before start()
+        self.exec_log = ""  # stderr of the commands run in the agent's container
+        # container ID -> (kind, number, [(process, path, file)]): one file per follow
+        self._logs: Dict[str, tuple] = {}
+        self._order: list = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._watcher: Optional[threading.Thread] = None
+
+    # The composition.
+
+    def agent_service(self, image: str) -> dict:
+        service = {
+            "image": image,
+            "network_mode": "host",
+            "volumes": [
+                f"firmline-data:{self.DATA}",
+                f"{self.docker.socket}:/var/run/docker.sock",
+                f"{self.compose_dir}:{self.compose_dir}",
+                f"{self.etc}:/etc/firmline:ro",
+                f"{self.os_release}:/etc/os-release:ro",
+            ],
+        }
+        if self.agent_environment:
+            service["environment"] = dict(self.agent_environment)
+        return service
+
+    def composition(self, services: Dict[str, str], agent_image: Optional[str] = None) -> str:
+        """A composition (JSON, which Compose reads as YAML) of the services {name: image}, with
+        the agent's service first when agent_image is given."""
+        document: dict = {"services": {}}
+        if agent_image is not None:
+            document["services"][self.AGENT_SERVICE] = self.agent_service(agent_image)
+            document["volumes"] = {"firmline-data": {}}
+        for service, image in services.items():
+            document["services"][service] = {"image": image}
+        return json.dumps(document, indent=2) + "\n"
+
+    def config(self) -> str:
+        return (
+            "[platform]\n"
+            f"url = {self.platform_url}\n"
+            "broker = localhost\n"
+            f"broker_port = {self.broker_port}\n"
+            "ca_file = /etc/firmline/root.pem\n"
+            "update_key = /etc/firmline/update-key.pem\n"
+            "serial = file:/etc/firmline/serial-number\n"
+            "\n"
+            "[component torizon]\n"
+            "main = true\n"
+            "version = os-release:VERSION_ID\n"
+            "install = none\n"
+            "\n"
+            "[component app]\n"
+            "main = false\n"
+            f"version = package:{self.INITIAL_VERSION}\n"
+            "install = docker-compose\n"
+            f"compose_file = {self.compose_file}\n"
+            f"health_timeout = {self.health_timeout}\n"
+        )
+
+    def start(self, services: Dict[str, str], agent_image: str) -> None:
+        """Writes the device's files and starts the composition of the agent and `services`."""
+        self.compose_dir.mkdir(parents=True)
+        self.etc.mkdir(parents=True)
+        (self.etc / "agent.conf").write_text(self.config())
+        (self.etc / "serial-number").write_text(f"SN-{os.urandom(4).hex()}\n")
+        shutil.copyfile(self.root_ca, self.etc / "root.pem")
+        shutil.copyfile(self.update_key, self.etc / "update-key.pem")
+        self.os_release.write_text(f'NAME="Torizon OS"\nVERSION_ID="{self.OS_VERSION}"\n')
+        self.compose_file.write_text(self.composition(services, agent_image))
+        self.compose("up", "--detach")
+        self._watcher = threading.Thread(target=self._watch, daemon=True)
+        self._watcher.start()
+
+    def compose(self, *args: str, file: Optional[Path] = None) -> subprocess.CompletedProcess:
+        """docker compose of the project `torizon` with compose_file (or `file`)."""
+        return self.docker.run(
+            "compose", "-p", self.PROJECT, "-f", str(file or self.compose_file), *args,
+            timeout=180,
+        )
+
+    def containers(self) -> dict:
+        """{service: (container ID, state, image ID)} of the project's containers."""
+        listing = self.docker.run(
+            "ps", "-a", "--no-trunc", "--filter", f"label=com.docker.compose.project={self.PROJECT}",
+            "--format", '{{.Label "com.docker.compose.service"}} {{.ID}}',
+        ).stdout.split()
+        found = {}
+        for service, container in zip(listing[::2], listing[1::2]):
+            state, image = self.docker.run(
+                "inspect", "--format", "{{.State.Status}} {{.Image}}", container
+            ).stdout.split()
+            found[service] = (container, state, image)
+        return found
+
+    def agent(self) -> str:
+        """The ID of the agent's container."""
+        return self.containers()[self.AGENT_SERVICE][0]
+
+    # The agent.
+
+    def register(self, token: str) -> str:
+        """`firmline-agent register` in the agent's container, as at the device's test; the
+        device ID. The agent (run --wait-registration) then starts within 10 s."""
+        result = self.docker.run(
+            "exec", self.agent(), "firmline-agent", "register", "--token", token, check=False,
+            timeout=60,
+        )
+        self.exec_log += result.stderr
+        if result.returncode != 0:
+            raise AssertionError(f"register exited with {result.returncode}:\n{result.stderr}")
+        return json.loads(self.read_data("device.json"))["deviceId"]
+
+    def logs(self, container: Optional[str] = None) -> str:
+        """The log of a container (the agent's by default) as docker has it now."""
+        result = self.docker.run("logs", container or self.agent(), check=False)
+        return result.stdout + result.stderr
+
+    def wait_for_log(self, text: str, timeout: float = 60, count: int = 1,
+                     container: Optional[str] = None) -> str:
+        container = container or self.agent()
+        return wait_until(
+            lambda: (lambda log: log if log.count(text) >= count else None)(self.logs(container)),
+            timeout, f"the agent logging {text!r}",
+        )
+
+    def read_data(self, name: str) -> Optional[str]:
+        """A file of the agent's data folder (also of a stopped container), None when missing."""
+        with tempfile.TemporaryDirectory() as folder:
+            result = self.docker.run(
+                "cp", f"{self.agent()}:{self.DATA}/{name}", folder, check=False
+            )
+            if result.returncode != 0:
+                return None
+            return (Path(folder) / name).read_text()
+
+    def write_data(self, name: str, text: str) -> None:
+        """Writes a file into the agent's data folder (also of a stopped container)."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / name
+            path.write_text(text)
+            self.docker.run("cp", str(path), f"{self.agent()}:{self.DATA}/{name}")
+
+    def data_files(self) -> list:
+        with tempfile.TemporaryDirectory() as folder:
+            self.docker.run("cp", f"{self.agent()}:{self.DATA}/.", folder)
+            return sorted(os.listdir(folder))
+
+    # The logs of the containers that come and go.
+
+    def _follow(self, container: str, path: Path) -> tuple:
+        """`docker logs --follow` of a container into path, a new file: a follow writes the whole
+        log from the container's start, and a late one (the container being removed) writes only
+        an error, which must not replace what an earlier one got."""
+        out = open(path, "wb")
+        process = subprocess.Popen(
+            ["docker", "logs", "--follow", container], env=self.docker.env,
+            stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+        )
+        return process, path, out
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            listing = self.docker.run(
+                "ps", "-a", "--no-trunc", "--format",
+                '{{.ID}} {{.State}} {{.Names}} {{.Label "com.docker.compose.service"}}',
+                check=False, timeout=30,
+            )
+            for line in listing.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                container, state = parts[0], parts[1]
+                with self._lock:
+                    entry = self._logs.get(container)
+                if entry is not None:
+                    kind, number, follows = entry
+                    # A follow started before the container ran ends at once: again while it
+                    # runs.
+                    if (follows[-1][0].poll() is not None and state == "running"
+                            and len(follows) < self.FOLLOWS):
+                        path = self.folder / f"log-{number}-{kind}-{len(follows)}.txt"
+                        with self._lock:
+                            follows.append(self._follow(container, path))
+                    continue
+                if parts[2] == self.APPLY:
+                    kind = "apply"
+                elif len(parts) == 4 and parts[3] == self.AGENT_SERVICE:
+                    kind = "agent"
+                else:
+                    continue
+                number = len(self._order)
+                follow = self._follow(container, self.folder / f"log-{number}-{kind}-0.txt")
+                with self._lock:
+                    self._logs[container] = (kind, number, [follow])
+                    self._order.append(container)
+            self._stop.wait(0.3)
+
+    def _collected(self, kind: str, timeout: float) -> list:
+        """[(container ID, log)] of the containers of a kind, in the order they appeared: the log
+        docker has of a container that still exists, else the longest of those followed (once
+        complete, up to timeout)."""
+        with self._lock:
+            entries = [(c, self._logs[c][0], list(self._logs[c][2])) for c in self._order]
+        logs = []
+        for container, entry_kind, follows in entries:
+            if entry_kind != kind:
+                continue
+            now = self.docker.run("logs", container, check=False)
+            if now.returncode == 0:
+                logs.append((container, now.stdout + now.stderr))
+                continue
+            texts = []
+            for process, path, _ in follows:
+                try:
+                    process.wait(timeout)
+                except subprocess.TimeoutExpired:
+                    pass
+                texts.append(path.read_text(errors="replace"))
+            logs.append((container, max(texts, key=len)))
+        return logs
+
+    def agent_logs(self, timeout: float = 15) -> list:
+        """[(container ID, log)] of every agent container so far."""
+        return self._collected("agent", timeout)
+
+    def apply_logs(self, timeout: float = 15) -> list:
+        """[(container ID, log)] of every firmline-apply container so far."""
+        return self._collected("apply", timeout)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._watcher is not None:
+            self._watcher.join(30)
+        for _, _, follows in self._logs.values():
+            for process, _, out in follows:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                out.close()

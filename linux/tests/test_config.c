@@ -416,6 +416,18 @@ static void example_configuration_is_valid(void) {
     CHECK(cfg.component[0].main);
     CHECK_EQ_INT(cfg.component[0].install, FA_INSTALL_SCRIPT);
     CHECK_EQ_STR(cfg.component[0].script, "/usr/lib/firmline/install.sh");
+    CHECK_EQ_STR(cfg.path, path); /* as given: `run` starts `apply` with it */
+}
+
+static void config_path_too_long_is_refused(void) {
+    static fa_config cfg;
+    static char path[5000];
+    char err[256] = "";
+    memset(path, 'a', sizeof path - 1);
+    path[0] = '/';
+    path[sizeof path - 1] = '\0';
+    CHECK_EQ_INT(fa_config_load(path, &cfg, err), -1);
+    CHECK_EQ_STR(err, "the path of the configuration file is too long");
 }
 
 int main(void) {
@@ -433,5 +445,6 @@ int main(void) {
     RUN(config_platform_value_rules);
     RUN(config_key_table_is_exposed);
     RUN(example_configuration_is_valid);
+    RUN(config_path_too_long_is_refused);
     return CHECK_RESULT;
 }

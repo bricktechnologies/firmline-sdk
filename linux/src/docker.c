@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -231,6 +232,82 @@ int fa_command_run(const char *const argv[], char *out, size_t cap, int timeout_
         return -1;
     }
     return WEXITSTATUS(status);
+}
+
+#define CONTAINERS "/containers/"
+#define HOSTNAME_FILE "/hostname"
+#define HOSTNAME_POINT "/etc/hostname"
+#define CONTAINER_ID_LEN 64
+#define MOUNTINFO_LIMIT (1024 * 1024)
+
+/* Field `want` (0-based, separated by spaces) of a mountinfo line of n bytes, or false. */
+static bool field(const char *line, size_t n, int want, const char **start, size_t *len) {
+    size_t i = 0;
+    for (int f = 0;; f++) {
+        while (i < n && line[i] == ' ')
+            i++;
+        size_t begin = i;
+        while (i < n && line[i] != ' ')
+            i++;
+        if (i == begin)
+            return false;
+        if (f == want) {
+            *start = line + begin;
+            *len = i - begin;
+            return true;
+        }
+    }
+}
+
+static bool lower_hex(const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    return true;
+}
+
+int fa_docker_container_of_mountinfo(const char *text, size_t len, char id[65]) {
+    const size_t prefix = strlen(CONTAINERS), name = strlen(HOSTNAME_FILE);
+    const size_t suffix = prefix + CONTAINER_ID_LEN + name;
+    size_t at = 0;
+    while (at < len) {
+        const char *line = text + at;
+        const char *end = memchr(line, '\n', len - at);
+        size_t n = end != NULL ? (size_t)(end - line) : len - at;
+        at += n + 1;
+        /* "<id> <parent> <major:minor> <root> <mount point> ...": root is the path of the bind's
+         * source inside its file system. */
+        const char *root, *point;
+        size_t root_len, point_len;
+        if (!field(line, n, 3, &root, &root_len) || !field(line, n, 4, &point, &point_len) ||
+            point_len != strlen(HOSTNAME_POINT) || memcmp(point, HOSTNAME_POINT, point_len) != 0 ||
+            root_len < suffix)
+            continue;
+        const char *s = root + root_len - suffix;
+        const char *hex = s + prefix;
+        if (memcmp(s, CONTAINERS, prefix) != 0 || !lower_hex(hex, CONTAINER_ID_LEN) ||
+            memcmp(hex + CONTAINER_ID_LEN, HOSTNAME_FILE, name) != 0)
+            continue;
+        memcpy(id, hex, CONTAINER_ID_LEN);
+        id[CONTAINER_ID_LEN] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+int fa_docker_own_container(char id[65]) {
+    const char *path = getenv("FIRMLINE_MOUNTINFO_FILE");
+    if (path == NULL || path[0] == '\0')
+        path = "/proc/self/mountinfo";
+    FILE *f = fopen(path, "r");
+    if (f == NULL)
+        return -1;
+    char *text = malloc(MOUNTINFO_LIMIT);
+    size_t n = text != NULL ? fread(text, 1, MOUNTINFO_LIMIT, f) : 0;
+    fclose(f);
+    int rc = text != NULL ? fa_docker_container_of_mountinfo(text, n, id) : -1;
+    free(text);
+    return rc;
 }
 
 int fa_docker_run(const char *const argv[], char *out, size_t cap, int timeout_ms) {

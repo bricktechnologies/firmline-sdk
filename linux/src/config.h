@@ -47,6 +47,7 @@ typedef struct {
     int status_interval_s;    /* default 3600 */
     fa_component component[FA_MAX_COMPONENTS];
     int component_count;
+    char path[4096]; /* the file it was read from, as given (`run` starts `apply` with it) */
 } fa_config;
 
 /* Reads and validates the file. 0, or -1 with a message (line-numbered when it is about a line). */

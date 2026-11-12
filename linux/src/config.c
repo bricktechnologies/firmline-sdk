@@ -433,6 +433,11 @@ int fa_config_load(const char *path, fa_config *out, char err[256]) {
     out->status_interval_s = 3600;
     snprintf(out->data_dir, sizeof out->data_dir, "/var/lib/firmline");
     snprintf(out->os_release, sizeof out->os_release, "/etc/os-release");
+    if (strlen(path) >= sizeof out->path) {
+        snprintf(err, 256, "the path of the configuration file is too long");
+        return -1;
+    }
+    memcpy(out->path, path, strlen(path) + 1);
 
     FILE *f = fopen(path, "r");
     if (f == NULL) {

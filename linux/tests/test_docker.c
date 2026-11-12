@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -130,6 +131,52 @@ static void command_after_cancel_is_refused(void) {
     CHECK_EQ_INT(fa_command_run(printf_abc, out, sizeof out, 5000), -1);
 }
 
+#define HEX "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+#define OTHER "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+static void own_container_is_the_one_of_the_hostname_bind(void) {
+    char id[65];
+    /* Docker's default data root on the root file system: the hostname file of another
+     * container bound elsewhere (a composition may do it) and the resolv.conf of this one come
+     * first, then its /etc/hostname. */
+    const char *docker = "1 0 0:31 / / rw,relatime - overlay overlay rw\n"
+                         "2 1 8:1 /var/lib/docker/containers/" OTHER
+                         "/hostname /run/other-hostname rw - ext4 /dev/sda1 rw\n"
+                         "3 1 8:1 /var/lib/docker/containers/" HEX
+                         "/resolv.conf /etc/resolv.conf rw,relatime - ext4 /dev/sda1 rw\n"
+                         "4 1 8:1 /var/lib/docker/containers/" HEX
+                         "/hostname /etc/hostname rw,relatime - ext4 /dev/sda1 rw\n";
+    CHECK_EQ_INT(fa_docker_container_of_mountinfo(docker, strlen(docker), id), 0);
+    CHECK_EQ_STR(id, HEX);
+    /* /var/lib/docker on a file system of its own: the root starts at its containers folder;
+     * the last line without a newline */
+    const char *own_fs = "7 1 253:2 /containers/" HEX "/hostname /etc/hostname rw - ext4 /dev/x rw";
+    CHECK_EQ_INT(fa_docker_container_of_mountinfo(own_fs, strlen(own_fs), id), 0);
+    CHECK_EQ_STR(id, HEX);
+}
+
+static void outside_a_container_there_is_no_own_container(void) {
+    char id[65] = "unchanged";
+    const char *cases[] = {
+        "",
+        "22 1 0:21 / / rw - overlay overlay rw\n"
+        "23 22 8:1 /etc/hostname /etc/hostname rw - ext4 /dev/sda1 rw\n",
+        /* upper case, 63 digits, another file name, another mount point, another folder, too
+         * few fields */
+        "4 1 8:1 /var/lib/docker/containers/0123456789ABCDEF0123456789abcdef0123456789abcdef0123"
+        "456789abcdef/hostname /etc/hostname rw - ext4 /dev/sda1 rw\n",
+        "4 1 8:1 /var/lib/docker/containers/123456789abcdef0123456789abcdef0123456789abcdef0123"
+        "456789abcdef/hostname /etc/hostname rw - ext4 /dev/sda1 rw\n",
+        "4 1 8:1 /var/lib/docker/containers/" HEX "/hostnames /etc/hostname rw - ext4 /dev/a rw\n",
+        "4 1 8:1 /var/lib/docker/containers/" HEX "/hostname /etc/hostname2 rw - ext4 /dev/a rw\n",
+        "4 1 8:1 /var/lib/docker/xcontainers/" HEX "/hostname /etc/hostname rw - ext4 /dev/a rw\n",
+        "4 1 8:1 /var/lib/docker/containers/" HEX "/hostname\n",
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++)
+        CHECK_EQ_INT(fa_docker_container_of_mountinfo(cases[i], strlen(cases[i]), id), -1);
+    CHECK_EQ_STR(id, "unchanged");
+}
+
 int main(void) {
     snprintf(log_path, sizeof log_path, "/tmp/fa-docker-log-%ld", (long)getpid());
     RUN(command_captures_stdout_and_returns_the_exit_code);
@@ -137,6 +184,8 @@ int main(void) {
     RUN(command_stderr_goes_to_the_log_not_to_the_output);
     RUN(command_past_its_time_is_killed_with_its_group);
     RUN(docker_run_puts_docker_in_front);
+    RUN(own_container_is_the_one_of_the_hostname_bind);
+    RUN(outside_a_container_there_is_no_own_container);
     RUN(command_after_cancel_is_refused); /* last: a cancel is for good */
     unlink(log_path);
     return CHECK_RESULT;
