@@ -44,6 +44,23 @@ class ImageTest(unittest.TestCase):
             '{"/var/lib/firmline":{}} Apache-2.0 ["firmline-agent"] ["run","--wait-registration"]',
         )
 
+    def test_image_has_the_docker_client_and_archive_tools_torizon_needs(self):
+        for command in (("docker", "--version"), ("docker", "compose", "version"),
+                        ("tar", "--version"), ("gzip", "--version")):
+            result = subprocess.run(
+                ["docker", "run", "--rm", "--entrypoint", command[0], IMAGE, *command[1:]],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, f"{command}: {result.stderr}")
+
+    def test_image_size_is_reported(self):
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", IMAGE, "--format", "{{.Size}}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(inspect.returncode, 0, inspect.stderr)
+        print(f"\nimage size: {int(inspect.stdout) / 1_000_000:.1f} MB")
+
 
 if __name__ == "__main__":
     unittest.main()
