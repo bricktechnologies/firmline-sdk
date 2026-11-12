@@ -1,17 +1,20 @@
-# Firmline agent for generic Linux: integration guide
+# Firmline agent for generic Linux and Torizon: integration guide
 
-This guide is for the engineer who puts the Firmline agent on a Linux device. It covers what the
-agent does, how to build or get it, every configuration key, how a device is registered at the
-end-of-line test station, how updates are installed, and what is left on the device.
+This guide is for the engineer who puts the Firmline agent on a Linux device, or on a Toradex
+module with Torizon OS (the section "Torizon"). It covers what the agent does, how to build or
+get it, every configuration key, how a device is registered at the end-of-line test station, how
+updates are installed, and what is left on the device.
 
 The agent helps a manufacturer deliver signed updates and report the state of a device to the
 Firmline platform. It prepares the data the platform needs; it does not make a product compliant
-with any regulation, and what an update does on your device is decided by your install script.
+with any regulation, and what an update does on your device is decided by your install script
+(on Torizon, by the package you build with `pack`).
 
 ## What the agent does and does not do
 
-The agent (`firmline-agent`) is one program with four commands: `register`, `run`, `status` and
-`endpoint`.
+The agent (`firmline-agent`) is one program with six commands: `register`, `run`, `status`,
+`endpoint`, `pack` and `apply`. The last two are for Torizon: `pack` runs on your build machine,
+`apply` on the device (the agent starts it, you do not).
 
 It does:
 
@@ -31,7 +34,8 @@ It does:
 
 It does not:
 
-- install anything by itself: how a file is put in place is your script's job;
+- install anything by itself: how a file is put in place is your script's job (the one exception
+  is a Docker Compose package on Torizon, which `apply` installs: see "Torizon");
 - decide when to update: the platform offers, the agent applies one release at a time, in arrival
   order;
 - run a file that was not completely downloaded and verified;
@@ -63,18 +67,24 @@ prints `firmline-agent <version>`, `--help` the commands.
 
 A container image, `ghcr.io/bricktechnologies/firmline-agent` (linux/amd64, linux/arm64 and
 linux/arm/v7), is built from `linux/Dockerfile` and published at each release; until the first
-release is published, build it yourself with `docker build -f linux/Dockerfile .`. It runs
-`firmline-agent run` and keeps its data in the volume `/var/lib/firmline`. Inside the image an
-install script runs inside the container; updating the host or other containers is the subject of
-the Docker and Torizon support, which is planned and not part of this release.
+release is published, build it yourself with `docker build -f linux/Dockerfile .`. Its entry
+point is `firmline-agent` and its default command is `run --wait-registration`; it keeps its data
+in the volume `/var/lib/firmline`. An install script runs inside the container; updating the host
+or other containers is what `install = docker-compose` is for, on Torizon (see "Torizon"). The
+image carries the Docker client and Docker Compose for that.
 
 Use a tag: `:1` follows the latest 1.x release, `:X.Y.Z` (for example `:1.0.0`) pins one
 release. There is no `latest` tag. The image contains no configuration: mount the folder with
-`agent.conf` and the update key at `/etc/firmline` (the default path). `run` exits with code 1
-on a device that is not registered, so a container started with a restart policy before
-registration restarts in a loop, and `docker exec … register` cannot be used. Register first, with a one-off container on the same
-volume (the image's entry point is `firmline-agent`, so the command follows the image name); put
-the token file in a folder of its own, mounted writable, because the agent deletes the file:
+`agent.conf` and the update key at `/etc/firmline` (the default path).
+
+`run --wait-registration`, the image's default command, does not exit on a device that is not
+registered: it logs once that it waits, and looks for `device.json` again every 10 seconds. So a
+container with a restart policy can be started before the registration, and the device registered
+with `docker exec <container> firmline-agent register …` on the same volume; the agent starts
+working within about 10 seconds of the registration. Without the flag (as in the systemd unit)
+`run` exits with code 1 on a device that is not registered. A one-off container works as well;
+put the token file in a folder of its own, mounted writable, because the agent deletes the file
+(the image's entry point is `firmline-agent`, so the command follows the image name):
 
 ```
 docker run --rm \
@@ -85,7 +95,8 @@ docker run --rm \
     register --token-file /run/firmline-token/token --serial SN-000123
 ```
 
-Then start the long-running container, which runs `run` by default:
+Then start the long-running container, which runs `run --wait-registration` by default (started
+before the registration, it waits for it):
 
 ```
 docker run -d --name firmline-agent --restart unless-stopped \
@@ -105,6 +116,9 @@ test station".
 3. At the end-of-line test station, register the device with a one-time token.
 4. Enable the service (`linux/systemd/firmline-agent.service`).
 5. Run the check list at the end of this guide on a real device.
+
+On a Toradex module with Torizon OS, follow the section "Torizon" instead of steps 1, 2 and 4, and
+use `examples/torizon`.
 
 ## Configuration
 
@@ -149,8 +163,8 @@ up to 16 components, and exactly one has `main = true`.
 | `agent_service` | `firmline-agent` | Only with `install = docker-compose`: the service of the composition that runs the agent, same characters as `project`. |
 | `health_timeout` | `120` | Only with `install = docker-compose`: seconds the new composition has to be running after an update, 10 to 3600. |
 
-`install = docker-compose` is accepted by the configuration; the agent does not install such a component yet
-(offers for it are answered like those for `install = none`).
+`install = docker-compose` is for a Docker Compose application on Torizon: see "Torizon". One
+component at most can have it, and the configuration refuses a second one.
 
 The version is read every time the agent needs it (for each status, and to settle an update), not
 once at start. A `fixed:` version never changes: use it only for a component the agent does not
@@ -238,9 +252,9 @@ A release gets one of three results:
 
 | Result | When | Detail |
 | --- | --- | --- |
-| `installed` | The install script succeeded (see "The script contract"). | none; `fw` is the new version |
+| `installed` | The install script succeeded (see "The script contract"), or `apply` installed the package and its health check passed (see "Torizon"). | none; `fw` is the new version |
 | `rejected_signature` | The signature or the key identifier of the manifest is not valid, or the downloaded file differs from the manifest in size or SHA-256. | `signature_invalid`, `kid_mismatch`, `size_mismatch`, `hash_mismatch` |
-| `failed` | Any other refusal or error. | `format_unknown`, `tenant_mismatch`, `family_mismatch`, `family_unknown`, `component_mismatch`, `older_version`, `no_space`, `install_failed`, `boot_failed` |
+| `failed` | Any other refusal or error. | `format_unknown`, `tenant_mismatch`, `family_mismatch`, `family_unknown`, `component_mismatch`, `older_version`, `no_space`, `install_failed`, `boot_failed`, `health_check_failed` (Torizon only) |
 
 On the platform the first `rejected_signature` of a release pauses the whole release, for every
 device. A site proxy or cache that alters downloaded files therefore pauses the rollout: let the
@@ -388,6 +402,208 @@ the network or run any command: `registered`, `deviceId`, `familyId`, `certifica
 version) and `pendingInstall` (an install running, or waiting for a restart). A value that is not
 known is `null`. It is meant for the test station and for support.
 
+## Torizon
+
+This section is for a Toradex module with Torizon OS, where the product is a Docker Compose
+application. The agent is one more service of that composition, with the image
+`ghcr.io/bricktechnologies/firmline-agent`. It reports the version of Torizon OS and of your
+application, and installs a new version of the application from a package that `pack` builds. It
+does not update Torizon OS: that stays with Torizon, and an offer for a component with
+`install = none` is answered `failed component_mismatch`.
+
+The agent installs only from inside a Docker container: on an agent that is not in one, an offer
+for a `docker-compose` component is answered `failed install_failed`. The behaviour described here
+was tried with Docker Compose 2.26.1, the version that the image ships (Debian's `docker-compose`
+package), and with Docker's classic image store.
+
+### Installing the agent
+
+Put the agent in the composition that Torizon starts at every boot
+(`/var/sota/storage/docker-compose/docker-compose.yml`, project `torizon`), and its files in the
+Torizon image, as you do for your own application: the composition, and the folder `/etc/firmline`
+with `agent.conf` and `update.pem` (the public key of the «OTA releases» page). This guide does
+not repeat the documentation of TorizonCore Builder, which builds that image. The files of
+`examples/torizon` are a start:
+
+- `examples/torizon/docker-compose.yml`: the agent service;
+- `examples/torizon/agent.conf`: Torizon OS (`version = os-release:VERSION_ID`,
+  `install = none`) and the application (`install = docker-compose`, `version = package:1.0.0`,
+  `main = true`), with `serial = devicetree`.
+
+What the agent service needs:
+
+| Line | Why |
+| --- | --- |
+| `command: ["run", "--wait-registration"]` | The image's own command. The container can start before the module is registered, and waits (see "Registration on Torizon"). |
+| `restart: unless-stopped` | A crash or an update of the agent brings it back. |
+| `container_name: firmline-agent` | A name to use in `docker exec` and `docker cp`. |
+| `stop_grace_period: 20s` | At least 15 seconds, see below. |
+| `firmline-data:/var/lib/firmline` | A volume for the data folder: the identity and the state of the updates must survive the recreation of the container. |
+| `/var/run/docker.sock` | How the agent manages the containers of the application. It gives the agent root on the device (see "Security notes"). |
+| `/var/sota/storage/docker-compose` (same path inside) | The composition that Torizon starts, which an update replaces. The agent writes `docker-compose.yml.new` next to it. |
+| `/etc/os-release` of the host, read-only, at `/host/os-release`, with `os_release = /host/os-release` | The container has an `os-release` of its own: this one gives the version of Torizon OS. |
+| `/etc/firmline`, read-only | `agent.conf` and the update key. |
+
+The serial number comes from `serial = devicetree`, the file `/proc/device-tree/serial-number`,
+which the container's own `/proc` shows: the example does not mount it. Check it in the trial
+(see the check list).
+
+Keep the defaults of `compose_file`, `project` and `agent_service` unless your Torizon image
+starts the composition from elsewhere or under another name. The service of the agent must be
+named as `agent_service` says (`firmline-agent` by default).
+
+**`stop_grace_period`: at least 15 seconds.** The default of Docker is 10 seconds, then the
+container is killed. A stop of the agent takes about 11 seconds when it is ending an install
+script (it gives the script SIGTERM and up to 5 seconds, then SIGKILL) and closing its broker
+connection. A stop that Docker cuts short with SIGKILL gives the agent no time to do that: what
+the script had done is then settled at the next start by reading the version, as after a power
+loss. When `apply` runs, a stop of the agent does not end it: `firmline-apply` is a container of
+its own, and the next agent reads its outcome (see "The update path on Torizon"). An update of
+the application that recreates the agent container stops it the same way, so the time matters
+there too. 20 seconds leaves room.
+
+### Registration on Torizon
+
+At the end-of-line test station, with the module on and the agent container running (it waits
+for the registration):
+
+```
+docker cp ./token firmline-agent:/tmp/token
+docker exec firmline-agent firmline-agent register --token-file /tmp/token --serial SN-000123
+```
+
+(without `--serial` when the configuration has `serial = devicetree`). `docker exec
+firmline-agent firmline-agent register --token …` also works, but an argument is visible to
+every user of the module in the process list: prefer the file, which the agent deletes. The exit
+codes and the standard output are those of "Registration at the end-of-line test station".
+Within about 10 seconds of the registration the waiting `run` connects to the broker.
+
+### The package
+
+A Docker Compose application is released as one file, uploaded as the firmware of a version of the
+application component. `pack` builds it on your build machine or in your CI, where the images are:
+
+```
+firmline-agent pack --compose docker-compose.yml --version 1.4.3 --output app-1.4.3.tar
+```
+
+`--version` is the firmware version of the release: the version you give the platform for the
+file (1 to 64 bytes, no control character, no space at either end). The package is an
+uncompressed tar of three files:
+
+- `firmline-package.json`: the format (1), the architecture of the images, the version, and for
+  each service its local image name and its image ID;
+- `docker-compose.yml`: your composition, with each service on its local image
+  `firmline.local/<service>:<tag>`, `pull_policy: never` and no `build:`. No image is ever pulled
+  on the device;
+- `images.tar.gz`: `docker save` of all the images of the composition, compressed. It is always
+  complete: a package holds every image, not only the changed ones.
+
+The local tag is the version with each character outside `[A-Za-z0-9_.-]` replaced by `_`, so
+version `1.4.3+build.7` gives `firmline.local/web:1.4.3_build.7`; the package keeps the version as
+given. The package has no signature of its own: its size and SHA-256 are in the manifest that
+your update key signs. The size limit of a firmware file is 256 MB.
+
+What `pack` needs and does:
+
+- Docker (the CLI and Docker Compose 2.24 or newer, because `pack` uses `!reset`), `tar` and
+  `gzip`, where `pack` runs.
+- Every service has `image:`. A service with only `build:` is refused: build it and tag it first.
+  `pack` never pulls: each image must be on the machine. All the images are of one architecture
+  (a package is for one), and there are at most 16 services.
+- A service name must be usable as a part of a Docker image name: lowercase letters and digits
+  in groups joined by `.`, `_`, `__` or `-`, at most 64 characters. Otherwise `pack` refuses it.
+- Services of Compose profiles that are not active are not in the package: `pack` packs what
+  `docker compose config` renders.
+- `docker compose config` writes your `${VAR}` and `.env` values into the composition of the
+  package, as the build machine reads them. **A secret in `.env` ends up in the firmware file**,
+  which the platform stores and the device downloads. Keep secrets out of the composition: the
+  device must have them some other way.
+- The images stay tagged under their local names on the build machine.
+- The image IDs of the package are the configuration digests of the manifest of `docker save`.
+  The device compares them with the IDs that Docker shows after `docker load`, so the device must
+  use Docker's classic image store (Torizon's default): on another image store the IDs can differ
+  and `apply` refuses the package.
+- The output appears only when the package is complete (it replaces a file of the same name), and
+  `pack` removes its temporary files on every exit, also on SIGINT, SIGTERM and SIGHUP.
+
+### The update path on Torizon
+
+The platform offers the release, and the agent checks and downloads it as for any component (see
+"The update path"). For the component with `install = docker-compose` it then starts
+`firmline-agent apply` in a container of its own, `firmline-apply`: the same image as the agent,
+with the mounts of the agent's container (`--volumes-from`). It survives the recreation of the
+agent, which an update of the application can cause. The agent writes `install.json` in the
+state `apply` first, reads `apply.json` every second, and sends the result when `apply` has
+one. After a restart the agent follows the apply that was running, and the result is sent once,
+by the agent that reads the outcome first.
+
+One component with `install = docker-compose` per device: Torizon starts one composition, and a
+second package would replace all of it. The configuration refuses a second one.
+
+`apply` does this, in order:
+
+1. Checks the package: the three files, the description, the version (it must be the version of
+   the release: another is `failed install_failed`), the architecture against the one of the
+   Docker daemon, the composition against the description, and the images in `images.tar.gz`
+   against the IDs of the description. If anything is wrong, nothing on the device has been
+   touched.
+2. When the package has no service named `agent_service` and the composition in use has one, that
+   service is copied into the new composition (the same image, with the named volumes and
+   networks it uses), so that its container stays as it is and `--remove-orphans` does not
+   remove it. An agent service that has `depends_on` is refused: put the agent service in the
+   package. A package that has the agent service updates the agent.
+3. Loads the images (`docker load`) and checks that each local name is the ID of the description.
+4. Writes the new composition as `<compose_file>.new`, copies the composition in use to
+   `compose-previous.yml` in the data folder, and starts the new one:
+   `docker compose -p <project> -f <compose_file>.new up --detach --remove-orphans --pull=never`.
+5. The health check, for `health_timeout` seconds (default 120, 10 to 3600). It looks every 2
+   seconds, and the whole time counts: a package takes at least `health_timeout` seconds to
+   install. Every service of the new composition must have containers, all `running`, none that
+   has restarted since the start of step 4 (a container that `up` kept is counted from its count
+   before). A container with a healthcheck must not be `unhealthy` at any look, and must be
+   `healthy` at the end (`starting` at the end fails).
+6. On success, `<compose_file>.new` replaces `compose_file` and `package.json` is written: the
+   version is now the one of the package. `apply` writes its outcome in `apply.json`, and then
+   removes the images of the previous package that the new one does not use. Only those:
+   never another image of your device.
+7. On a failure, it puts the previous composition back: the local names that the package had
+   taken from another image are given back, `compose_file` is the previous composition, and the
+   previous composition is started again as in step 4. The images that the failed package
+   loaded stay on the device.
+
+The results:
+
+| Result | When |
+| --- | --- |
+| `installed` | Step 6 is done. `fw` is the version of the package. |
+| `failed` `install_failed` | Anything before the health check, the start of the new composition, or step 6 (the previous composition goes back): the package could not be read, was for another version or architecture, an image did not load, `docker compose up` failed. |
+| `failed` `health_check_failed` | The health check failed. |
+
+For a `failed` the version in the status is the one the component reports, as after a failed
+script. A release that fails does not come back: a new release is needed to try again.
+
+Cases:
+
+- **An earlier `firmline-apply` container is still there.** One that ended is removed. One that
+  still runs (an earlier apply removing images, say) is waited for, up to 30 minutes; then the new
+  release is `failed install_failed`, with nothing of it touched, and the container is left alone.
+- **`apply` was cut** (a power loss, a stop of the device, the `firmline-apply` container removed)
+  and ended without an outcome in `apply.json`. If the installed package (`package.json`) already
+  has the version of the release, the release is `installed` (the health check had passed); else
+  it is `failed install_failed`, and the previous composition goes back to `compose_file` if the
+  new one had replaced it. In both cases the agent then brings up the composition of
+  `compose_file` (in a `firmline-apply` container: `docker compose up --detach --remove-orphans
+  --pull=never`), so that the module runs what the file says, and `<compose_file>.new` and
+  `compose-previous.yml` are removed.
+- **The label of the containers.** The containers that the update created keep the Compose label
+  `com.docker.compose.project.config_files` with the path `<compose_file>.new`, a file that no
+  longer exists after a success. Run Compose on the module with `-f <compose_file>`.
+
+**Torizon Cloud.** If the module is also on Torizon Cloud, do not assign application updates to
+it from there: the two systems would both replace the composition and the images. Updates of
+Torizon OS stay with Torizon.
+
 ## Data folder
 
 The data folder (`data_dir`, `/var/lib/firmline` by default) is created with mode `0700`. Every
@@ -413,7 +629,11 @@ never copy it to a second device.
 | `register.key` | The new key during `register`, until the identity is saved. |
 | `offer-<release>.json` | An offer as received, while its release is queued. |
 | `download-<release>.part` | The bytes of a download so far; `.bin` is the verified file while its script runs. |
-| `install.json` | An install in progress (release, component, version, state, boot identifier): present while a script runs or waits for the restart. |
+| `install.json` | An install in progress (release, component, version, state, boot identifier): present while a script runs or waits for the restart, or, in the state `apply`, while `apply` installs a package (Torizon). |
+| `apply.json` | Torizon: the outcome of `apply`, written only by `apply`: the release, the state (`running`, `installed` or `failed`), the detail (`install_failed` or `health_check_failed` for `failed`) and the version. The agent reads it every second while `apply` runs, and at start. |
+| `package.json` | Torizon: the description (`firmline-package.json`) of the last package installed. It is where the version source `package:` reads, and what tells `apply` which images the next package replaces. |
+| `compose-previous.yml` | Torizon: a copy of the composition in use, made by `apply` before it starts the new one and removed when `apply` ends. |
+| `apply.tmp/` | Torizon: the working folder of `apply` (the composition and the images of the package, until they are loaded). Removed when `apply` ends, and by the next `apply` if one was cut short. |
 | `result-<release>.json` | The result of a release as it is (or was) sent, and whether the broker confirmed it. The 32 most recent are kept. |
 
 The release in a file name is the release identifier in lower case. Free disk space for the data
@@ -446,6 +666,9 @@ connection to the broker does not use a proxy: for a site that only has a proxy,
   the platform is replaced, put the new public key on the devices before releases are signed with it.
 - The registration token is a secret until it is used: use `--token-file`, in a folder only root can
   read (`/run` is a memory file system), and do not put it in the image.
+- On Torizon the agent container mounts `/var/run/docker.sock`, which gives the agent, and anyone
+  who can run code in its container or change its image, root on the device. Treat the agent's
+  image, its composition and `/etc/firmline` like the rest of your system image.
 - The broker and the platform are verified on every connection (TLS 1.2 or later). There is no
   option to switch verification off.
 - `FIRMLINE_BOOT_ID_FILE` is an environment variable used by the automated tests to play a reboot
@@ -485,6 +708,50 @@ connection to the broker does not use a proxy: for a site that only has a proxy,
    reports the right result.
 8. Check the log for the token, a link or a key: there must be none.
 
+## Check list for a trial on a Toradex module with Torizon OS
+
+Run it on a real module with the composition of your product, before the first release to
+customers. A real module matters: the serial number, the Docker storage, the power loss and the
+disk space are those of the board.
+
+1. The module runs a Torizon OS image built with your composition (the agent service of
+   `examples/torizon/docker-compose.yml` and your own services) and `/etc/firmline` with
+   `agent.conf` and `update.pem`. `docker ps` shows the agent container, `docker logs` its line
+   `waiting for the registration`.
+2. In the container, `cat /proc/device-tree/serial-number` prints the serial number of the module
+   and `firmline-agent status --config /etc/firmline/agent.conf` prints `registered` as false and
+   does not complain (`docker exec firmline-agent firmline-agent …`).
+3. `docker info --format '{{.DriverStatus}}'` and `docker version --format '{{.Server.Arch}}'`: the
+   storage is Docker's classic image store, and the architecture is the one of your package.
+4. Register with the token (see "Registration on Torizon"): `deviceId` and exit 0; within about
+   10 seconds the log shows the connection and `status sent`, and the platform shows the module
+   with its last contact, the version of Torizon OS and the application version (`1.0.0` or
+   what `version = package:…` says).
+5. Build a package with `pack` for a new version, upload it as the firmware of that version of the
+   application component and release it to the module: the log shows the download, the
+   `apply:` lines, and the result `installed`; `docker ps` shows the new containers, the version
+   on the platform changes, and the old images of your application are gone.
+6. Release a package whose service exits at once (or has a failing healthcheck): the result is
+   `failed` with `health_check_failed`, the old composition runs again and
+   `/var/sota/storage/docker-compose/docker-compose.yml` is unchanged.
+7. Release a package of another architecture, or one built with a wrong version: `failed`
+   `install_failed`, and the application keeps running.
+8. A package that updates the agent itself (it has the agent service): the agent container is
+   recreated and the result arrives once, from the new agent.
+9. Cut the power during `apply` (while the health check runs, and while the images load) and
+   during the download: after the boot the module runs the composition of `compose_file`, the
+   result of an apply that was cut is `failed` `install_failed` (or `installed` if the new
+   version was already in place), the download resumes, and no release gets two results.
+10. Fill the disk (a package larger than the free space) and see `failed` `no_space` or
+    `install_failed`, with the application still running.
+11. `docker stop firmline-agent` while a release is downloaded or applied stops the agent within
+    `stop_grace_period`, and the next start follows the release to its result.
+12. Check the log of the agent for the token, a link or a key: there must be none. Check that
+    your composition and `.env` of the build machine hold no secret that `pack` would copy into
+    the package (see "The package").
+13. Reboot the module: Torizon starts the composition of `compose_file`, the agent connects, and
+    the platform shows the version of the last package installed.
+
 ## Releases of the SDK (for maintainers)
 
 A tag `vX.Y.Z` on `main` publishes the image `ghcr.io/bricktechnologies/firmline-agent` with the
@@ -500,3 +767,11 @@ by running the workflow by hand (that builds the three architectures after the t
 
 On the first tag, the GHCR package is created private: make it public in the package settings once.
 The organisation must also allow `GITHUB_TOKEN` to create packages.
+
+The test of the image (`tests/integration/test_image.py`, skipped unless `FIRMLINE_IMAGE` names a
+built image) starts containers, so it needs a Docker client of its own. Run from Git Bash on
+Windows, a `docker run` that starts it needs `MSYS_NO_PATHCONV=1` (otherwise Git Bash rewrites the
+Linux paths of the command), `-w /work` for the working folder and `-v "$(pwd -W):/work"` for the
+repository (a Windows path, which Docker Desktop reads); `scripts/check.sh` sets the first one.
+`scripts/check.sh` runs its development container with `--privileged`: it starts a Docker daemon
+of its own for the Torizon tests, and keeps its images in the volume `firmline-docker`.

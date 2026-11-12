@@ -19,14 +19,16 @@ It has two parts:
 | --- | --- |
 | Core library | ready |
 | Linux agent for generic Linux (install script) | ready |
-| Docker and Torizon (`install = docker-compose`) | planned (T179) |
+| Docker and Torizon (`install = docker-compose`) | ready: Toradex modules with Torizon OS are supported |
 | Zephyr | planned (T180) |
 
 ## Start here
 
 The guide for generic Linux is [docs/integration.md](docs/integration.md): build or image,
 configuration, registration, the install script contract, renewal, relay, data folder, logs and a
-check list for a trial on a real device. An example for a Debian device is in
+check list for a trial on a real device. The same guide covers Torizon (Docker Compose
+applications on a Toradex module), with an example in [examples/torizon](examples/torizon). An
+example for a Debian device is in
 [examples/debian-script](examples/debian-script), and a systemd unit in
 [linux/systemd/firmline-agent.service](linux/systemd/firmline-agent.service).
 
@@ -40,7 +42,9 @@ scripts/check.sh
 ```
 
 It builds the development image, checks the formatting, builds with the sanitizers, and runs the
-unit and integration tests. The agent image is built from `linux/Dockerfile`.
+unit and integration tests. The development container runs `--privileged`: it starts a Docker daemon of
+its own for the Torizon tests (the volume `firmline-docker` keeps its images). The agent image is
+built from `linux/Dockerfile`.
 
 ## Official sources and support
 
