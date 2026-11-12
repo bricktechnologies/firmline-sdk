@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static size_t read_file(const char *path, char *buf, size_t cap) {
     size_t n;
@@ -19,7 +20,8 @@ static size_t read_file(const char *path, char *buf, size_t cap) {
 static void test_status_matches_the_guide_example(void) {
     char expected[512], b[4096];
     size_t n = read_file(FL_VECTOR_DIR "/device/status.json", expected, sizeof expected);
-    int r = fl_status_build(b, sizeof b, "1.4.3+build.7", NULL, 0, 1804665600, 0, 86400);
+    int r = fl_status_build(b, sizeof b, "1.4.3+build.7", NULL, 0, "firmline-agent/1.0.0",
+                            1804665600, 0, 86400);
     CHECK(n > 0);
     CHECK_EQ_INT(r, (int)n);
     CHECK_EQ_STR(b, expected);
@@ -38,7 +40,7 @@ static void test_result_matches_the_guide_example(void) {
 static void test_status_with_components_and_offset(void) {
     char b[4096];
     fl_component_version c[2] = {{"main", "1.4.3"}, {"modem", "2.0.1"}};
-    int r = fl_status_build(b, sizeof b, NULL, c, 2, 1804665600, 60, -1);
+    int r = fl_status_build(b, sizeof b, NULL, c, 2, NULL, 1804665600, 60, -1);
     CHECK(r > 0);
     CHECK_EQ_STR(b, "{\"components\":{\"main\":\"1.4.3\",\"modem\":\"2.0.1\"},"
                     "\"ts\":\"2027-03-10T09:00:00+01:00\"}");
@@ -59,31 +61,59 @@ static void test_status_limits(void) {
     char b[4096], code[17][8], long65[66];
     fl_component_version c[17];
     fill_components(c, code, 17);
-    CHECK(fl_status_build(b, sizeof b, NULL, c, 16, 0, 0, 0) > 0);
+    CHECK(fl_status_build(b, sizeof b, NULL, c, 16, NULL, 0, 0, 0) > 0);
     memset(long65, 'a', 65);
     long65[65] = '\0';
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, long65, NULL, 0, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, long65, NULL, 0, NULL, 0, 0, 0), FL_ERR_ARG);
     CHECK_EQ_STR(b, "");
-    CHECK(fl_status_build(b, sizeof b, long65 + 1, NULL, 0, 0, 0, 0) > 0); /* 64 bytes */
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, "", NULL, 0, 0, 0, 0), FL_ERR_ARG);
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, NULL, 0, 0, 0, 0), FL_ERR_ARG);
+    CHECK(fl_status_build(b, sizeof b, long65 + 1, NULL, 0, NULL, 0, 0, 0) > 0); /* 64 bytes */
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, "", NULL, 0, NULL, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, NULL, 0, NULL, 0, 0, 0), FL_ERR_ARG);
     c[0].version = long65;
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 1, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 1, NULL, 0, 0, 0), FL_ERR_ARG);
     c[0].version = "";
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 1, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 1, NULL, 0, 0, 0), FL_ERR_ARG);
     c[0].version = "1";
     c[1].code = c[0].code; /* repeated code */
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 2, 0, 0, 0), FL_ERR_ARG);
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", NULL, 0, 0, 1440, 0), FL_ERR_ARG);
-    CHECK_EQ_INT(fl_status_build(b, 10, "1", NULL, 0, 0, 0, 0), FL_ERR_SPACE);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, NULL, c, 2, NULL, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", NULL, 0, NULL, 0, 1440, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, 10, "1", NULL, 0, NULL, 0, 0, 0), FL_ERR_SPACE);
     CHECK_EQ_STR(b, "");
+}
+
+static void test_status_with_sdk_and_components_orders_fields(void) {
+    char b[4096];
+    fl_component_version c[1] = {{"main", "1"}};
+    CHECK(fl_status_build(b, sizeof b, NULL, c, 1, "a_b.c-1/2.0", 0, 0, -1) > 0);
+    CHECK_EQ_STR(b, "{\"components\":{\"main\":\"1\"},\"sdk\":\"a_b.c-1/2.0\","
+                    "\"ts\":\"1970-01-01T00:00:00Z\"}");
+}
+
+static void test_status_refuses_a_bad_sdk(void) {
+    char b[4096], name33[40], v65[80];
+    const char *bad[] = {"agent", "a/b/c", " a/1", "a/1 ",  "a /1",  "a/ 1",
+                         "/1",    "a/",    "",     "a b/1", "a/1\t", "a/\n1"};
+    size_t i;
+    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", NULL, 0, bad[i], 0, 0, 0), FL_ERR_ARG);
+        CHECK_EQ_STR(b, "");
+    }
+    memset(v65, 'x', 65); /* a 65-byte value: name, '/', then the version */
+    v65[3] = '/';
+    v65[65] = '\0';
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", NULL, 0, v65, 0, 0, 0), FL_ERR_ARG);
+    CHECK(fl_status_build(b, sizeof b, "1", NULL, 0, v65 + 1, 0, 0, 0) > 0); /* 64 bytes */
+    memset(name33, 'n', 33);
+    strcpy(name33 + 33, "/1");
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", NULL, 0, name33, 0, 0, 0), FL_ERR_ARG);
+    CHECK(fl_status_build(b, sizeof b, "1", NULL, 0, name33 + 1, 0, 0, 0) > 0); /* 32 */
 }
 
 static void test_status_refuses_17_components(void) {
     char b[4096], code[17][8];
     fl_component_version c[17];
     fill_components(c, code, 17);
-    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", c, 17, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(b, sizeof b, "1", c, 17, NULL, 0, 0, 0), FL_ERR_ARG);
     CHECK_EQ_STR(b, "");
 }
 
@@ -101,7 +131,7 @@ static void test_status_over_4096_bytes(void) {
         c[i].code = codes[i];
         c[i].version = vers;
     }
-    CHECK_EQ_INT(fl_status_build(big, sizeof big, "1", c, 16, 0, 0, 0), FL_ERR_ARG);
+    CHECK_EQ_INT(fl_status_build(big, sizeof big, "1", c, 16, NULL, 0, 0, 0), FL_ERR_ARG);
     CHECK_EQ_STR(big, "");
 }
 
@@ -271,6 +301,8 @@ int main(void) {
     RUN(test_result_matches_the_guide_example);
     RUN(test_status_with_components_and_offset);
     RUN(test_status_limits);
+    RUN(test_status_with_sdk_and_components_orders_fields);
+    RUN(test_status_refuses_a_bad_sdk);
     RUN(test_status_refuses_17_components);
     RUN(test_status_over_4096_bytes);
     RUN(test_result_drops_detail_over_64);

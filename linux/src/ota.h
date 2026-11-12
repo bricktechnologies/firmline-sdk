@@ -12,14 +12,34 @@
  *   offer-<release>.json    the offer as received, while the release is queued: the queue is
  *                           rebuilt from these at start (each checked again)
  *   download-<release>.part the bytes downloaded so far; hashed again from disk before resuming
- *   download-<release>.bin  the verified file, while its script runs
- *   install.json            {release, component, version} while a script that exited 10 waits
- *                           for the reboot; at the next start: installed or failed boot_failed
+ *   download-<release>.bin  the verified file, while its script (or apply) runs
+ *   install.json            {release, component, version, state, bootId} while an installation
+ *                           is under way: state "running" while the script runs (at the next
+ *                           start: installed when the component reports the version, else failed
+ *                           install_failed), "reboot" while a script that exited 10 waits for the
+ *                           reboot (at the next boot: installed or failed boot_failed), "apply"
+ *                           from the start of apply to its outcome (at the next start: followed)
  *   result-<release>.json   {seq, published, payload}: the exact result message, the 32 most
  *                           recent by seq; published = PUBACK received
+ * and, for a docker-compose component, the files of `apply` (apply.h, cmd_apply.c), which the
+ * agent reads: apply.json (the outcome), package.json (the version source package:), and
+ * compose-previous.yml, written back to compose_file when an apply cut short had already
+ * replaced it.
+ *
+ * A docker-compose component is installed by `firmline-agent apply --release <id> --config
+ * <the agent's configuration>` in the container firmline-apply, started with the agent's image
+ * and --volumes-from its container (only an agent in a container installs one: otherwise the
+ * offer is failed install_failed before the download). The agent waits for an earlier
+ * firmline-apply that still runs (up to 30 minutes, then the release is failed install_failed
+ * and that container left as it is) and removes one that has ended. Its outcome in apply.json is
+ * the result; the container gone without one (or docker silent for 5 minutes) is failed
+ * install_failed, or installed when package.json already has the version, and the composition of
+ * compose_file is brought up again (docker compose up --detach --remove-orphans --pull=never, in
+ * a firmline-apply container too).
  *
  * Runs in the service's thread, from its hooks; never blocks the loop for long: the download is
- * a libcurl multi transfer and the script a child process, both polled from the loop. */
+ * a libcurl multi transfer and the script a child process, both polled from the loop; the docker
+ * commands of apply are short (docker ps once a second). */
 #ifndef FIRMLINE_AGENT_OTA_H
 #define FIRMLINE_AGENT_OTA_H
 

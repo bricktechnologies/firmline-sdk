@@ -26,4 +26,15 @@ int fa_cmd_status(int argc, char **argv);
  * writes or removes endpoint.json in the data folder. Exit 0, or 1 on any error. */
 int fa_cmd_endpoint(int argc, char **argv);
 
+/* pack --compose <file> --version <v> --output <file.tar>: the package of a Docker Compose
+ * application (cmd_pack.c), built with the docker CLI of this machine. Exit 0; 1 with one error
+ * line on stderr and no output file (a file already there is left as it was). */
+int fa_cmd_pack(int argc, char **argv);
+
+/* apply --release <id> [--config <path>]: installs the package of the release that run left in
+ * the data folder for the docker-compose component (cmd_apply.c, apply.h); the outcome in
+ * apply.json. Exit 0 when installed; 1 when failed (apply.json says why) or on a usage or
+ * configuration error (no apply.json). */
+int fa_cmd_apply(int argc, char **argv);
+
 #endif

@@ -5,7 +5,13 @@
  *   DOWNLOAD a libcurl transfer appends to the .part and feeds the check;
  *   RETRY    waiting for fl_download_retry_at after a 429, a 5xx or a network error;
  *   INSTALL  the component's script runs with the verified file;
- *   REBOOT   reboot_command runs after a script that exited 10.
+ *   REBOOT   reboot_command runs after a script that exited 10;
+ *   APPLY    (install = docker-compose) `firmline-agent apply` runs in the container
+ *            firmline-apply, started from the agent's own (same image, --volumes-from), so that
+ *            it outlives a recreation of the agent; its outcome is read from apply.json every
+ *            second. An agent that starts with install.json in the state "apply" follows it the
+ *            same way: the result is sent by whichever agent reads the outcome first, and stored
+ *            before it is sent, so a recreated agent sends that result again, never another.
  * A job ends with a result, or without one when the platform has to offer again (a link expired
  * or refused, a check that could not run): never with a file that was not verified.
  * Whether a link has expired is the server's answer (404), never the device clock's: a link is
@@ -15,7 +21,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ota.h"
 
+#include "apply.h"
 #include "components.h"
+#include "docker.h"
 #include "firmline/fl_download.h"
 #include "firmline/fl_json.h"
 #include "firmline/fl_messages.h"
@@ -49,6 +57,12 @@
 #define INSTALL_STATE "install.json"
 #define RELEASE_LEN 36
 #define CLOSE_GRACE_S 5 /* for a running script to end when the agent stops */
+#define APPLY_CONTAINER "firmline-apply"
+#define APPLY_POLL_MS 1000         /* how often the container and apply.json are looked at */
+#define APPLY_UNANSWERED_MS 300000 /* docker silent that long: the apply container has ended */
+#define APPLY_WAIT_S 1800 /* for an earlier firmline-apply container to end before apply starts */
+#define DOCKER_QUICK_MS 30000 /* docker ps, inspect, rm */
+#define DOCKER_RUN_MS 120000  /* docker run --detach */
 
 typedef struct {
     char release[RELEASE_LEN + 1]; /* lower case */
@@ -61,7 +75,15 @@ typedef struct {
     size_t len;
 } stored_result;
 
-typedef enum { JOB_NONE, JOB_REHASH, JOB_DOWNLOAD, JOB_RETRY, JOB_INSTALL, JOB_REBOOT } job_state;
+typedef enum {
+    JOB_NONE,
+    JOB_REHASH,
+    JOB_DOWNLOAD,
+    JOB_RETRY,
+    JOB_INSTALL,
+    JOB_REBOOT,
+    JOB_APPLY
+} job_state;
 
 typedef enum {
     SINK_OK,
@@ -111,6 +133,13 @@ struct fa_ota {
     } links[FL_QUEUE_MAX];
     fa_http_download *http;
     fa_child child;
+    /* JOB_APPLY */
+    bool apply_started; /* apply was started (or is followed from install.json at start) */
+    long long
+        apply_waiting_since_ms;      /* monotonic: waiting for an earlier firmline-apply; 0 = not */
+    long long apply_silent_since_ms; /* monotonic: docker has not answered since; 0 = it has */
+    long long apply_next_ms;         /* monotonic: the next look */
+    char own_id[65];                 /* the agent's container, "" = not known */
 };
 
 /* ---- Names -------------------------------------------------------------------------------- */
@@ -192,7 +221,8 @@ static const fa_component *find_component(const fa_config *cfg, const char *code
 static bool installable(void *ctx, const char *component) {
     const fa_ota *o = ctx;
     const fa_component *c = find_component(o->cfg, component);
-    return c != NULL && c->install == FA_INSTALL_SCRIPT;
+    return c != NULL &&
+           (c->install == FA_INSTALL_SCRIPT || c->install == FA_INSTALL_DOCKER_COMPOSE);
 }
 
 static const char *installed_version(void *ctx, const char *component) {
@@ -354,8 +384,9 @@ static fl_time link_deadline(const fa_ota *o, const char *release) {
     return monotonic_s() + FL_DOWNLOAD_RETRY_WINDOW;
 }
 
-/* Removes the downloads no queued release needs: every .bin (a script that never ended), and
- * the .part files of releases no longer queued (except `keep`). */
+/* Removes the downloads no queued release needs: every .bin (a script that never ended) but the
+ * one of an apply being followed, and the .part files of releases no longer queued (except
+ * `keep`). */
 static void clean_downloads(fa_ota *o, const char *keep) {
     DIR *d = opendir(o->cfg->data_dir);
     if (d == NULL)
@@ -367,6 +398,8 @@ static void clean_downloads(fa_ota *o, const char *keep) {
     while ((e = readdir(d)) != NULL && n < 16) {
         bool bin = release_of(e->d_name, "download-", ".bin", release);
         bool part = !bin && release_of(e->d_name, "download-", ".part", release);
+        if (bin && o->state == JOB_APPLY && same_release(release, o->job.release))
+            continue; /* apply may still read it */
         if (bin ||
             (part && queued(o, release) == NULL && (keep == NULL || !same_release(release, keep))))
             snprintf(names[n++], sizeof names[0], "%s", e->d_name);
@@ -658,6 +691,324 @@ static int save_install_state(fa_ota *o, const char *state) {
     return 0;
 }
 
+/* ---- install = docker-compose: apply in a container of its own ----------------------------- */
+
+static long long monotonic_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* The agent's own container (ruling 5), looked up once: 0, or -1 outside a container. */
+static int own_container(fa_ota *o) {
+    return o->own_id[0] != '\0' ? 0 : fa_docker_own_container(o->own_id);
+}
+
+typedef enum { APPLY_NONE, APPLY_ENDED, APPLY_ALIVE, APPLY_UNKNOWN } apply_presence;
+
+/* Whether a container named firmline-apply exists, and whether it has ended (created, exited,
+ * dead) or still runs (running, restarting, paused, or being removed after its end). */
+static apply_presence apply_container(void) {
+    static char out[16384];
+    const char *argv[] = {"ps",         "--all",
+                          "--no-trunc", "--filter=name=" APPLY_CONTAINER,
+                          "--format",   "{{.Names}} {{.State}}",
+                          NULL};
+    if (fa_docker_run(argv, out, sizeof out, DOCKER_QUICK_MS) != 0)
+        return APPLY_UNKNOWN;
+    char *rest = NULL;
+    for (char *line = strtok_r(out, "\n", &rest); line != NULL;
+         line = strtok_r(NULL, "\n", &rest)) {
+        char *space = strchr(line, ' ');
+        if (space == NULL)
+            continue;
+        *space = '\0';
+        if (strcmp(line, APPLY_CONTAINER) != 0) /* the filter matches parts of names too */
+            continue;
+        const char *state = space + 1;
+        return strcmp(state, "created") == 0 || strcmp(state, "exited") == 0 ||
+                       strcmp(state, "dead") == 0
+                   ? APPLY_ENDED
+                   : APPLY_ALIVE;
+    }
+    return APPLY_NONE;
+}
+
+/* docker run --detach --rm --name firmline-apply --volumes-from <agent> [--entrypoint=<e>]
+ * <the agent's image ID> <args>: the same image and mounts as the agent (socket, data folder,
+ * composition folder, configuration). A firmline-apply container that has ended is removed
+ * first. 0, or -1 (logged). */
+static int run_apply_container(fa_ota *o, const char *entrypoint, const char *const args[]) {
+    char image[256];
+    const char *inspect[] = {"inspect", "--type=container", "--format={{.Image}}", o->own_id, NULL};
+    if (own_container(o) != 0) {
+        fa_log("error", "release %s: not in a container: no %s container can be started",
+               o->job.release, APPLY_CONTAINER);
+        return -1;
+    }
+    if (fa_docker_run(inspect, image, sizeof image, DOCKER_QUICK_MS) != 0)
+        image[0] = '\0';
+    image[strcspn(image, "\n")] = '\0';
+    if (!fa_package_id_ok(image)) {
+        fa_log("error", "release %s: the image of the agent's container %.12s cannot be read",
+               o->job.release, o->own_id);
+        return -1;
+    }
+    if (apply_container() == APPLY_ENDED) {
+        const char *rm[] = {"rm", APPLY_CONTAINER, NULL};
+        if (fa_docker_run(rm, NULL, 0, DOCKER_QUICK_MS) == 0)
+            fa_log("info", "release %s: the %s container left by an earlier run is removed",
+                   o->job.release, APPLY_CONTAINER);
+    }
+    char volumes[96], entry[64];
+    snprintf(volumes, sizeof volumes, "--volumes-from=%s", o->own_id);
+    const char *argv[FA_COMMAND_MAX_ARGS];
+    int n = 0;
+    argv[n++] = "run";
+    argv[n++] = "--detach";
+    argv[n++] = "--rm";
+    argv[n++] = "--name=" APPLY_CONTAINER;
+    argv[n++] = volumes;
+    if (entrypoint != NULL) {
+        snprintf(entry, sizeof entry, "--entrypoint=%s", entrypoint);
+        argv[n++] = entry;
+    }
+    argv[n++] = image;
+    for (int i = 0; args[i] != NULL && n < FA_COMMAND_MAX_ARGS - 1; i++)
+        argv[n++] = args[i];
+    argv[n] = NULL;
+    if (fa_docker_run(argv, NULL, 0, DOCKER_RUN_MS) != 0) {
+        fa_log("error", "release %s: the %s container cannot be started", o->job.release,
+               APPLY_CONTAINER);
+        return -1;
+    }
+    return 0;
+}
+
+/* The folder and the file name of compose_file (an absolute path). 0, or -1. */
+static int split_compose_file(const fa_component *c, char dir[256], char name[256]) {
+    const char *slash = strrchr(c->compose_file, '/');
+    if (slash == NULL || slash[1] == '\0')
+        return -1;
+    size_t dir_len = slash == c->compose_file ? 1 : (size_t)(slash - c->compose_file);
+    memcpy(dir, c->compose_file, dir_len);
+    dir[dir_len] = '\0';
+    snprintf(name, 256, "%s", slash + 1);
+    return 0;
+}
+
+/* What an apply cut short leaves of its own: apply.tmp (up to the size of the package: left
+ * there, it would fail the free-space check of every next download, which comes before the next
+ * apply), <compose_file>.new, and compose-previous.yml (the composition before it). With put_back
+ * the latter is written to compose_file first when the two differ: the cut came after apply had
+ * put the new composition in place, before package.json (apply.h, step 6), so the composition
+ * goes back with the version. */
+static void drop_apply_files(fa_ota *o, bool put_back) {
+    char dir[256], name[256], new_name[300];
+    fa_apply_remove_work(o->cfg->data_dir);
+    if (split_compose_file(o->comp, dir, name) != 0)
+        return;
+    char *previous = NULL, *current = NULL;
+    size_t previous_len = 0, current_len = 0;
+    if (put_back &&
+        fa_store_read(o->cfg->data_dir, FA_APPLY_PREVIOUS, &previous, &previous_len) == 0) {
+        bool same = fa_store_read(dir, name, &current, &current_len) == 0 &&
+                    current_len == previous_len && memcmp(current, previous, current_len) == 0;
+        free(current);
+        if (!same && fa_store_write(dir, name, previous, previous_len, 0644) != 0) {
+            fa_log("error", "release %s: cannot write the previous composition back to %s (%s)",
+                   o->job.release, o->comp->compose_file, strerror(errno));
+            free(previous);
+            return; /* compose-previous.yml stays */
+        }
+        if (!same)
+            fa_log("warning", "release %s: %s is the previous composition again", o->job.release,
+                   o->comp->compose_file);
+        free(previous);
+    }
+    if (fa_store_remove(o->cfg->data_dir, FA_APPLY_PREVIOUS) != 0)
+        fa_log("warning", "cannot remove %s/%s: %s", o->cfg->data_dir, FA_APPLY_PREVIOUS,
+               strerror(errno));
+    snprintf(new_name, sizeof new_name, "%s.new", name);
+    if (fa_store_remove(dir, new_name) != 0)
+        fa_log("warning", "cannot remove %s/%s: %s", dir, new_name, strerror(errno));
+}
+
+/* After an apply cut short the composition that runs may be the new one, never checked: the
+ * composition of compose_file is brought up again as Torizon starts it, so that the device runs
+ * what the file says. In a firmline-apply container too, since this agent's container may be
+ * one of those it recreates. */
+static void bring_up(fa_ota *o) {
+    char project[96], file[300];
+    snprintf(project, sizeof project, "--project-name=%s", o->comp->project);
+    snprintf(file, sizeof file, "--file=%s", o->comp->compose_file);
+    const char *args[] = {"compose",          project,        file, "up", "--detach",
+                          "--remove-orphans", "--pull=never", NULL};
+    fa_log("info", "release %s: bringing the composition of %s up again", o->job.release,
+           o->comp->compose_file);
+    if (run_apply_container(o, "docker", args) != 0)
+        fa_log("error", "release %s: the composition of %s is not brought up again", o->job.release,
+               o->comp->compose_file);
+}
+
+/* The outcome of the job's release in apply.json: true with the result, its detail ("" for
+ * none) and version ("" for none); false while there is none (missing, another release's,
+ * `running`, unreadable). */
+static bool apply_outcome(fa_ota *o, fl_result *result, char detail[32], char version[65]) {
+    char *text = NULL;
+    size_t len = 0;
+    if (fa_store_read(o->cfg->data_dir, FA_APPLY_STATE, &text, &len) != 0)
+        return false;
+    fl_json j;
+    char release[RELEASE_LEN + 2], state[16], read_detail[32];
+    bool ok = fl_json_parse(&j, text, len) == FL_OK &&
+              fl_json_string(&j, "release", release, sizeof release) == FL_OK &&
+              strlen(release) == RELEASE_LEN && same_release(release, o->job.release) &&
+              fl_json_string(&j, "state", state, sizeof state) == FL_OK;
+    if (ok && fl_json_string(&j, "version", version, 65) != FL_OK)
+        version[0] = '\0';
+    if (ok && fl_json_string(&j, "detail", read_detail, sizeof read_detail) != FL_OK)
+        read_detail[0] = '\0';
+    free(text);
+    if (!ok)
+        return false;
+    detail[0] = '\0';
+    if (strcmp(state, "installed") == 0) {
+        *result = FL_RESULT_INSTALLED;
+        if (version[0] == '\0')
+            snprintf(version, 65, "%s", o->job.version);
+        return true;
+    }
+    if (strcmp(state, "failed") == 0) {
+        *result = FL_RESULT_FAILED;
+        snprintf(detail, 32, "%s",
+                 strcmp(read_detail, "health_check_failed") == 0 ? read_detail : "install_failed");
+        return true;
+    }
+    return false;
+}
+
+/* apply has gone without an outcome in apply.json: stopped, cut by a restart or a power loss, or
+ * never started. The version tells whether its last step was done (package.json is written
+ * only after the health check): then the release is installed; else it failed install_failed and
+ * the composition before it is put back. Either way compose_file is brought up again. */
+static void apply_cut(fa_ota *o) {
+    fa_log("warning", "release %s: the apply container ended without an outcome", o->job.release);
+    const char *now = current_version(o);
+    if (now != NULL && strcmp(now, o->job.version) == 0) {
+        fa_log("info", "release %s: version %s is in place: it passed the health check",
+               o->job.release, now);
+        drop_apply_files(o, false);
+        finish(o, FL_RESULT_INSTALLED, NULL, o->job.version);
+    } else {
+        drop_apply_files(o, true);
+        finish(o, FL_RESULT_FAILED, "install_failed", current_version(o));
+    }
+    bring_up(o);
+}
+
+/* How long an earlier firmline-apply container is waited for before apply starts: APPLY_WAIT_S,
+ * or the seconds (1 to APPLY_WAIT_S) of the environment variable FIRMLINE_APPLY_WAIT_S: for the
+ * integration tests only, which cannot wait 30 minutes. */
+static int apply_wait_s(void) {
+    const char *text = getenv("FIRMLINE_APPLY_WAIT_S");
+    char *end = NULL;
+    long s = text != NULL && text[0] != '\0' ? strtol(text, &end, 10) : 0;
+    return end != NULL && *end == '\0' && s >= 1 && s <= APPLY_WAIT_S ? (int)s : APPLY_WAIT_S;
+}
+
+/* The job follows the apply of o->job from now on (o->apply_started: already started). */
+static void begin_apply(fa_ota *o, bool started) {
+    o->state = JOB_APPLY;
+    o->apply_started = started;
+    o->apply_waiting_since_ms = 0;
+    o->apply_silent_since_ms = 0;
+    o->apply_next_ms = 0;
+}
+
+/* APPLY: once a second. Before apply runs, an earlier firmline-apply container that still runs
+ * (an apply removing old images after its outcome, a composition being brought up) is waited
+ * for, never removed, up to 30 minutes: then the release fails install_failed. Then the outcome in
+ * apply.json, or the container's end without one. Nothing is decided while the agent stops: the
+ * next start follows it again. */
+static void apply_step(fa_ota *o) {
+    long long now = monotonic_ms();
+    if (now < o->apply_next_ms || o->stopping || fa_service_stopping(o->svc))
+        return;
+    o->apply_next_ms = now + APPLY_POLL_MS;
+    apply_presence presence = apply_container();
+    if (presence == APPLY_UNKNOWN) {
+        /* Measured from the first look without an answer (a look may itself wait up to
+         * DOCKER_QUICK_MS): docker silent that long is taken as the container gone. */
+        if (o->apply_silent_since_ms == 0)
+            o->apply_silent_since_ms = now;
+        if (monotonic_ms() - o->apply_silent_since_ms < APPLY_UNANSWERED_MS)
+            return;
+        fa_log("warning", "release %s: docker has not answered for %d s", o->job.release,
+               APPLY_UNANSWERED_MS / 1000);
+        presence = APPLY_NONE;
+    }
+    o->apply_silent_since_ms = 0;
+    if (!o->apply_started) {
+        if (presence == APPLY_ALIVE) {
+            if (o->apply_waiting_since_ms == 0) {
+                fa_log("info", "release %s: an earlier %s container still runs: waiting for it",
+                       o->job.release, APPLY_CONTAINER);
+                o->apply_waiting_since_ms = now;
+            }
+            int limit = apply_wait_s();
+            if (now - o->apply_waiting_since_ms < (long long)limit * 1000)
+                return;
+            /* Paused, restarted by a policy, hung, or someone else's: nothing of this release
+             * has touched the device yet, so it fails here and the queue goes on; the container
+             * is left as it is. */
+            if (limit % 60 == 0)
+                fa_log("warning", "release %s: an earlier %s container still runs after %d min",
+                       o->job.release, APPLY_CONTAINER, limit / 60);
+            else
+                fa_log("warning", "release %s: an earlier %s container still runs after %d s",
+                       o->job.release, APPLY_CONTAINER, limit);
+            finish(o, FL_RESULT_FAILED, "install_failed", current_version(o));
+            return;
+        }
+        /* A stop before this point leaves no install.json: at the next start the stored offer
+         * is queued again, as for any release not yet installed. */
+        if (save_install_state(o, "apply") != 0) {
+            remove_file(o, "download-", o->job.release, ".bin");
+            give_up(o, "the installation cannot be recorded");
+            return;
+        }
+        fa_log("info", "release %s: installing %s version %s with apply in the container %s",
+               o->job.release, o->comp->code, o->job.version, APPLY_CONTAINER);
+        const char *args[] = {"apply", "--release", o->job.release, "--config", o->cfg->path, NULL};
+        o->apply_started = true;
+        run_apply_container(o, NULL, args); /* when it cannot start, it ends without an outcome */
+        return;
+    }
+    fl_result result;
+    char detail[32], version[65];
+    if (apply_outcome(o, &result, detail, version)) { /* read after the look at the container */
+        finish(o, result, detail[0] != '\0' ? detail : NULL, version[0] != '\0' ? version : NULL);
+        return;
+    }
+    if (presence == APPLY_NONE || presence == APPLY_ENDED)
+        apply_cut(o);
+}
+
+/* install.json in the state "apply" at start: the apply of the former run (or of the agent this
+ * one replaces) is followed until its outcome. */
+static void follow_apply(fa_ota *o, const char *release, const char *version,
+                         const fa_component *c) {
+    memset(&o->job, 0, sizeof o->job);
+    snprintf(o->job.release, sizeof o->job.release, "%s", release);
+    snprintf(o->job.component, sizeof o->job.component, "%s", c->code);
+    snprintf(o->job.version, sizeof o->job.version, "%s", version);
+    o->comp = c;
+    begin_apply(o, true);
+    fa_log("info", "release %s: following its installation in the container %s", release,
+           APPLY_CONTAINER);
+}
+
 static void start_install(fa_ota *o) {
     char part[96], bin[96], path[PATH_MAX];
     file_name(part, sizeof part, "download-", o->job.release, ".part");
@@ -677,8 +1028,13 @@ static void start_install(fa_ota *o) {
         give_up(o, "the verified file cannot be kept");
         return;
     }
-    /* Recorded before the script starts: a stop or a power loss while it runs must not make the
-     * release look new at the next start (installed again, or refused as older_version). */
+    /* Recorded before the script (or apply) starts: a stop or a power loss while it runs must not
+     * make the release look new at the next start (installed again, or refused as
+     * older_version). */
+    if (o->comp->install == FA_INSTALL_DOCKER_COMPOSE) {
+        begin_apply(o, false); /* started (and recorded) once no other apply runs */
+        return;
+    }
     if (save_install_state(o, "running") != 0) {
         remove_file(o, "download-", o->job.release, ".bin");
         give_up(o, "the installation cannot be recorded");
@@ -899,8 +1255,17 @@ static void start_next(fa_ota *o, fl_time now) {
     }
     o->job = d;
     o->comp = find_component(o->cfg, o->job.component);
-    if (o->comp == NULL || o->comp->install != FA_INSTALL_SCRIPT) { /* checked with the offer */
+    if (o->comp == NULL || o->comp->install == FA_INSTALL_NONE) { /* checked with the offer */
         finish(o, FL_RESULT_FAILED, "component_mismatch", NULL);
+        return;
+    }
+    if (o->comp->install == FA_INSTALL_DOCKER_COMPOSE && own_container(o) != 0) {
+        /* apply must outlive the agent's container: without one, nothing to download */
+        fa_log("warning",
+               "release %s: not in a container: %s (install = docker-compose) is installed only "
+               "by an agent running in a Docker container",
+               o->job.release, o->comp->code);
+        finish(o, FL_RESULT_FAILED, "install_failed", current_version(o));
         return;
     }
     clean_downloads(o, o->job.release);
@@ -1025,7 +1390,12 @@ static void load_results(fa_ota *o) {
  *  - state "running" (the script was stopped with the agent, or the power went): install_failed;
  *  - state "reboot" (the script exited 10): a new boot without the version is boot_failed; in the
  *    same boot (only the agent restarted) it keeps waiting for the reboot, with no result and
- *    nothing run again. */
+ *    nothing run again;
+ *  - state "apply" (install = docker-compose): before anything else, its apply is followed as if
+ *    this run had started it (apply_step). When the component is no longer install =
+ *    docker-compose (its configuration changed), there is no apply to follow: as "running", with
+ *    apply's files in the data folder removed (compose-previous.yml, apply.tmp), never a reboot.
+ */
 static void settle_install(fa_ota *o) {
     char *text = NULL;
     size_t len = 0;
@@ -1056,13 +1426,30 @@ static void settle_install(fa_ota *o) {
         fa_store_remove(o->cfg->data_dir, INSTALL_STATE);
         return;
     }
+    bool apply = strcmp(state, "apply") == 0;
+    if (apply && c->install == FA_INSTALL_DOCKER_COMPOSE) {
+        follow_apply(o, release, version, c);
+        return; /* install.json stays until the outcome */
+    }
+    if (apply) {
+        fa_log("warning",
+               "release %s: component %s is no longer installed with docker-compose: "
+               "its apply is not followed",
+               release, component);
+        fa_apply_remove_work(o->cfg->data_dir);
+        if (fa_store_remove(o->cfg->data_dir, FA_APPLY_PREVIOUS) != 0)
+            fa_log("warning", "cannot remove %s/%s: %s", o->cfg->data_dir, FA_APPLY_PREVIOUS,
+                   strerror(errno));
+    }
     bool readable = fa_component_version(o->cfg, c, now_version) == 0;
     boot_id(boot);
     if (readable && strcmp(now_version, version) == 0) {
         add_result(o, release, FL_RESULT_INSTALLED, version, NULL);
         fa_service_request_status(o->svc);
-    } else if (strcmp(state, "running") == 0) {
-        fa_log("warning", "release %s: the install script was stopped before it ended", release);
+    } else if (strcmp(state, "running") == 0 || apply) {
+        if (!apply)
+            fa_log("warning", "release %s: the install script was stopped before it ended",
+                   release);
         add_result(o, release, FL_RESULT_FAILED, readable ? now_version : NULL, "install_failed");
     } else if (stored_boot[0] != '\0' && strcmp(stored_boot, boot) == 0) {
         o->reboot_pending = true;
@@ -1222,6 +1609,9 @@ void fa_ota_close(fa_ota *o) {
                o->state == JOB_INSTALL ? "the install script" : "reboot_command");
         fa_child_stop(&o->child);
     }
+    if (o->state == JOB_APPLY && o->apply_started)
+        fa_log("info", "release %s: the agent stops while apply runs: followed at the next start",
+               o->job.release);
     end_job(o);
     free(o);
 }
@@ -1242,6 +1632,9 @@ void fa_ota_tick(fa_ota *o, fl_time now) {
         break;
     case JOB_INSTALL:
         install_step(o);
+        break;
+    case JOB_APPLY:
+        apply_step(o);
         break;
     case JOB_REBOOT:
         reboot_step(o);

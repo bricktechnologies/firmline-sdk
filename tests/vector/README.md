@@ -1,6 +1,6 @@
 # Test vector
 
-Copied byte for byte from the Firmline platform repository (brkt-cra), `tests/fixtures/ota/` and `tests/fixtures/device/`, commit `38dd1e9`. Do not edit these files; if the platform contract changes, a new vector is generated there and copied here again. The private key was never saved, so the vector cannot be regenerated identically.
+Copied byte for byte from the Firmline platform repository (brkt-cra), `tests/fixtures/ota/` and `tests/fixtures/device/`, commit `e0ca812`. Do not edit these files; if the platform contract changes, a new vector is generated there and copied here again. The private key was never saved, so the vector cannot be regenerated identically.
 
 | File | Content |
 |------|---------|

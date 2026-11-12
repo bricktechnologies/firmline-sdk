@@ -25,13 +25,15 @@ typedef struct {
     const char *version;
 } fl_component_version;
 
-/* {"fw","components","ts","uptime"}. fw (NULL to omit) and each code and version are 1..64 bytes;
- * components are an object {"code":"version"} (codes distinct). At least fw or one component.
- * uptime < 0 omits it. Returns the length, FL_ERR_ARG for a violated limit (more than
+/* {"fw","components","sdk","ts","uptime"}. fw (NULL to omit) and each code and version are 1..64
+ * bytes; components are an object {"code":"version"} (codes distinct). At least fw or one
+ * component. sdk (NULL to omit) is "name/version" of the SDK that builds the message: name 1..32 of
+ * [A-Za-z0-9._-], one "/", version valid as fw without a leading or trailing space, 64 bytes at
+ * most. uptime < 0 omits it. Returns the length, FL_ERR_ARG for a violated limit (more than
  * FL_STATUS_MAX bytes, more than 16 components, a NULL or empty text, a repeated code, neither fw
  * nor components, an offset or year out of range), FL_ERR_SPACE if cap is too small. */
 int fl_status_build(char *out, size_t cap, const char *fw, const fl_component_version *components,
-                    size_t n, fl_time ts, int offset_minutes, int64_t uptime);
+                    size_t n, const char *sdk, fl_time ts, int offset_minutes, int64_t uptime);
 
 /* {"release","result","fw","detail"}. release is required (non-empty); fw NULL omits it (1..64
  * bytes otherwise); detail NULL or empty is omitted and one over 64 bytes is dropped, the result

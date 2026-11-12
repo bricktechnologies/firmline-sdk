@@ -28,8 +28,9 @@ LABEL org.opencontainers.image.title="firmline-agent" \
       org.opencontainers.image.version="${VERSION}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3t64 libcurl4t64 libmosquitto1 \
+       docker-cli docker-compose \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /firmline-agent /usr/bin/firmline-agent
 VOLUME /var/lib/firmline
 ENTRYPOINT ["firmline-agent"]
-CMD ["run"]
+CMD ["run", "--wait-registration"]

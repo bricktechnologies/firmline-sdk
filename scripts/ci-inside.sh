@@ -44,5 +44,7 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 
 if [ -d tests/integration ]; then
+    # Here the Docker tests must run: a daemon that cannot start fails them instead of skipping.
+    export FIRMLINE_REQUIRE_DOCKER=1
     python3 -m unittest discover -s tests/integration -v
 fi

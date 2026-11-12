@@ -44,5 +44,50 @@ class OfficialSources(unittest.TestCase):
         self.assertRegex(body, r"(?i)trademark")
 
 
+class TorizonGuide(unittest.TestCase):
+    def section(self) -> str:
+        text = read("docs/integration.md")
+        found = re.search(r"(?ms)^## Torizon$(.*?)(?=^## |\Z)", text)
+        self.assertIsNotNone(found, "docs/integration.md has no '## Torizon'")
+        return found.group(1)
+
+    def test_the_section_names_what_a_torizon_engineer_needs(self):
+        body = self.section()
+        for word in ("pack", "apply", "--wait-registration", "docker exec", "stop_grace_period",
+                     "health_timeout", "/var/run/docker.sock", "Torizon Cloud", "health_check_failed",
+                     "install_failed", ".env"):
+            self.assertIn(word, body)
+
+    def test_the_section_says_why_the_serial_is_a_file_and_that_the_first_package_removes_no_image(self):
+        body = self.section()
+        self.assertIn("/sys/firmware", body)
+        self.assertIn("--serial", body)
+        self.assertRegex(body, r"(?i)first package[^.]*removes? no")
+
+    def test_the_guide_has_a_trial_check_list_for_a_toradex_module(self):
+        self.assertRegex(read("docs/integration.md"),
+                         r"(?m)^## Check list for a trial on a Toradex module")
+
+    def test_the_data_folder_lists_the_files_of_apply(self):
+        text = read("docs/integration.md")
+        data = re.search(r"(?ms)^## Data folder$(.*?)(?=^## )", text).group(1)
+        for name in ("apply.json", "package.json", "compose-previous.yml", "apply.tmp/"):
+            self.assertIn(f"| `{name}` |", data)
+
+    def test_the_guide_no_longer_says_docker_support_is_planned(self):
+        text = read("docs/integration.md")
+        self.assertNotRegex(text, r"(?i)planned and not part of this release")
+        self.assertNotIn("does not install such a component yet", text)
+
+    def test_the_readme_says_torizon_is_supported_and_how_the_check_runs_docker(self):
+        text = read("README.md")
+        self.assertRegex(text, r"(?i)Torizon")
+        self.assertNotRegex(text, r"(?i)planned \(T179\)")
+        self.assertIn("--privileged", text)
+        self.assertIn("firmline-docker", text)
+        self.assertRegex(text, r"(?i)trial on a real Toradex module pending")
+        self.assertNotRegex(text, r"(?i)ready: Toradex")
+
+
 if __name__ == "__main__":
     unittest.main()

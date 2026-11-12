@@ -16,6 +16,7 @@
 #include "ota.h"
 #include "renewal.h"
 #include "store.h"
+#include "version.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -491,7 +493,8 @@ static void send_status(fa_service *s) {
     s->nothing_readable = false;
 
     char payload[FL_STATUS_MAX + 1];
-    int len = fl_status_build(payload, sizeof payload, fw, others, n, now, 0, read_uptime());
+    int len = fl_status_build(payload, sizeof payload, fw, others, n, FA_AGENT_NAME_VERSION, now, 0,
+                              read_uptime());
     if (len < 0) {
         fa_log("error", "the status cannot be built (error %d)", len);
         return;
@@ -653,7 +656,63 @@ static int prepare(fa_service *s, const fa_config *cfg) {
     return 0;
 }
 
-int fa_service_run(const fa_config *cfg) {
+/* No SA_RESTART: a signal interrupts the waits, and the loop sees the flag at once. A broken
+ * connection must be an error of the write, not the end of the process. */
+static void install_signal_handlers(void) {
+    struct sigaction stop, ignore;
+    memset(&stop, 0, sizeof stop);
+    memset(&ignore, 0, sizeof ignore);
+    stop.sa_handler = on_stop_signal;
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&stop.sa_mask);
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGTERM, &stop, NULL);
+    sigaction(SIGINT, &stop, NULL);
+    sigaction(SIGPIPE, &ignore, NULL);
+}
+
+#define REGISTRATION_CHECK_S 10
+
+/* Until device.json exists (true), or a stop signal arrives (false). Logs once. The signals are
+ * blocked outside the wait itself: pselect unblocks them and sleeps in one step, so a signal that
+ * comes between the flag check and the wait is not lost, and nothing polls. Only "not there" is
+ * waited for: any other error is left to prepare(), which logs it. */
+static bool wait_for_registration(const fa_config *cfg) {
+    char path[PATH_MAX];
+    struct stat st;
+    if (join_path(path, sizeof path, cfg->data_dir, IDENTITY) != 0)
+        return true; /* prepare() reports it */
+    install_signal_handlers();
+    stop_requested = 0;
+    sigset_t blocked, previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGTERM);
+    sigaddset(&blocked, SIGINT);
+    sigprocmask(SIG_BLOCK, &blocked, &previous);
+    bool logged = false;
+    bool ready = false;
+    while (!stop_requested) {
+        errno = 0;
+        if (stat(path, &st) == 0 || errno != ENOENT) {
+            ready = true;
+            break;
+        }
+        if (!logged) {
+            fa_log("info", "run: waiting for the registration (%s is missing)", path);
+            logged = true;
+        }
+        struct timespec ts = {REGISTRATION_CHECK_S, 0};
+        pselect(0, NULL, NULL, NULL, &ts, &previous);
+    }
+    sigprocmask(SIG_SETMASK, &previous, NULL);
+    return ready;
+}
+
+int fa_service_run(const fa_config *cfg, bool wait_registration) {
+    if (wait_registration && !wait_for_registration(cfg)) {
+        fa_log("info", "stopped");
+        return 0;
+    }
     fa_service *s = calloc(1, sizeof *s);
     if (s == NULL) {
         fa_log("error", "run: out of memory");
@@ -677,19 +736,8 @@ int fa_service_run(const fa_config *cfg) {
         return 1;
     }
 
-    /* No SA_RESTART: a signal interrupts the waits, and the loop sees the flag at once. A broken
-     * connection must be an error of the write, not the end of the process. */
-    struct sigaction stop, ignore;
-    memset(&stop, 0, sizeof stop);
-    memset(&ignore, 0, sizeof ignore);
-    stop.sa_handler = on_stop_signal;
-    ignore.sa_handler = SIG_IGN;
-    sigemptyset(&stop.sa_mask);
-    sigemptyset(&ignore.sa_mask);
     stop_requested = 0;
-    sigaction(SIGTERM, &stop, NULL);
-    sigaction(SIGINT, &stop, NULL);
-    sigaction(SIGPIPE, &ignore, NULL);
+    install_signal_handlers();
 
     fa_log("info", "running as device %s", s->id.device_id);
     fa_renewal_check(s->renewal, wall_clock()); /* at start; then after each status */

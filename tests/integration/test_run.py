@@ -41,6 +41,20 @@ class RunTest(IntegrationTest):
         self.assertEqual(0, result.code, result.stderr)
         return agent, agent.read_json("device.json")
 
+    SDK_RULE = re.compile(r"^[A-Za-z0-9._-]{1,32}/\S(.*\S)?$")
+
+    def sdk_name_version(self, agent) -> str:
+        """firmline-agent/<version>, the version being what --version prints (0.0.0-dev in the
+        default build), checked against the platform rule for the sdk field."""
+        result = agent.run("--version")
+        self.assertEqual(0, result.code, result.stderr)
+        match = re.fullmatch(r"firmline-agent (\S+)\n", result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        value = "firmline-agent/" + match.group(1)
+        self.assertRegex(value, self.SDK_RULE)
+        self.assertLessEqual(len(value), 64)
+        return value
+
     def secrets_of(self, agent):
         return [agent.read_text("device.key"), agent.read_text("device.pem")]
 
@@ -71,7 +85,8 @@ class RunTest(IntegrationTest):
         message = platform.wait_for(status_topic)[0]
 
         status = message.json()
-        self.assertEqual({"fw", "components", "ts", "uptime"}, set(status))
+        self.assertEqual({"fw", "components", "sdk", "ts", "uptime"}, set(status))
+        self.assertEqual(self.sdk_name_version(agent), status["sdk"])
         self.assertEqual("2.4.1", status["fw"])
         self.assertEqual({"torizon": "7.2.0-build.13"}, status["components"])
         self.assertRegex(status["ts"], UTC_TIME)
@@ -99,6 +114,14 @@ class RunTest(IntegrationTest):
         self.assertEqual(0, agent.stop())
         wait_until(lambda: f"Client {client_id} disconnected." in self.broker.log, 10, "DISCONNECT")
         assert_no_secrets(agent.log, self.secrets_of(agent))
+
+    def test_every_https_request_carries_the_versioned_user_agent(self):
+        agent, _ = self.registered_agent()
+        expected = self.sdk_name_version(agent)
+        requests = list(self.platform.requests)
+        self.assertTrue(requests, "the registration reached the fake platform")
+        for request in requests:
+            self.assertEqual(expected, request.headers.get("user-agent"), request.path)
 
     def test_status_again_after_interval(self):
         agent, identity = self.registered_agent(status_interval=2)
@@ -152,6 +175,41 @@ class RunTest(IntegrationTest):
         self.assertIn("not registered", result.stderr)
         self.assertNotIn("New client connected", self.broker.log)
         assert_no_secrets(agent.log, [])
+
+    def test_run_waits_for_the_registration_when_asked(self):
+        agent = self.make_agent(broker=self.broker)
+        platform = self.platform_client()
+        process = agent.start("run", "--wait-registration")
+        agent.wait_for_log("waiting for the registration", 15)
+        time.sleep(25)  # the check is every 10 s: the message is logged once, not at every check
+        self.assertIsNone(process.poll(), "the agent must keep running")
+        self.assertEqual(1, agent.running_log.count("waiting for the registration"))
+        self.assertEqual(1, self.broker.log.count("New client connected"), "only the platform")
+
+        token = self.platform.new_token()
+        result = agent.run("register", "--token", token, "--serial", "SN-wait")
+        self.assertEqual(0, result.code, result.stderr)
+        identity = agent.read_json("device.json")
+        message = platform.wait_for(identity["topicRoot"] + "/status", timeout=15)[0]
+        self.assertEqual("firmline-agent/", message.json()["sdk"][:15])
+        self.assertEqual(0, agent.stop())
+        assert_no_secrets(agent.log, self.secrets_of(agent))
+
+    def test_run_stops_at_once_on_sigterm_while_waiting_for_the_registration(self):
+        agent = self.make_agent(broker=self.broker)
+        agent.start("run", "--wait-registration")
+        agent.wait_for_log("waiting for the registration", 15)
+        started = time.monotonic()
+        self.assertEqual(0, agent.stop(timeout=5))
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_run_with_wait_registration_and_a_registered_device_runs_as_usual(self):
+        agent, identity = self.registered_agent()
+        platform = self.platform_client()
+        agent.start("run", "--wait-registration")
+        platform.wait_for(identity["topicRoot"] + "/status")
+        self.assertNotIn("waiting for the registration", agent.running_log)
+        self.assertEqual(0, agent.stop())
 
     def test_run_with_wrong_update_key_exits_1(self):
         agent, _ = self.registered_agent()

@@ -1,0 +1,29 @@
+# The Firmline agent as a service of the composition that Torizon starts at every boot
+# (/var/sota/storage/docker-compose/docker-compose.yml, project torizon). Add your own services
+# next to it. The guide's "Torizon" section explains each line.
+services:
+  firmline-agent:
+    image: ghcr.io/bricktechnologies/firmline-agent:1
+    container_name: firmline-agent
+    # The image's own command: waits for `docker exec firmline-agent firmline-agent register ...`
+    # instead of exiting on a device that is not registered yet.
+    command: ["run", "--wait-registration"]
+    restart: unless-stopped
+    # At least 15 seconds: a stop of the agent takes about 11 seconds when it ends a script.
+    stop_grace_period: 20s
+    volumes:
+      # The identity, the queue and the state of the updates.
+      - firmline-data:/var/lib/firmline
+      # Gives the agent root on the device: it manages the containers of the application.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The composition Torizon starts, which an update replaces.
+      - /var/sota/storage/docker-compose:/var/sota/storage/docker-compose
+      # The version of Torizon OS (agent.conf: os_release).
+      - /etc/os-release:/host/os-release:ro
+      # agent.conf and update.pem.
+      - /etc/firmline:/etc/firmline:ro
+      # The serial number of the module (agent.conf: serial).
+      - /sys/firmware/devicetree/base/serial-number:/run/firmline/serial-number:ro
+
+volumes:
+  firmline-data:

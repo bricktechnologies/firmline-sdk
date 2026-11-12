@@ -61,10 +61,12 @@ int fa_endpoint_load(const fa_config *cfg, fa_endpoint *out);
 #define FA_CHAIN_UNWRITABLE (-2)
 int fa_device_chain_update(const char *dir);
 
-/* Runs the service until SIGTERM or SIGINT: 0 then. 1 when it cannot start (not registered,
- * update_key not a P-256 public key, data folder incomplete, device.key not the key of
- * device.pem, endpoint.json unreadable, libmosquitto failed). */
-int fa_service_run(const fa_config *cfg);
+/* Runs the service until SIGTERM or SIGINT: 0 then. With wait_registration, a missing device.json
+ * is not an error: it logs once and looks again every 10 s (SIGTERM or SIGINT ends the wait: 0).
+ * 1 when it cannot start (not registered and no wait_registration, update_key not a P-256 public
+ * key, data folder incomplete, device.key not the key of device.pem, endpoint.json unreadable,
+ * libmosquitto failed). */
+int fa_service_run(const fa_config *cfg, bool wait_registration);
 
 /* ---- What the hooks can use ------------------------------------------------------------- */
 

@@ -2,6 +2,7 @@
 #include "commands.h"
 #include "http.h"
 #include "log.h"
+#include "version.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -10,10 +11,8 @@ static const struct {
     const char *name;
     int (*run)(int argc, char **argv);
 } COMMANDS[] = {
-    {"register", fa_cmd_register},
-    {"run", fa_cmd_run},
-    {"status", fa_cmd_status},
-    {"endpoint", fa_cmd_endpoint},
+    {"register", fa_cmd_register}, {"run", fa_cmd_run},   {"status", fa_cmd_status},
+    {"endpoint", fa_cmd_endpoint}, {"pack", fa_cmd_pack}, {"apply", fa_cmd_apply},
 };
 
 static void usage(FILE *out) {
@@ -23,9 +22,11 @@ static void usage(FILE *out) {
           "  register (--token <token> | --token-file <path>) [--serial <serial>]\n"
           "           [--config <path>]\n"
           "           create the device key and register the device with the platform\n"
-          "  run [--config <path>]\n"
+          "  run [--config <path>] [--wait-registration]\n"
           "           the service: broker connection, status, updates, certificate renewal\n"
-          "           (stops on SIGTERM)\n"
+          "           (stops on SIGTERM); --wait-registration waits for register instead of\n"
+          "           exiting when the device is not registered (a container with a restart\n"
+          "           policy)\n"
           "  status [--config <path>]\n"
           "           print the registration, certificate expiry, last connection and queued\n"
           "           releases as one JSON object (files only, no network)\n"
@@ -33,16 +34,22 @@ static void usage(FILE *out) {
           "           [--config <path>]\n"
           "           use a relay on this site (HTTPS 443 and broker 8883 by default, verified\n"
           "           with the root received at registration), or the configuration again\n"
+          "  pack --compose <file> --version <version> --output <file.tar>\n"
+          "           build the package of a Docker Compose application for a release, where\n"
+          "           its images are (never pulled): images renamed\n"
+          "           firmline.local/<service>:<version as a tag>, composition and\n"
+          "           images in one tar\n"
+          "  apply --release <id> [--config <path>]\n"
+          "           install the downloaded package of a Docker Compose application (run\n"
+          "           starts it in a container of its own): images loaded, the new\n"
+          "           composition started and checked, the previous one back on failure;\n"
+          "           the outcome in apply.json in the data folder\n"
           "\n"
           "  --config  the configuration file (default " FA_DEFAULT_CONFIG ")\n"
           "  --help    show this text\n"
           "  --version print the version\n",
           out);
 }
-
-#ifndef FIRMLINE_AGENT_VERSION
-#define FIRMLINE_AGENT_VERSION "0.0.0-dev"
-#endif
 
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--version") == 0) {

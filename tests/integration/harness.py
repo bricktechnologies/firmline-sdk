@@ -1179,6 +1179,7 @@ class Broker:
         self._started = False
         self.config_path = self.dir / "mosquitto.conf"
         self.log_path = self.dir / "mosquitto.log"
+        self.stderr_path = self.dir / "mosquitto.stderr"
         self.acl_path = self.dir / "acl"
         self.crl_path = self.dir / "crl.pem"
         self.server_cert = server_cert or (pki.broker_cert_path, pki.broker_key_path)
@@ -1294,11 +1295,12 @@ class Broker:
             self.write_acl()
             self.config_path.write_text(self._config())
             running = self.log.count(self.RUNNING)  # the log file grows across restarts
-            self._process = subprocess.Popen(
-                ["mosquitto", "-c", str(self.config_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            with open(self.stderr_path, "ab") as stderr:
+                self._process = subprocess.Popen(
+                    ["mosquitto", "-c", str(self.config_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr,
+                )
             deadline = time.monotonic() + self.START_TIMEOUT
             while (
                 self.log.count(self.RUNNING) <= running
@@ -1314,7 +1316,12 @@ class Broker:
             if not (exited and self._port_chosen and not self._started):
                 break
             self.port = free_port()
-        raise TimeoutError(f"the broker on port {self.port} did not start: see {self.log_path}")
+        tails = "\n".join(
+            f"--- {path.name}:\n" + path.read_text(errors="replace")[-2000:]
+            for path in (self.log_path, self.stderr_path)
+            if path.exists()
+        )
+        raise TimeoutError(f"the broker on port {self.port} did not start:\n{tails}")
 
     def stop(self) -> None:
         if self._process is not None:

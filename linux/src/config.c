@@ -29,6 +29,10 @@ typedef enum {
     K_VERSION,
     K_INSTALL,
     K_TIMEOUT,
+    K_COMPOSE_FILE,
+    K_PROJECT,
+    K_AGENT_SERVICE,
+    K_HEALTH_TIMEOUT,
     K_COUNT
 } key_id;
 
@@ -48,6 +52,10 @@ static const char *const KEY_NAMES[K_COUNT] = {
     "component.version",
     "component.install",
     "component.timeout",
+    "component.compose_file",
+    "component.project",
+    "component.agent_service",
+    "component.health_timeout",
 };
 
 const char *const *fa_config_keys(size_t *count) {
@@ -66,6 +74,7 @@ typedef struct {
     bool seen[K_COUNT]; /* keys already given in the current section */
     bool platform_seen;
     bool comp_has_version;
+    int compose_key_line; /* line of the first docker-compose key of the component, 0 = none */
     bool main_seen;
     bool have_url, have_broker, have_update_key;
 } parser;
@@ -134,6 +143,20 @@ static bool valid_os_release_key(const char *s) {
     for (; *s != '\0'; s++)
         if (!((*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_'))
             return false;
+    return true;
+}
+
+/* A project or service name: [a-z0-9][a-z0-9_-]{0,63}. */
+static bool valid_docker_name(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 64)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!(alnum || (i > 0 && (c == '_' || c == '-'))))
+            return false;
+    }
     return true;
 }
 
@@ -215,6 +238,12 @@ static int version_value(parser *p, fa_component *comp, const char *v) {
         comp->source = FA_VERSION_OS_RELEASE;
         if (!set_str(comp->source_arg, sizeof comp->source_arg, v + 11))
             return fail(p, "version is too long");
+    } else if (strncmp(v, "package:", 8) == 0) {
+        size_t n = strlen(v + 8);
+        if (n == 0 || n > 64 || !printable(v + 8))
+            return fail(p, "package version must be 1 to 64 printable characters");
+        comp->source = FA_VERSION_PACKAGE;
+        memcpy(comp->source_arg, v + 8, n + 1);
     } else if (strncmp(v, "file:", 5) == 0 || strncmp(v, "command:", 8) == 0) {
         bool is_file = v[0] == 'f';
         const char *path = v + (is_file ? 5 : 8);
@@ -224,8 +253,8 @@ static int version_value(parser *p, fa_component *comp, const char *v) {
         if (!set_str(comp->source_arg, sizeof comp->source_arg, path))
             return fail(p, "version is too long");
     } else {
-        return fail(p, "version must be fixed:<v>, os-release:<KEY>, file:<path> or "
-                       "command:<path>");
+        return fail(p, "version must be fixed:<v>, os-release:<KEY>, file:<path>, "
+                       "command:<path> or package:<v>");
     }
     p->comp_has_version = true;
     return 0;
@@ -247,8 +276,17 @@ static int component_value(parser *p, key_id key, const char *v) {
             comp->script[0] = '\0';
             return 0;
         }
-        if (strcmp(v, "docker-compose") == 0)
-            return fail(p, "install = docker-compose is supported from T179");
+        if (strcmp(v, "docker-compose") == 0) {
+            for (int i = 0; i < p->cfg->component_count; i++)
+                if (&p->cfg->component[i] != comp &&
+                    p->cfg->component[i].install == FA_INSTALL_DOCKER_COMPOSE)
+                    return fail(p,
+                                "only one component can have install = docker-compose "
+                                "(component %s has it)",
+                                p->cfg->component[i].code);
+            comp->install = FA_INSTALL_DOCKER_COMPOSE;
+            return 0;
+        }
         if (strncmp(v, "script:", 7) == 0) {
             if (!is_abs_path(v + 7))
                 return fail(p, "the script path must be absolute");
@@ -257,10 +295,34 @@ static int component_value(parser *p, key_id key, const char *v) {
                        ? 0
                        : fail(p, "install is too long");
         }
-        return fail(p, "install must be script:<path> or none");
+        return fail(p, "install must be script:<path>, docker-compose or none");
     case K_TIMEOUT:
         if (!parse_int(v, 1, 86400, &comp->timeout_s))
             return fail(p, "timeout must be a number of seconds from 1 to 86400");
+        return 0;
+    case K_COMPOSE_FILE:
+        if (!is_abs_path(v))
+            return fail(p, "compose_file must be an absolute path");
+        p->compose_key_line = p->compose_key_line > 0 ? p->compose_key_line : p->line;
+        return set_str(comp->compose_file, sizeof comp->compose_file, v)
+                   ? 0
+                   : fail(p, "compose_file is too long");
+    case K_PROJECT:
+    case K_AGENT_SERVICE: {
+        const char *name = key == K_PROJECT ? "project" : "agent_service";
+        if (!valid_docker_name(v))
+            return fail(p,
+                        "%s is 1 to 64 characters of [a-z0-9_-], starting with a letter or "
+                        "digit",
+                        name);
+        p->compose_key_line = p->compose_key_line > 0 ? p->compose_key_line : p->line;
+        memcpy(key == K_PROJECT ? comp->project : comp->agent_service, v, strlen(v) + 1);
+        return 0;
+    }
+    case K_HEALTH_TIMEOUT:
+        if (!parse_int(v, 10, 3600, &comp->health_timeout_s))
+            return fail(p, "health_timeout must be a number of seconds from 10 to 3600");
+        p->compose_key_line = p->compose_key_line > 0 ? p->compose_key_line : p->line;
         return 0;
     default:
         return fail(p, "internal error");
@@ -272,6 +334,12 @@ static int finish_component(parser *p) {
     if (p->section == SEC_COMPONENT && !p->comp_has_version) {
         p->line = 0;
         return fail(p, "component %s has no version", p->comp->code);
+    }
+    if (p->section == SEC_COMPONENT && p->compose_key_line > 0 &&
+        p->comp->install != FA_INSTALL_DOCKER_COMPOSE) {
+        p->line = p->compose_key_line;
+        return fail(p, "compose_file, project, agent_service and health_timeout are allowed "
+                       "only with install = docker-compose");
     }
     return 0;
 }
@@ -302,6 +370,12 @@ static int open_section(parser *p, char *name) {
         memcpy(p->comp->code, code, strlen(code) + 1);
         p->comp->install = FA_INSTALL_NONE;
         p->comp->timeout_s = 600;
+        snprintf(p->comp->compose_file, sizeof p->comp->compose_file, "%s",
+                 "/var/sota/storage/docker-compose/docker-compose.yml");
+        snprintf(p->comp->project, sizeof p->comp->project, "torizon");
+        snprintf(p->comp->agent_service, sizeof p->comp->agent_service, "firmline-agent");
+        p->comp->health_timeout_s = 120;
+        p->compose_key_line = 0;
         p->comp_has_version = false;
         p->section = SEC_COMPONENT;
         return 0;
@@ -359,6 +433,11 @@ int fa_config_load(const char *path, fa_config *out, char err[256]) {
     out->status_interval_s = 3600;
     snprintf(out->data_dir, sizeof out->data_dir, "/var/lib/firmline");
     snprintf(out->os_release, sizeof out->os_release, "/etc/os-release");
+    if (strlen(path) >= sizeof out->path) {
+        snprintf(err, 256, "the path of the configuration file is too long");
+        return -1;
+    }
+    memcpy(out->path, path, strlen(path) + 1);
 
     FILE *f = fopen(path, "r");
     if (f == NULL) {
