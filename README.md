@@ -19,7 +19,7 @@ It has two parts:
 | --- | --- |
 | Core library | ready |
 | Linux agent for generic Linux (install script) | ready |
-| Docker and Torizon (`install = docker-compose`) | ready: Toradex modules with Torizon OS are supported |
+| Docker and Torizon (`install = docker-compose`) | implemented; trial on a real Toradex module pending |
 | Zephyr | planned (T180) |
 
 ## Start here

@@ -46,7 +46,7 @@ class TorizonConfiguration(unittest.TestCase):
 
     def test_agent_conf_has_the_components_of_a_torizon_device(self):
         text = (EXAMPLE / "agent.conf").read_text(encoding="utf-8")
-        for line in ("serial = devicetree", "version = os-release:VERSION_ID", "install = none",
+        for line in ("serial = file:/run/firmline/serial-number", "version = os-release:VERSION_ID", "install = none",
                      "install = docker-compose", "version = package:1.0.0", "main = true"):
             self.assertIn(line, text)
 
@@ -86,6 +86,9 @@ class TorizonComposition(unittest.TestCase):
         self.assertEqual(compose, mounts[compose]["source"])
         self.assertTrue(mounts["/host/os-release"]["read_only"])
         self.assertTrue(mounts["/etc/firmline"]["read_only"])
+        serial = mounts["/run/firmline/serial-number"]
+        self.assertEqual("/sys/firmware/devicetree/base/serial-number", serial["source"])
+        self.assertTrue(serial["read_only"])
 
 
 if __name__ == "__main__":

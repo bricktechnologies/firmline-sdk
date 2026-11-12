@@ -22,6 +22,8 @@ services:
       - /etc/os-release:/host/os-release:ro
       # agent.conf and update.pem.
       - /etc/firmline:/etc/firmline:ro
+      # The serial number of the module (agent.conf: serial).
+      - /sys/firmware/devicetree/base/serial-number:/run/firmline/serial-number:ro
 
 volumes:
   firmline-data:

@@ -428,7 +428,7 @@ not repeat the documentation of TorizonCore Builder, which builds that image. Th
 - `examples/torizon/docker-compose.yml`: the agent service;
 - `examples/torizon/agent.conf`: Torizon OS (`version = os-release:VERSION_ID`,
   `install = none`) and the application (`install = docker-compose`, `version = package:1.0.0`,
-  `main = true`), with `serial = devicetree`.
+  `main = true`), with `serial = file:/run/firmline/serial-number`.
 
 What the agent service needs:
 
@@ -443,10 +443,15 @@ What the agent service needs:
 | `/var/sota/storage/docker-compose` (same path inside) | The composition that Torizon starts, which an update replaces. The agent writes `docker-compose.yml.new` next to it. |
 | `/etc/os-release` of the host, read-only, at `/host/os-release`, with `os_release = /host/os-release` | The container has an `os-release` of its own: this one gives the version of Torizon OS. |
 | `/etc/firmline`, read-only | `agent.conf` and the update key. |
+| `/sys/firmware/devicetree/base/serial-number` of the host, read-only, at `/run/firmline/serial-number` | The serial number of the module, read by `serial = file:/run/firmline/serial-number`. |
 
-The serial number comes from `serial = devicetree`, the file `/proc/device-tree/serial-number`,
-which the container's own `/proc` shows: the example does not mount it. Check it in the trial
-(see the check list).
+The serial number of the module comes from `serial = file:/run/firmline/serial-number`: the
+composition mounts the host file `/sys/firmware/devicetree/base/serial-number` there, read-only.
+`serial = devicetree` (the file `/proc/device-tree/serial-number`) is not used: on an ARM module
+`/proc/device-tree` leads to `/sys/firmware/devicetree/base`, Docker masks `/sys/firmware` in a
+container that is not privileged, and a mount under `/proc` is refused. The alternative is to give
+the serial at registration with `--serial`, with no `serial` line in `agent.conf`. Check the
+serial on the real module (see the check list).
 
 Keep the defaults of `compose_file`, `project` and `agent_service` unless your Torizon image
 starts the composition from elsewhere or under another name. The service of the agent must be
@@ -469,10 +474,11 @@ for the registration):
 
 ```
 docker cp ./token firmline-agent:/tmp/token
-docker exec firmline-agent firmline-agent register --token-file /tmp/token --serial SN-000123
+docker exec firmline-agent firmline-agent register --token-file /tmp/token
 ```
 
-(without `--serial` when the configuration has `serial = devicetree`). `docker exec
+(without `--serial`, as here, the serial is the one of `serial = file:…`; with `--serial` the
+configuration must have no `serial` line). `docker exec
 firmline-agent firmline-agent register --token …` also works, but an argument is visible to
 every user of the module in the process list: prefer the file, which the agent deletes. The exit
 codes and the standard output are those of "Registration at the end-of-line test station".
@@ -566,7 +572,9 @@ second package would replace all of it. The configuration refuses a second one.
 6. On success, `<compose_file>.new` replaces `compose_file` and `package.json` is written: the
    version is now the one of the package. `apply` writes its outcome in `apply.json`, and then
    removes the images of the previous package that the new one does not use. Only those:
-   never another image of your device.
+   never another image of your device. The first package removes no image: a module that has
+   installed no package has no `package.json`, so the images it was built with stay until you
+   remove them yourself.
 7. On a failure, it puts the previous composition back: the local names that the package had
    taken from another image are given back, `compose_file` is the previous composition, and the
    previous composition is started again as in step 4. The images that the failed package
@@ -718,8 +726,8 @@ disk space are those of the board.
    `examples/torizon/docker-compose.yml` and your own services) and `/etc/firmline` with
    `agent.conf` and `update.pem`. `docker ps` shows the agent container, `docker logs` its line
    `waiting for the registration`.
-2. In the container, `cat /proc/device-tree/serial-number` prints the serial number of the module
-   and `firmline-agent status --config /etc/firmline/agent.conf` prints `registered` as false and
+2. In the container, `cat /run/firmline/serial-number` prints the serial number of the module
+   (the same as `cat /proc/device-tree/serial-number` on the host), and `firmline-agent status --config /etc/firmline/agent.conf` prints `registered` as false and
    does not complain (`docker exec firmline-agent firmline-agent …`).
 3. `docker info --format '{{.DriverStatus}}'` and `docker version --format '{{.Server.Arch}}'`: the
    storage is Docker's classic image store, and the architecture is the one of your package.
@@ -730,7 +738,8 @@ disk space are those of the board.
 5. Build a package with `pack` for a new version, upload it as the firmware of that version of the
    application component and release it to the module: the log shows the download, the
    `apply:` lines, and the result `installed`; `docker ps` shows the new containers, the version
-   on the platform changes, and the old images of your application are gone.
+   on the platform changes. The old images of your application are gone from the second package-based
+   update on (the first removes none: the module has no `package.json` yet).
 6. Release a package whose service exits at once (or has a failing healthcheck): the result is
    `failed` with `health_check_failed`, the old composition runs again and
    `/var/sota/storage/docker-compose/docker-compose.yml` is unchanged.

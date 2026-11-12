@@ -58,6 +58,12 @@ class TorizonGuide(unittest.TestCase):
                      "install_failed", ".env"):
             self.assertIn(word, body)
 
+    def test_the_section_says_why_the_serial_is_a_file_and_that_the_first_package_removes_no_image(self):
+        body = self.section()
+        self.assertIn("/sys/firmware", body)
+        self.assertIn("--serial", body)
+        self.assertRegex(body, r"(?i)first package[^.]*removes? no")
+
     def test_the_guide_has_a_trial_check_list_for_a_toradex_module(self):
         self.assertRegex(read("docs/integration.md"),
                          r"(?m)^## Check list for a trial on a Toradex module")
@@ -79,6 +85,8 @@ class TorizonGuide(unittest.TestCase):
         self.assertNotRegex(text, r"(?i)planned \(T179\)")
         self.assertIn("--privileged", text)
         self.assertIn("firmline-docker", text)
+        self.assertRegex(text, r"(?i)trial on a real Toradex module pending")
+        self.assertNotRegex(text, r"(?i)ready: Toradex")
 
 
 if __name__ == "__main__":
