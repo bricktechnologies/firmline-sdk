@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import unittest
 import uuid
@@ -27,6 +28,7 @@ from harness import (
     assert_no_secrets,
     wait_until,
 )
+from test_ota import OtaBase
 
 AGENT_1 = "firmline-test/agent:1"
 AGENT_2 = "firmline-test/agent:2"
@@ -137,12 +139,13 @@ class TorizonTest(IntegrationTest):
                 for marker in SANITIZER_MARKERS:
                     self.assertNotIn(marker, log, f"{kind} container {container[:12]}:\n{log}")
 
-    def cut_apply(self, release: str, files: dict, unchecked: dict) -> None:
+    def cut_apply(self, release: str, files: dict, unchecked: dict,
+                  work_folder: bool = False) -> None:
         """Plays an apply cut short (a power loss, a crash of its container): the composition
         `unchecked` (services {name: image}, with the agent's service as it is) runs in place of
         the application, the agent is stopped, the data folder gets install.json for `release`
-        in the state "apply" and `files` ({name: text}), then the agent starts again. No
-        firmline-apply container exists."""
+        in the state "apply" and `files` ({name: text}) (and with work_folder apply.tmp with a
+        file in it), then the agent starts again. No firmline-apply container exists."""
         other = self.tmp / "unchecked.yml"
         other.write_text(self.device.composition(unchecked, AGENT_1))
         self.device.compose("up", "--detach", "--remove-orphans", file=other)
@@ -152,7 +155,28 @@ class TorizonTest(IntegrationTest):
         self.device.write_data("install.json", json.dumps(install))
         for name, text in files.items():
             self.device.write_data(name, text)
+        if work_folder:
+            with tempfile.TemporaryDirectory() as folder:
+                work = Path(folder) / "apply.tmp"
+                work.mkdir()
+                (work / "images.tar.gz").write_bytes(b"extracted before the cut")
+                self.docker.run("cp", str(work), f"{agent}:{TorizonDevice.DATA}/apply.tmp")
         self.docker.run("start", agent)
+
+    def cut_without_its_outcome(self, files) -> None:
+        """RF 1 when apply.json says nothing of the release: files(release) are the files of the
+        data folder. failed install_failed, and the composition of compose_file runs again."""
+        self.docker.app_image("example/web:2", "stay")
+        device_id = self.start_device()
+        release = str(uuid.uuid4())
+
+        self.cut_apply(release, files(release), {"web": "example/web:2"})
+
+        self.assert_one_result(device_id, {
+            "release": release, "result": "failed", "fw": "1.0.0", "detail": "install_failed"})
+        self.wait_running({"firmline-agent": self.agent_1, "app": self.old},
+                          "the composition of compose_file running again")
+        self.assertNotIn("install.json", self.device.data_files())
 
     @staticmethod
     def apply_state(release: str, state: str, detail=None, version=None) -> str:
@@ -248,7 +272,7 @@ class TorizonTest(IntegrationTest):
         release = str(uuid.uuid4())
 
         self.cut_apply(release, {"apply.json": self.apply_state(release, "running", None, "1.0.0")},
-                       {"web": "example/web:2"})
+                       {"web": "example/web:2"}, work_folder=True)
 
         self.assert_one_result(device_id, {
             "release": release, "result": "failed", "fw": "1.0.0", "detail": "install_failed"})
@@ -258,8 +282,20 @@ class TorizonTest(IntegrationTest):
         log = self.device.logs()
         self.assertIn(f"release {release}: the apply container ended without an outcome", log)
         self.assertIn("bringing the composition", log)
-        self.assertNotIn("install.json", self.device.data_files())
+        left = self.device.data_files()
+        self.assertNotIn("install.json", left)
+        # apply.tmp (as large as the package) would fail the free-space check of the next
+        # download, which comes before the next apply.
+        self.assertNotIn("apply.tmp", left)
         self.assertEqual("running", json.loads(self.device.read_data("apply.json"))["state"])
+
+    def test_an_apply_cut_without_apply_json_ends_with_failed(self):
+        self.cut_without_its_outcome(lambda release: {})
+
+    def test_an_apply_cut_with_the_outcome_of_another_release_ends_with_failed(self):
+        """apply.json is an `installed` of another release: not this release's outcome."""
+        self.cut_without_its_outcome(lambda release: {
+            "apply.json": self.apply_state(str(uuid.uuid4()), "installed", None, "2.0.0")})
 
     def test_an_apply_that_cannot_start_ends_with_failed(self):
         """`docker run` of apply fails (here the agent takes the application's container for its
@@ -410,6 +446,47 @@ class TorizonTest(IntegrationTest):
         self.assertEqual(1, len(apply_logs))
         self.assertIn("apply:", apply_logs[0][1])
         assert_no_secrets(apply_logs[0][1], secrets)
+
+
+class ApplyStateOfAScriptComponentTest(OtaBase):
+    """install.json in the state "apply" names a component that is no longer install =
+    docker-compose (its configuration changed while apply ran): there is no apply to follow, so
+    the release ends failed install_failed at the next start, in the same boot too, with no
+    reboot; apply's files in the data folder go, and the queue goes on."""
+
+    def test_it_fails_install_failed_without_a_reboot(self):
+        app, folder = self.component("app")
+        boot = self.tmp / "boot_id"  # the same boot before and after the restart
+        boot.write_text("boot-a\n")
+        agent, device = self.start_agent(
+            {"app": app}, env={"FIRMLINE_BOOT_ID_FILE": str(boot)},
+            reboot_command=f"{folder / 'reboot.sh'} now")
+        self.assertEqual(0, agent.stop())
+        release = str(uuid.uuid4())
+        agent.path("install.json").write_text(json.dumps(
+            {"release": release, "component": "app", "version": "2.0.0", "state": "apply",
+             "bootId": "boot-a"}))
+        agent.path("apply.json").write_text(TorizonTest.apply_state(release, "running"))
+        agent.path("compose-previous.yml").write_text("services: {}\n")
+        agent.path("apply.tmp").mkdir()
+        (agent.path("apply.tmp") / "images.tar.gz").write_bytes(b"left by a cut")
+
+        self.run_agent(agent)
+        self.assertEqual(
+            [{"release": release, "result": "failed", "fw": "1.0.0", "detail": "install_failed"}],
+            self.platform.wait_results(device, timeout=20))
+        offer = self.offer(device, "app", "1.1.0", b"version 1.1.0")
+        self.assertEqual(
+            {"release": offer.release, "result": "installed", "fw": "1.1.0"},
+            self.platform.wait_results(device, count=2)[1])
+
+        self.assertFalse((folder / "rebooted").exists(), "no reboot_command")
+        self.assertEqual(2, len(self.platform.results(device)))
+        self.assertEqual(1, len((folder / "runs").read_text().splitlines()))
+        left = agent.data_files()
+        for name in ("install.json", "compose-previous.yml", "apply.tmp"):
+            self.assertNotIn(name, left)
+        self.finish(agent)
 
 
 class OutsideAContainerTest(IntegrationTest):

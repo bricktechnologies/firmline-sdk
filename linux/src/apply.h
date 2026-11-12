@@ -72,4 +72,8 @@ fa_apply_outcome fa_apply_install(const fa_config *cfg, const fa_component *comp
  * removal that fails is logged. */
 void fa_apply_remove_previous_images(const fa_apply_packages *packages);
 
+/* Removes <data_dir>/apply.tmp and its files, as an apply cut short left them (nothing when there
+ * is none): for the agent, which shares the data folder, after it settles such an apply. */
+void fa_apply_remove_work(const char *data_dir);
+
 #endif

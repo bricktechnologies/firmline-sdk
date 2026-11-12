@@ -797,13 +797,15 @@ static int split_compose_file(const fa_component *c, char dir[256], char name[25
     return 0;
 }
 
-/* What an apply cut short leaves of its own: <compose_file>.new, and compose-previous.yml (the
- * composition before it). With put_back the latter is written to compose_file first when the two
- * differ: the cut came after apply had put the new composition in place, before package.json
- * (apply.h, step 6), so the composition goes back with the version. apply.tmp is removed by the
- * next apply. */
+/* What an apply cut short leaves of its own: apply.tmp (up to the size of the package: left
+ * there, it would fail the free-space check of every next download, which comes before the next
+ * apply), <compose_file>.new, and compose-previous.yml (the composition before it). With put_back
+ * the latter is written to compose_file first when the two differ: the cut came after apply had
+ * put the new composition in place, before package.json (apply.h, step 6), so the composition
+ * goes back with the version. */
 static void drop_apply_files(fa_ota *o, bool put_back) {
     char dir[256], name[256], new_name[300];
+    fa_apply_remove_work(o->cfg->data_dir);
     if (split_compose_file(o->comp, dir, name) != 0)
         return;
     char *previous = NULL, *current = NULL;
@@ -1390,7 +1392,10 @@ static void load_results(fa_ota *o) {
  *    same boot (only the agent restarted) it keeps waiting for the reboot, with no result and
  *    nothing run again;
  *  - state "apply" (install = docker-compose): before anything else, its apply is followed as if
- *    this run had started it (apply_step). */
+ *    this run had started it (apply_step). When the component is no longer install =
+ *    docker-compose (its configuration changed), there is no apply to follow: as "running", with
+ *    apply's files in the data folder removed (compose-previous.yml, apply.tmp), never a reboot.
+ */
 static void settle_install(fa_ota *o) {
     char *text = NULL;
     size_t len = 0;
@@ -1421,17 +1426,30 @@ static void settle_install(fa_ota *o) {
         fa_store_remove(o->cfg->data_dir, INSTALL_STATE);
         return;
     }
-    if (strcmp(state, "apply") == 0 && c->install == FA_INSTALL_DOCKER_COMPOSE) {
+    bool apply = strcmp(state, "apply") == 0;
+    if (apply && c->install == FA_INSTALL_DOCKER_COMPOSE) {
         follow_apply(o, release, version, c);
         return; /* install.json stays until the outcome */
+    }
+    if (apply) {
+        fa_log("warning",
+               "release %s: component %s is no longer installed with docker-compose: "
+               "its apply is not followed",
+               release, component);
+        fa_apply_remove_work(o->cfg->data_dir);
+        if (fa_store_remove(o->cfg->data_dir, FA_APPLY_PREVIOUS) != 0)
+            fa_log("warning", "cannot remove %s/%s: %s", o->cfg->data_dir, FA_APPLY_PREVIOUS,
+                   strerror(errno));
     }
     bool readable = fa_component_version(o->cfg, c, now_version) == 0;
     boot_id(boot);
     if (readable && strcmp(now_version, version) == 0) {
         add_result(o, release, FL_RESULT_INSTALLED, version, NULL);
         fa_service_request_status(o->svc);
-    } else if (strcmp(state, "running") == 0) {
-        fa_log("warning", "release %s: the install script was stopped before it ended", release);
+    } else if (strcmp(state, "running") == 0 || apply) {
+        if (!apply)
+            fa_log("warning", "release %s: the install script was stopped before it ended",
+                   release);
         add_result(o, release, FL_RESULT_FAILED, readable ? now_version : NULL, "install_failed");
     } else if (stored_boot[0] != '\0' && strcmp(stored_boot, boot) == 0) {
         o->reboot_pending = true;

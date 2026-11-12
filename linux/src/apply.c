@@ -780,3 +780,9 @@ void fa_apply_remove_previous_images(const fa_apply_packages *packages) {
             remove_image(old);
     }
 }
+
+void fa_apply_remove_work(const char *data_dir) {
+    char work[PATH_MAX];
+    if (join(work, sizeof work, data_dir, FA_APPLY_WORK) == 0)
+        remove_work(work);
+}
